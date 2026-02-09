@@ -117,9 +117,37 @@ typedef struct {
     uint8_t   active;
 } ParallelReality;
 
-/* ─── Engine State ────────────────────────────────────────────────────────── */
+/* ─── Oracle Registry ─────────────────────────────────────────────────────── */
+
+#define MAX_ORACLES  256
+
+/* Built-in oracle IDs */
+#define ORACLE_PHASE_FLIP      0x00  /* Phase-flip state 0 */
+#define ORACLE_SEARCH_MARK     0x01  /* Mark target state(s) for Grover search */
+#define ORACLE_PERIOD_FIND     0x02  /* Shor's period-finding (modular exp) */
+#define ORACLE_GROVER_MULTI    0x03  /* Grover with multiple marked states */
+#define ORACLE_CUSTOM_BASE     0x10  /* User-registered oracles start here */
+
+struct HexStateEngine_s;  /* Forward declaration */
+
+/* Oracle function signature:
+ *   eng       — engine pointer (full access to all state)
+ *   chunk_id  — target chunk
+ *   user_data — arbitrary user context passed at registration
+ */
+typedef void (*OracleFunc)(struct HexStateEngine_s *eng,
+                           uint64_t chunk_id, void *user_data);
 
 typedef struct {
+    const char  *name;       /* Human-readable name */
+    OracleFunc   func;       /* Implementation */
+    void        *user_data;  /* Arbitrary context (owned by caller) */
+    uint8_t      active;     /* 1 = registered */
+} OracleEntry;
+
+/* ─── Engine State ────────────────────────────────────────────────────────── */
+
+typedef struct HexStateEngine_s {
     /* Chunks (dynamically allocated via mmap) */
     Chunk           *chunks;
     uint64_t        num_chunks;
@@ -136,6 +164,10 @@ typedef struct {
 
     /* Measurement results (dynamically allocated, same capacity as chunks) */
     uint64_t        *measured_values;
+
+    /* Oracle registry */
+    OracleEntry     oracles[MAX_ORACLES];
+    uint32_t        num_oracles_registered;
 
     /* PRNG state (Pi-seeded) */
     uint64_t        prng_state;
@@ -186,8 +218,13 @@ void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b);
 int  op_timeline_fork(HexStateEngine *eng, uint64_t target, uint64_t source);
 int  op_infinite_resources(HexStateEngine *eng, uint64_t chunk, uint64_t size);
 
-/* Oracle */
+/* Oracle registry */
+int  oracle_register(HexStateEngine *eng, uint32_t oracle_id,
+                     const char *name, OracleFunc func, void *user_data);
+void oracle_unregister(HexStateEngine *eng, uint32_t oracle_id);
+void oracle_list(HexStateEngine *eng);
 void execute_oracle(HexStateEngine *eng, uint64_t chunk_id, uint32_t oracle_id);
+void register_builtin_oracles(HexStateEngine *eng);
 
 /* Program execution */
 int  load_program(HexStateEngine *eng, const char *filename);
@@ -197,6 +234,9 @@ int  execute_instruction(HexStateEngine *eng, Instruction instr);
 
 /* Self-test */
 int  run_self_test(HexStateEngine *eng);
+
+/* Shor's factoring (CLI entrypoint) */
+int  run_shor_factoring(HexStateEngine *eng, const char *n_decimal);
 
 /* Utility */
 uint64_t engine_prng(HexStateEngine *eng);
