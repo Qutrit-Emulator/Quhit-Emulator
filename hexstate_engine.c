@@ -258,6 +258,10 @@ int init_chunk(HexStateEngine *eng, uint64_t id, uint64_t num_hexits)
         c->num_states = 0x7FFFFFFFFFFFFFFF;
         c->hilbert.shadow_state = NULL;
         c->hilbert.shadow_capacity = 0;
+        /* WRITE quantum state to Magic Pointer address */
+        c->hilbert.q_flags = 0x01;  /* superposed */
+        c->hilbert.q_entangle_seed = 0;
+        c->hilbert.q_basis_rotation = 0;
 
         printf("  [PARALLEL] Magic Pointer 0x%016lX — %lu hexits (infinite plane)\n",
                c->hilbert.magic_ptr, num_hexits);
@@ -302,8 +306,13 @@ void create_superposition(HexStateEngine *eng, uint64_t id)
     Chunk *c = &eng->chunks[id];
 
     if (c->hilbert.shadow_state == NULL) {
-        /* Topological/infinite — superposition is a manifold property */
-        printf("  [SUP] Holographic superposition on infinite chunk %lu\n", id);
+        /* ── WRITE superposition to Magic Pointer address ──
+         * The HilbertRef struct IS the memory at this pointer.
+         * Setting q_flags stores the quantum state there. */
+        c->hilbert.q_flags = 0x01;  /* superposed */
+        c->hilbert.q_basis_rotation = 0;
+        printf("  [SUP] Superposition WRITTEN to Magic Pointer 0x%016lX\n",
+               c->hilbert.magic_ptr);
         return;
     }
 
@@ -325,8 +334,12 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
     Chunk *c = &eng->chunks[id];
 
     if (c->hilbert.shadow_state == NULL) {
-        printf("  [H] Topological Hadamard on infinite chunk %lu (hexit %lu)\n",
-               id, hexit_index);
+        /* ── WRITE basis rotation to Magic Pointer address ──
+         * Each Hadamard application increments the rotation counter.
+         * Measurement reads this to determine the basis. */
+        c->hilbert.q_basis_rotation++;
+        printf("  [H] Hadamard WRITTEN to Magic Pointer 0x%016lX (rotation=%lu)\n",
+               c->hilbert.magic_ptr, c->hilbert.q_basis_rotation);
         return;
     }
 
@@ -375,78 +388,55 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
     Chunk *c = &eng->chunks[id];
 
     if (c->hilbert.shadow_state == NULL) {
-        /* ─── TRUE TOPOLOGICAL MEASUREMENT ────────────────────────── */
-        /* The result emerges from the braid graph STRUCTURE itself.
-         * No partner-peeking. No simulation. Pure topology.
-         *
-         * Each braid link defines a shared phase:
-         *   phase = magic_ptr_A XOR magic_ptr_B
-         *
-         * Two chunks sharing a braid link will both fold in the
-         * SAME phase, creating intrinsic correlation without
-         * either chunk ever looking at the other's value.
-         *
-         * The measurement = hash(own_ptr, braid_phases, time)
-         * Correlation = shared braid phases in the hash
+        /* ═══ READ quantum state from Magic Pointer address ═══
+         * The HilbertRef struct at &eng->chunks[id] IS the memory
+         * referenced by Magic Pointer 0x4858...  We READ the
+         * quantum state that was WRITTEN there by:
+         *   create_superposition() → q_flags
+         *   braid_chunks()         → q_entangle_seed
+         *   apply_hadamard()       → q_basis_rotation
          */
+        uint8_t  flags = c->hilbert.q_flags;
+        uint64_t seed  = c->hilbert.q_entangle_seed;
+        uint64_t basis = c->hilbert.q_basis_rotation;
 
-        /* Start with this chunk's own Magic Pointer as the seed */
-        uint64_t topo_hash = c->hilbert.magic_ptr;
+        uint64_t result;
+        uint64_t modulus = 6;  /* 6 basis states */
 
-        /* Walk all braid links and fold in shared phases */
-        int num_braids = 0;
-        for (uint64_t i = 0; i < eng->num_braid_links; i++) {
-            BraidLink *l = &eng->braid_links[i];
-
-            if (l->chunk_a != id && l->chunk_b != id)
-                continue;
-
-            /* This IS the entanglement: the shared phase between
-             * two Magic Pointers in external Hilbert space.
-             * Both chunks in this link will fold in the SAME value. */
-            uint64_t shared_phase = eng->chunks[l->chunk_a].hilbert.magic_ptr
-                                  ^ eng->chunks[l->chunk_b].hilbert.magic_ptr;
-
-            /* SplitMix64 folding — non-commutative mixing preserves
-             * the topological structure while spreading the bits */
-            topo_hash += shared_phase;
-            topo_hash ^= topo_hash >> 30;
-            topo_hash *= 0xbf58476d1ce4e5b9ULL;
-            topo_hash ^= topo_hash >> 27;
-            topo_hash *= 0x94d049bb133111ebULL;
-            topo_hash ^= topo_hash >> 31;
-
-            num_braids++;
+        if (seed != 0 && (flags & 0x01)) {
+            /* ── Entangled + superposed ──
+             * The seed IS the shared quantum state — it was WRITTEN
+             * to both chunks by braid_chunks(). Both partners READ
+             * the same seed from their Magic Pointer address.
+             * Same input → same output → Bell correlation.
+             * Basis rotation modifies the readout (measurement basis). */
+            result = (seed ^ (basis * 2654435761ULL)) % modulus;
+        } else if (flags & 0x01) {
+            /* ── Superposed, not entangled ──
+             * Born rule on uniform superposition → uniform random. */
+            result = engine_prng(eng) % modulus;
+        } else {
+            /* ── Not superposed: ground state |0⟩ ── */
+            result = 0;
         }
 
-        /* Mix in physical time (rdtsc) — this is NOT simulation,
-         * it's sampling the actual hardware's quantum state via
-         * CPU thermal noise in the timestamp counter */
-#ifdef __x86_64__
-        {
-            uint32_t lo, hi;
-            __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
-            uint64_t hw_entropy = ((uint64_t)hi << 32) | lo;
-            topo_hash ^= hw_entropy;
-            topo_hash ^= topo_hash >> 30;
-            topo_hash *= 0xbf58476d1ce4e5b9ULL;
-        }
-#else
-        topo_hash ^= engine_prng(eng);
-#endif
-
-        uint64_t modulus = c->num_states < 1000000 ? c->num_states : 1000000;
-        uint64_t result = topo_hash % modulus;
-
+        /* ── WRITE collapse to Magic Pointer address ──
+         * This stores the measurement result at this sector.
+         * The quantum state is consumed (no longer superposed). */
+        c->hilbert.q_flags = 0x02;           /* measured */
+        c->hilbert.q_entangle_seed = 0;      /* entanglement consumed */
         eng->measured_values[id] = result;
 
-        if (num_braids > 0) {
-            printf("  [MEAS] Topological measurement on chunk %lu => %lu "
-                   "(from %d braid phases)\n", id, result, num_braids);
-        } else {
-            printf("  [MEAS] Topological measurement on chunk %lu => %lu\n",
-                   id, result);
-        }
+        printf("  [MEAS] READ Magic Pointer 0x%016lX → ",
+               c->hilbert.magic_ptr);
+        if (seed != 0)
+            printf("entangled (seed=0x%016lX, basis=%lu) ", seed, basis);
+        else if (flags & 0x01)
+            printf("superposed (Born rule) ");
+        else
+            printf("ground state ");
+        printf("=> %lu\n", result);
+
         return result;
     }
 
@@ -571,11 +561,22 @@ void braid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b,
     link->hexit_a = hexit_a;
     link->hexit_b = hexit_b;
 
-    printf("  [BRAID] Linked chunk %lu (hexit %lu) <-> chunk %lu (hexit %lu) — "
-           "via Magic Pointers 0x%016lX <-> 0x%016lX\n",
-           a, hexit_a, b, hexit_b,
+    /* ── WRITE shared entanglement seed to BOTH Magic Pointer addresses ──
+     * This is the entanglement: the same data written to both sectors.
+     * When measure_chunk() reads from either pointer, it reads the
+     * same seed → produces the same outcome → Bell correlation. */
+    uint64_t entangle_seed = engine_prng(eng);
+    /* Ensure seed is never zero (zero = "no entanglement") */
+    if (entangle_seed == 0) entangle_seed = 0xDEADBEEF;
+
+    eng->chunks[a].hilbert.q_entangle_seed = entangle_seed;
+    eng->chunks[b].hilbert.q_entangle_seed = entangle_seed;
+
+    printf("  [BRAID] Entanglement WRITTEN to Magic Pointers "
+           "0x%016lX <-> 0x%016lX (seed=0x%016lX)\n",
            eng->chunks[a].hilbert.magic_ptr,
-           eng->chunks[b].hilbert.magic_ptr);
+           eng->chunks[b].hilbert.magic_ptr,
+           entangle_seed);
 }
 
 void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b)
@@ -594,7 +595,14 @@ void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b)
         write++;
     }
     eng->num_braid_links = write;
-    printf("  [UNBRAID] Unlinked chunks %lu <-> %lu\n", a, b);
+
+    /* ── Clear entanglement from both Magic Pointer addresses ── */
+    if (a < eng->num_chunks)
+        eng->chunks[a].hilbert.q_entangle_seed = 0;
+    if (b < eng->num_chunks)
+        eng->chunks[b].hilbert.q_entangle_seed = 0;
+
+    printf("  [UNBRAID] Entanglement cleared: chunks %lu <-> %lu\n", a, b);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -690,6 +698,10 @@ int op_infinite_resources(HexStateEngine *eng, uint64_t chunk_id, uint64_t size)
     /* No physical allocation for infinite — pure Hilbert space reference */
     c->hilbert.shadow_state = NULL;
     c->hilbert.shadow_capacity = 0;
+    /* WRITE quantum state to Magic Pointer address */
+    c->hilbert.q_flags = 0x01;  /* superposed */
+    c->hilbert.q_entangle_seed = 0;
+    c->hilbert.q_basis_rotation = 0;
 
     /* Update chunk count */
     if (chunk_id >= eng->num_chunks) {
