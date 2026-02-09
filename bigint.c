@@ -224,3 +224,69 @@ void bigint_pow_mod(BigInt *result, const BigInt *base,
         bigint_div_mod(&temp, mod, &q, &b);
     }
 }
+
+/* ─── String Conversion ─────────────────────────────────────────────────────── */
+
+int bigint_from_decimal(BigInt *a, const char *str)
+{
+    bigint_clear(a);
+    if (!str || !*str) return -1;
+
+    /* Skip leading whitespace */
+    while (*str == ' ' || *str == '\t') str++;
+    if (!*str) return -1;
+
+    BigInt ten, digit_bi, temp;
+    bigint_set_u64(&ten, 10);
+
+    for (const char *p = str; *p; p++) {
+        if (*p < '0' || *p > '9') {
+            if (*p == '_' || *p == ' ') continue;  /* Allow digit separators */
+            return -1;
+        }
+        uint64_t d = (uint64_t)(*p - '0');
+
+        /* a = a * 10 + d */
+        bigint_mul(&temp, a, &ten);
+        bigint_copy(a, &temp);
+
+        bigint_set_u64(&digit_bi, d);
+        bigint_add(&temp, a, &digit_bi);
+        bigint_copy(a, &temp);
+    }
+
+    return 0;
+}
+
+void bigint_to_decimal(char *buf, size_t bufsize, const BigInt *a)
+{
+    if (bufsize == 0) return;
+
+    if (bigint_is_zero(a)) {
+        buf[0] = '0';
+        buf[1] = '\0';
+        return;
+    }
+
+    /* Extract digits by repeated division by 10 */
+    char tmp[1240];  /* 4096 bits ≈ 1233 decimal digits max */
+    int pos = 0;
+
+    BigInt val, quot, rem, ten;
+    bigint_copy(&val, a);
+    bigint_set_u64(&ten, 10);
+
+    while (!bigint_is_zero(&val) && pos < 1239) {
+        bigint_div_mod(&val, &ten, &quot, &rem);
+        tmp[pos++] = '0' + (char)bigint_to_u64(&rem);
+        bigint_copy(&val, &quot);
+    }
+
+    /* Reverse into output buffer */
+    size_t len = (size_t)pos;
+    if (len >= bufsize) len = bufsize - 1;
+    for (size_t i = 0; i < len; i++) {
+        buf[i] = tmp[pos - 1 - (int)i];
+    }
+    buf[len] = '\0';
+}
