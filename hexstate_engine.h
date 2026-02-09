@@ -1,0 +1,205 @@
+/*
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * HEXSTATE ENGINE — 6-State Quantum Processor Emulator
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * C port of the Qutrit Engine with 6 basis states (|0⟩ – |5⟩).
+ * All chunks reference an external Hilbert space via Magic Pointers.
+ * Supports 4096-bit BigInt arithmetic.
+ *
+ * Magic Pointer Tag: 0x4858 ("HX" — HexState)
+ */
+
+#ifndef HEXSTATE_ENGINE_H
+#define HEXSTATE_ENGINE_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include "bigint.h"
+
+/* ─── Configuration Constants ─────────────────────────────────────────────── */
+#define NUM_BASIS_STATES      6
+#define MAX_CHUNK_SIZE        8           /* 6^8 = 1,679,616 states */
+#define MAX_STATES_STANDARD   1679616     /* 6^8 */
+#define MAX_CHUNKS            16777216
+#define INITIAL_CHUNK_CAP     4096        /* Start small, grow as needed */
+#define MAX_BRAID_LINKS       16777216
+#define MAX_ADDONS            32
+#define CAUSAL_SAFEGUARD      4096
+
+/* Magic Pointer tag for Hilbert space references */
+#define MAGIC_TAG             0x4858ULL   /* "HX" */
+#define MAGIC_MASK            0xFFFF000000000000ULL
+#define MAKE_MAGIC_PTR(id)    ((MAGIC_TAG << 48) | ((uint64_t)(id) & 0xFFFFFFFFFFFFULL))
+#define IS_MAGIC_PTR(ptr)     (((ptr) >> 48) == MAGIC_TAG)
+#define MAGIC_PTR_ID(ptr)     ((ptr) & 0xFFFFFFFFFFFFULL)
+
+/* State encoding: 6 basis states × complex amplitude */
+#define HEXIT_SIZE            96          /* 6 × 16 bytes (6 complex doubles) */
+#define STATE_BYTES           16          /* Complex amplitude: 8 (real) + 8 (imag) */
+
+/* ─── Opcode Definitions ──────────────────────────────────────────────────── */
+/* Core (Epoch 1) */
+#define OP_NOP                0x00
+#define OP_INIT               0x01
+#define OP_SUP                0x02
+#define OP_HADAMARD           0x03
+#define OP_PHASE              0x04
+#define OP_CPHASE             0x05
+#define OP_SWAP               0x06
+#define OP_MEASURE            0x07
+#define OP_GROVER             0x08
+#define OP_BRAID              0x09
+#define OP_UNBRAID            0x0A
+#define OP_ORACLE             0x0B
+#define OP_ADDON              0x0C
+#define OP_PRINT_STATE        0x0D
+#define OP_BELL_TEST          0x0E
+#define OP_SHIFT              0x10
+#define OP_REPAIR             0x11
+#define OP_NULL               0x14
+#define OP_SUMMARY            0x1F
+#define OP_HALT               0xFF
+
+/* Epoch 11: Multiverse Horizon */
+#define OP_TIMELINE_FORK      0xA8
+#define OP_INFINITE_RESOURCES 0xA9
+#define OP_DIMENSIONAL_PEEK   0x5A
+#define OP_ENTROPY_SIPHON     0x44
+
+/* Epoch 2 */
+#define OP_MIRROR_VOID        0x32
+#define OP_SHIFT_REALITY      0x3C
+#define OP_REPAIR_CAUSALITY   0x42
+
+/* Phase 6: Omega */
+#define OP_ENTROPY_REVERSE    0x5E
+#define OP_QUANTUM_TUNNEL     0x78
+#define OP_FINAL_ASCENSION    0xF2
+#define OP_SIREN_SONG         0x72
+
+/* ─── Data Structures ─────────────────────────────────────────────────────── */
+
+typedef struct {
+    double real;
+    double imag;
+} Complex;
+
+/* Hilbert Space Reference (Magic Pointer) */
+typedef struct {
+    uint64_t  magic_ptr;          /* (MAGIC_TAG << 48) | chunk_id */
+    Complex  *shadow_state;       /* Local mmap'd shadow cache (may be NULL for infinite) */
+    uint64_t  shadow_capacity;    /* Number of states in shadow cache */
+} HilbertRef;
+
+/* Chunk: logical unit of quantum state */
+typedef struct {
+    uint64_t   id;
+    uint64_t   size;              /* Number of hexits */
+    uint64_t   num_states;        /* 6^size (or INT64_MAX for infinite) */
+    HilbertRef hilbert;           /* External Hilbert space reference */
+    uint8_t    locked;            /* 1 = immutable */
+} Chunk;
+
+/* Braid link (entanglement) */
+typedef struct {
+    uint64_t chunk_a;
+    uint64_t chunk_b;
+    uint64_t hexit_a;
+    uint64_t hexit_b;
+} BraidLink;
+
+/* Parallel Reality tracking */
+typedef struct {
+    uint64_t  reality_id;
+    uint64_t  parent_chunk;
+    uint64_t  divergence;
+    void     *hw_context;         /* mmap'd hardware context */
+    uint8_t   active;
+} ParallelReality;
+
+/* ─── Engine State ────────────────────────────────────────────────────────── */
+
+typedef struct {
+    /* Chunks (dynamically allocated via mmap) */
+    Chunk           *chunks;
+    uint64_t        num_chunks;
+    uint64_t        chunk_capacity;
+
+    /* Braid links */
+    BraidLink      *braid_links;
+    uint64_t        num_braid_links;
+    uint64_t        braid_capacity;
+
+    /* Parallel realities (dynamically allocated, same capacity as chunks) */
+    ParallelReality *parallel;
+    uint64_t        next_reality_id;
+
+    /* Measurement results (dynamically allocated, same capacity as chunks) */
+    uint64_t        *measured_values;
+
+    /* PRNG state (Pi-seeded) */
+    uint64_t        prng_state;
+
+    /* Program execution */
+    uint8_t        *program;
+    uint64_t        program_size;
+    uint64_t        pc;           /* Program counter (byte offset) */
+    int             running;
+
+    /* BigInt workspace */
+    BigInt          bigint_temp[3];
+} HexStateEngine;
+
+/* ─── Instruction Word Layout ─────────────────────────────────────────────── */
+/* 64-bit instruction:
+ *   [63:56]  Op2     (8 bits)
+ *   [55:32]  Op1     (24 bits)
+ *   [31:8]   Target  (24 bits)
+ *   [7:0]    Opcode  (8 bits)
+ */
+typedef struct {
+    uint8_t  opcode;
+    uint32_t target;    /* 24-bit chunk/target index */
+    uint32_t op1;       /* 24-bit operand 1 */
+    uint8_t  op2;       /* 8-bit operand 2 */
+} Instruction;
+
+/* ─── API ─────────────────────────────────────────────────────────────────── */
+
+/* Lifecycle */
+int  engine_init(HexStateEngine *eng);
+void engine_destroy(HexStateEngine *eng);
+
+/* Chunk operations */
+int  init_chunk(HexStateEngine *eng, uint64_t id, uint64_t num_hexits);
+void create_superposition(HexStateEngine *eng, uint64_t id);
+void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index);
+uint64_t measure_chunk(HexStateEngine *eng, uint64_t id);
+void grover_diffusion(HexStateEngine *eng, uint64_t id);
+
+/* Entanglement */
+void braid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b,
+                  uint64_t hexit_a, uint64_t hexit_b);
+void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b);
+
+/* Multiverse operations */
+int  op_timeline_fork(HexStateEngine *eng, uint64_t target, uint64_t source);
+int  op_infinite_resources(HexStateEngine *eng, uint64_t chunk, uint64_t size);
+
+/* Oracle */
+void execute_oracle(HexStateEngine *eng, uint64_t chunk_id, uint32_t oracle_id);
+
+/* Program execution */
+int  load_program(HexStateEngine *eng, const char *filename);
+Instruction decode_instruction(uint64_t raw);
+int  execute_program(HexStateEngine *eng);
+int  execute_instruction(HexStateEngine *eng, Instruction instr);
+
+/* Self-test */
+int  run_self_test(HexStateEngine *eng);
+
+/* Utility */
+uint64_t engine_prng(HexStateEngine *eng);
+void     print_chunk_state(HexStateEngine *eng, uint64_t id);
+
+#endif /* HEXSTATE_ENGINE_H */
