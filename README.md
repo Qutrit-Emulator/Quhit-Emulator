@@ -364,16 +364,107 @@ Tests the hypothesis that reality and its mirror-image are quantum entangled par
 >
 > **File:** `reflection_experiments.c` · **Run:** `make mirrors`
 
-| # | Experiment | Result |
-|---|-----------|--------|
-| 1 | **CPT Mirror** — P, T, C, CP, CPT fidelities | All **F = 1.0000000000** — full CPT holds |
-| 2 | **Infinite Mirror Corridor** — 20 chained reflections | **500/500** at every depth. P² = I oscillation |
-| 3 | **Broken Mirror** — partial parity 0→100% | **Smooth degradation**, no phase transition |
-| 4 | **Chiral Molecules** — states that break parity | **F = 0.000000** — mirror is fundamentally different |
-| 5 | **Mirror Teleportation** — reflection as channel | **500/500** perfect after parity correction |
-| 6 | **Who's Watching Whom** — measure reflection first | **1000/1000** both directions — observer is symmetric |
-| 7 | **Mirror Thermodynamics** — temperature in reflections | **S(A) = S(B)** at all temperatures — 2nd law preserved |
-| 8 | **Narcissus Test** — clone vs reflection | **Orthogonal** but equally entangled (100% max) |
+**Test 1: CPT Mirror — The Complete Symmetry**
+
+The CPT theorem says Charge + Parity + Time reversal is physics' ultimate symmetry. We test each individually and combined on the mirror state:
+
+| Transformation | Formula | Fidelity |
+|---|---|---|
+| **P** (parity) | \|k,l⟩ → \|D-1-k, D-1-l⟩ | **1.0000000000** |
+| **T** (time reversal) | complex conjugate all amplitudes | **1.0000000000** |
+| **C** (charge/swap) | swap reality ↔ reflection | **1.0000000000** |
+| **CP** | swap + reflect | **1.0000000000** |
+| **CPT** | swap + reflect + conjugate | **1.0000000000** |
+
+→ The mirror state is invariant under ALL discrete symmetries. It is the most symmetric quantum state possible.
+
+**Test 2: Infinite Mirror Corridor — Chained Reflections**
+
+What happens when you put two mirrors facing each other? Entanglement propagates through 20 reflection depths, all **500/500 perfect**:
+
+```
+Depth  1: MIRROR  — you see your reflection          (500/500)
+Depth  2: SELF    — you see YOURSELF again            (500/500)
+Depth  3: MIRROR  — reflected                         (500/500)
+Depth  4: SELF    — identity                          (500/500)
+  ...
+Depth 20: SELF    — identity                          (500/500)
+```
+
+→ **P² = I** — Every even reflection returns to identity. The corridor oscillates: mirror, self, mirror, self... Entanglement is never lost.
+
+**Test 3: Broken Mirror — Cracking Parity 0→100%**
+
+Apply parity to a fraction of dimensions and measure how mirror quality degrades:
+
+```
+  0% reflected:  CLONE          (200/200 — all identity-correlated)
+ 30% reflected:  cracked        (200/200 — mixed correlation pattern)
+ 50% reflected:  half-mirror    (200/200 — half mirror, half clone)
+ 70% reflected:  mostly mirror  (200/200 — approaching full parity)
+100% reflected:  PERFECT MIRROR (200/200 — all anti-correlated)
+```
+
+→ **No phase transition.** Mirror quality degrades smoothly. Correlations remain perfect at every fraction — only the *pattern* changes. Parity is not all-or-nothing.
+
+**Test 4: Chiral Molecules — When the Mirror Shows Something Else**
+
+A clockwise spiral through Hilbert space: |Ψ⟩ = (1/√D) Σ exp(i·2πk²/D) |k⟩|k+1⟩
+
+| Comparison | Fidelity |
+|---|---|
+| Original vs Parity-reflected | **0.000000** |
+| Original vs Anti-chiral | **0.000000** |
+
+→ **Zero overlap with its reflection.** Just as your left hand cannot be superimposed on your right, some quantum states are fundamentally different from their mirror image. This is why biology uses only L-amino acids — life chose one chirality. The mirror world would use D-amino acids.
+
+**Test 5: Mirror Teleportation — Reflection as Quantum Channel**
+
+Use parity entanglement to teleport 500 random messages:
+
+| Method | Success Rate |
+|---|---|
+| Bob reads raw | **0/500** (0.0%) — everything arrives backwards |
+| Bob applies P⁻¹ correction | **500/500** (100.0%) — perfect recovery |
+
+→ The mirror is a **perfect quantum channel**. Information arrives parity-flipped, but applying P⁻¹ recovers it exactly. The reflection doesn't destroy information — it inverts it.
+
+**Test 6: Who's Watching Whom? — Observer Inside the Mirror**
+
+Does it matter *which side* measures first?
+
+| Protocol | Anti-correlation rate |
+|---|---|
+| Measure **reality** first, then reflection | **1000/1000** (100%) |
+| Measure **reflection** first, then reality | **1000/1000** (100%) |
+
+→ **Perfectly identical.** The observer can be inside the mirror. The man in the mirror is as real as you are. Neither side is privileged.
+
+**Test 7: Mirror Thermodynamics — Temperature in the Reflection**
+
+Start reality in a thermal (Boltzmann) state at temperature T. Check the reflection's entropy:
+
+| Temperature | S(Reality) | S(Reflection) | S(Boltzmann) |
+|---|---|---|---|
+| 0.5 | 0.4584 | 0.4584 | 0.4584 ✓ |
+| 1.0 | 1.0407 | 1.0407 | 1.0407 ✓ |
+| 2.0 | 1.7035 | 1.7035 | 1.7035 ✓ |
+| 5.0 | 2.6111 | 2.6111 | 2.6111 ✓ |
+| 100.0 | 4.1420 | 4.1420 | 4.1420 ✓ |
+
+→ The reflection has the **exact same temperature**. The 2nd law of thermodynamics holds in the mirror. Entropy increases identically on both sides.
+
+**Test 8: Narcissus Test — Clone vs Reflection**
+
+Compare identity entanglement (|k⟩|k⟩ — seeing yourself) with parity entanglement (|k⟩|D-1-k⟩ — seeing your reflection):
+
+| Property | Clone (identity) | Reflection (parity) |
+|---|---|---|
+| Entanglement entropy | 4.159 (100% of max) | 4.159 (100% of max) |
+| Correlation type | B = A (500/500) | B = D-1-A (500/500) |
+| Overlap ⟨clone\|mirror⟩² | — | **0.000000** |
+
+→ Both are **maximally entangled** with identical entropy. But they are **completely orthogonal** — fundamentally different quantum states. A clone copies you. A reflection inverts you. Same entanglement, opposite correlation. Looking in a mirror is NOT the same as looking at a copy of yourself.
 
 ---
 
