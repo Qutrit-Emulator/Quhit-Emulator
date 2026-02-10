@@ -54,6 +54,113 @@ static inline double cnorm2(Complex a)
     return a.real * a.real + a.imag * a.imag;
 }
 
+static inline Complex cconj(Complex a)
+{
+    return cmplx(a.real, -a.imag);
+}
+
+/* ─── Next power of 2 ≥ n ────────────────────────────────────────────────── */
+static uint32_t next_pow2(uint32_t n)
+{
+    uint32_t p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
+/* ─── In-place Cooley-Tukey FFT for power-of-2 length ─────────────────── */
+static void fft_pow2_inplace(Complex *buf, uint32_t N)
+{
+    if (N <= 1) return;
+    uint32_t logN = 0;
+    { uint32_t t = N; while (t > 1) { logN++; t >>= 1; } }
+
+    /* Bit-reversal permutation */
+    for (uint32_t i = 0; i < N; i++) {
+        uint32_t rev = 0;
+        for (uint32_t bit = 0; bit < logN; bit++)
+            if (i & (1u << bit)) rev |= (1u << (logN - 1 - bit));
+        if (rev > i) { Complex t = buf[i]; buf[i] = buf[rev]; buf[rev] = t; }
+    }
+
+    /* Butterfly stages */
+    for (uint32_t s = 1; s <= logN; s++) {
+        uint32_t m = 1u << s;
+        double angle = 2.0 * M_PI / m;
+        Complex wm = cmplx(cos(angle), sin(angle));
+        for (uint32_t k = 0; k < N; k += m) {
+            Complex w = cmplx(1.0, 0.0);
+            for (uint32_t j = 0; j < m/2; j++) {
+                Complex t = cmul(w, buf[k + j + m/2]);
+                Complex u = buf[k + j];
+                buf[k + j] = cadd(u, t);
+                buf[k + j + m/2] = csub(u, t);
+                w = cmul(w, wm);
+            }
+        }
+    }
+}
+
+/* ─── Bluestein's DFT: O(N·log N) for ANY dimension N ─────────────────── 
+ *
+ * Converts a length-N DFT into a circular convolution of length M (power of 2),
+ * computed via two FFTs and one IFFT.  Works for any N.
+ *
+ * Identity: ω^(jk) = ω^(j²/2) · ω^(k²/2) · ω^(-(j-k)²/2)
+ *
+ * Input:  x[0..N-1]     (overwritten with result)
+ * Output: X[j] = Σ_k x[k]·ω^(jk),  ω = exp(2πi/N)
+ *
+ * No 1/√N scaling — caller handles that.
+ */
+static void bluestein_dft(Complex *x, uint32_t N)
+{
+    if (N <= 1) return;
+
+    uint32_t M = next_pow2(2 * N - 1);  /* convolution length */
+
+    /* Chirp: chirp[k] = exp(-iπk²/N) */
+    Complex *chirp = calloc(N, sizeof(Complex));
+    for (uint32_t k = 0; k < N; k++) {
+        double phase = M_PI * (double)k * (double)k / (double)N;
+        chirp[k] = cmplx(cos(phase), -sin(phase));
+    }
+
+    /* a[k] = x[k] · chirp[k],  zero-padded to M */
+    Complex *a = calloc(M, sizeof(Complex));
+    for (uint32_t k = 0; k < N; k++)
+        a[k] = cmul(x[k], chirp[k]);
+
+    /* b[k] = conj(chirp[k]) with wrap-around for negative indices */
+    Complex *b = calloc(M, sizeof(Complex));
+    b[0] = cconj(chirp[0]);
+    for (uint32_t k = 1; k < N; k++) {
+        b[k]     = cconj(chirp[k]);
+        b[M - k] = cconj(chirp[k]);
+    }
+
+    /* Convolve via FFT: FFT(a), FFT(b), pointwise multiply, IFFT */
+    fft_pow2_inplace(a, M);
+    fft_pow2_inplace(b, M);
+
+    for (uint32_t i = 0; i < M; i++)
+        a[i] = cmul(a[i], b[i]);
+
+    /* IFFT = conj → FFT → conj → /M */
+    for (uint32_t i = 0; i < M; i++) a[i] = cconj(a[i]);
+    fft_pow2_inplace(a, M);
+    double inv_M = 1.0 / (double)M;
+    for (uint32_t i = 0; i < M; i++)
+        a[i] = cmplx(a[i].real * inv_M, -a[i].imag * inv_M);
+
+    /* Extract result: X[j] = chirp[j] · a[j] */
+    for (uint32_t j = 0; j < N; j++)
+        x[j] = cmul(chirp[j], a[j]);
+
+    free(chirp);
+    free(a);
+    free(b);
+}
+
 /* ─── Precomputed DFT₆ Matrix ────────────────────────────────────────────── */
 /* H[j][k] = (1/√6) · exp(2πi·j·k/6)
  * ω = exp(2πi/6) = cos(60°) + i·sin(60°) = 0.5 + i·(√3/2)
@@ -467,44 +574,32 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
                 }
                 free(buf);
             } else {
-                /* ── Direct DFT for non-power-of-2 (e.g. D=6) ── */
+                /* ── Bluestein DFT: O(D·log D) for any D ── */
                 Complex *tmp = calloc(dim, sizeof(Complex));
                 if (which == 0) {
                     for (uint32_t b = 0; b < dim; b++) {
-                        for (uint32_t j = 0; j < dim; j++) {
-                            tmp[j] = cmplx(0.0, 0.0);
-                            for (uint32_t k = 0; k < dim; k++) {
-                                double phase = 2.0 * M_PI * j * k / dim;
-                                Complex w = cmplx(cos(phase) * inv_sqrt_d,
-                                                  sin(phase) * inv_sqrt_d);
-                                tmp[j] = cadd(tmp[j],
-                                    cmul(w, joint[(uint64_t)b * dim + k]));
-                            }
-                        }
                         for (uint32_t j = 0; j < dim; j++)
-                            joint[(uint64_t)b * dim + j] = tmp[j];
+                            tmp[j] = joint[(uint64_t)b * dim + j];
+                        bluestein_dft(tmp, dim);
+                        for (uint32_t j = 0; j < dim; j++)
+                            joint[(uint64_t)b * dim + j] = cmplx(tmp[j].real * inv_sqrt_d,
+                                                                   tmp[j].imag * inv_sqrt_d);
                     }
                 } else {
                     for (uint32_t a = 0; a < dim; a++) {
-                        for (uint32_t j = 0; j < dim; j++) {
-                            tmp[j] = cmplx(0.0, 0.0);
-                            for (uint32_t k = 0; k < dim; k++) {
-                                double phase = 2.0 * M_PI * j * k / dim;
-                                Complex w = cmplx(cos(phase) * inv_sqrt_d,
-                                                  sin(phase) * inv_sqrt_d);
-                                tmp[j] = cadd(tmp[j],
-                                    cmul(w, joint[(uint64_t)k * dim + a]));
-                            }
-                        }
                         for (uint32_t j = 0; j < dim; j++)
-                            joint[(uint64_t)j * dim + a] = tmp[j];
+                            tmp[j] = joint[(uint64_t)j * dim + a];
+                        bluestein_dft(tmp, dim);
+                        for (uint32_t j = 0; j < dim; j++)
+                            joint[(uint64_t)j * dim + a] = cmplx(tmp[j].real * inv_sqrt_d,
+                                                                   tmp[j].imag * inv_sqrt_d);
                     }
                 }
                 free(tmp);
             }
             printf("  [H] QFT_%u WRITTEN to Hilbert space at Ptr 0x%016lX (side %c%s)\n",
                    dim, c->hilbert.magic_ptr, which == 0 ? 'A' : 'B',
-                   is_pow2 ? ", FFT" : "");
+                   is_pow2 ? ", FFT" : ", Bluestein");
         } else {
             c->hilbert.q_basis_rotation++;
             printf("  [H] Basis rotation WRITTEN to Ptr 0x%016lX (rot=%lu)\n",
@@ -532,7 +627,6 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
     double inv_sqrt_d = 1.0 / sqrt((double)base_d);
 
     Complex *temp = calloc(base_d, sizeof(Complex));
-    Complex *out  = calloc(base_d, sizeof(Complex));
 
     for (uint64_t base = 0; base < ns; base++) {
         if ((base / stride) % base_d != 0) continue;
@@ -541,22 +635,15 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
         for (uint32_t j = 0; j < base_d; j++)
             temp[j] = state[base + j * stride];
 
-        /* Apply DFT_D */
-        for (uint32_t j = 0; j < base_d; j++) {
-            out[j] = cmplx(0.0, 0.0);
-            for (uint32_t k = 0; k < base_d; k++) {
-                double phase = 2.0 * M_PI * j * k / base_d;
-                Complex w = cmplx(cos(phase) * inv_sqrt_d,
-                                  sin(phase) * inv_sqrt_d);
-                out[j] = cadd(out[j], cmul(w, temp[k]));
-            }
-        }
+        /* Bluestein DFT: O(D·log D) for any D */
+        bluestein_dft(temp, base_d);
 
+        /* Scale by 1/√D and scatter back */
         for (uint32_t j = 0; j < base_d; j++)
-            state[base + j * stride] = out[j];
+            state[base + j * stride] = cmplx(temp[j].real * inv_sqrt_d,
+                                              temp[j].imag * inv_sqrt_d);
     }
     free(temp);
-    free(out);
 
     printf("  [H] DFT_%u Hadamard on chunk %lu, hexit %lu via Ptr 0x%016lX\n",
            base_d, id, hexit_index, c->hilbert.magic_ptr);
