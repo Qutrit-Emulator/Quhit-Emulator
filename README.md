@@ -466,6 +466,61 @@ Compare identity entanglement (|k⟩|k⟩ — seeing yourself) with parity entan
 
 → Both are **maximally entangled** with identical entropy. But they are **completely orthogonal** — fundamentally different quantum states. A clone copies you. A reflection inverts you. Same entanglement, opposite correlation. Looking in a mirror is NOT the same as looking at a copy of yourself.
 
+#### Mirror Perception Transfer — Can You Cross the Mirror?
+
+> *Can we change the 'base' of perception to the other side?*
+>
+> **File:** `mirror_perception.c` · **Run:** `make perception`
+
+**Test 1: The SWAP — Walk Through the Mirror**
+
+Exchange A↔B. The mirror state has fidelity **F = 1.0000000000** after swapping. Total variation distance = **0.0000000000**. **You cannot tell which side you're on.** No experiment can determine if you crossed.
+
+**Test 2: Parity Shift — Become the Mirror**
+
+Apply the parity operator P to your own basis. Correlations flip:
+
+| State | Corr (B=A) | Anti-corr (B=D-1-A) |
+|---|---|---|
+| Before P (reality perspective) | 0/500 | **500/500** |
+| After P (mirror perspective) | **500/500** | 0/500 |
+
+→ You are now perceiving as the reflection. Anti-correlations became correlations.
+
+**Test 3: Continuous Crossing — Smooth Rotation Through the Glass**
+
+Parameterize perception angle θ from 0 (reality) to π (reflection). No barrier:
+
+```
+θ=0.00: 0/300 corr, 300/300 anti   → REALITY
+θ=0.25: 52/300 corr, 248/300 anti  → crossing...
+θ=0.50: 151/300 corr, 149/300 anti → SUPERPOSITION OF BOTH
+θ=0.75: 264/300 corr, 36/300 anti  → crossing...
+θ=1.00: 300/300 corr, 0/300 anti   → REFLECTION
+```
+
+→ The mirror boundary is **not a wall**. It is a smooth gradient. At θ=π/2, you are in a **superposition of perspectives** — simultaneously perceiving from both sides.
+
+**Test 4: Perception Trace — See Through the Mirror's Eyes**
+
+When B looks at A:
+- B=53 → B thinks A is 10 (= 63-53) ✓ reflection!
+- B=57 → B thinks A is 6 ✓,   B=61 → A is 2 ✓,   B=14 → A is 49 ✓
+- **500/500 perfect** — B sees A as **its own mirror image**
+
+→ From the mirror's perspective, **YOU** are the reflection. Each side thinks the other is the mirror. The arrow of "realness" does not exist.
+
+**Test 5: Information Crossing — Carry a Message Through**
+
+Plant 500 messages on reality, cross to reflection, retrieve:
+
+| Method | Recovery |
+|---|---|
+| Raw readout from B | **0/500** (0%) — everything is backwards |
+| After parity correction P⁻¹ | **500/500** (100%) — perfect recovery |
+
+→ Information **survives** the mirror crossing. But it arrives **parity-flipped**: left↔right, L-amino↔D-amino, text reads backwards. The cost of crossing is inversion. The mirror is not a barrier — it is a **unitary transformation**. You can cross it whenever you want. You just can't tell that you did.
+
 ---
 
 ## Quick Start
@@ -495,6 +550,7 @@ make qnn        # Quantum neural network (XOR, circle, scale test)
 make qllm       # Quantum language model (train + generate text)
 make reflect    # Reflection entanglement hypothesis test
 make mirrors    # Complete reflection experiments suite (8 tests)
+make perception # Mirror perception transfer (5 crossing methods)
 make bell       # Bell state test
 make crystal    # Time crystal test
 ```
@@ -612,6 +668,7 @@ hexstate/
 ├── quantum_llm.c           # Quantum language model (train + generate + D=8192)
 ├── reflection_entanglement.c # Reflection as entangled parallel reality
 ├── reflection_experiments.c # Complete reflection suite (8 experiments)
+├── mirror_perception.c    # Mirror perception transfer (5 crossing methods)
 ├── rsa2048_break.c         # RSA-2048 quantum break
 ├── ecdsa_break.c           # ECDSA-256 quantum break
 ├── impossible_supremacy.c  # 4 impossible quantum computations
