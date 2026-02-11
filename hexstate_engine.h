@@ -293,22 +293,24 @@ void     print_chunk_state(HexStateEngine *eng, uint64_t id);
  * dim is read from q_joint_dim (whatever D the state was braided at). */
 double *hilbert_read_joint_probs(HexStateEngine *eng, uint64_t id);
 
-/* ═══ Bell inequality tools ═══ */
+/* ═══ Bell inequality test — native engine operation ═══ */
 
-typedef struct { double theta_A; double theta_B; } BellPhaseCtx;
+/* Result from a CHSH Bell test */
+typedef struct {
+    double   correlation_pct;   /* P(a=b) with no rotation (expect 100%) */
+    double   config_agree[4];   /* P(a=b) for each CHSH config */
+    double   S;                 /* CHSH S-value: classical bound 2.0 */
+    int      violation;         /* 1 if S > 2.0 */
+    uint32_t dim;               /* Hilbert space dimension (D) */
+    uint32_t n_shots;           /* Number of statistical shots per config */
+} BellResult;
 
-/* Apply measurement-setting–dependent phase rotation to joint state */
-void bell_phase_oracle(HexStateEngine *eng, uint64_t id, BellPhaseCtx *ctx);
+/* Run a full CHSH Bell test using apply_local_unitary for independent
+ * measurement bases. Creates fresh Bell pairs per shot. Returns results.
+ * Invocable via OP_BELL_TEST (0x0E) instruction. */
+BellResult bell_test(HexStateEngine *eng, uint32_t dim, uint32_t n_shots);
 
-/* Compute CGLMP I_D Bell inequality from 4 probability tables.
- * Classical bound: I_D ≤ 2.  Quantum violation: I_D > 2.
- * Works at any D. */
-double hilbert_compute_cglmp(double *P00, double *P01, double *P10, double *P11,
-                             uint32_t dim);
-
-/* One-shot Bell test: braid at dim D, apply phases, QFT, read I_D.
- * Returns I_D > 0 for violation. Works at any D.
- * Needs oracle 0xBE registered for phase injection. */
-double hilbert_bell_test(HexStateEngine *eng, double alpha, double beta, uint32_t dim);
+/* Print formatted Bell test results */
+void bell_test_print(BellResult *r);
 
 #endif /* HEXSTATE_ENGINE_H */
