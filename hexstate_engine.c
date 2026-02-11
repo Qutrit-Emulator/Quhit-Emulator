@@ -285,6 +285,21 @@ int engine_init(HexStateEngine *eng)
 
 void engine_destroy(HexStateEngine *eng)
 {
+    /* Free all joint states from braid partners (avoid double-free) */
+    for (uint64_t i = 0; i < eng->num_chunks; i++) {
+        Chunk *c = &eng->chunks[i];
+        for (uint8_t p = 0; p < c->hilbert.num_partners; p++) {
+            Complex *js = c->hilbert.partners[p].q_joint_state;
+            if (!js) continue;
+            /* Only free if we are side A (avoid double-free with partner's copy) */
+            if (c->hilbert.partners[p].q_which == 0) {
+                free(js);
+            }
+            c->hilbert.partners[p].q_joint_state = NULL;
+        }
+        c->hilbert.num_partners = 0;
+    }
+
     /* Unmap all chunk shadow states */
     for (uint64_t i = 0; i < eng->num_chunks; i++) {
         Chunk *c = &eng->chunks[i];
@@ -405,10 +420,8 @@ int init_chunk(HexStateEngine *eng, uint64_t id, uint64_t num_hexits)
         c->hilbert.q_flags = 0x01;  /* superposed */
         c->hilbert.q_entangle_seed = 0;
         c->hilbert.q_basis_rotation = 0;
-        c->hilbert.q_joint_state = NULL;
-        c->hilbert.q_joint_dim = 0;
-        c->hilbert.q_partner = 0;
-        c->hilbert.q_which = 0;
+        memset(c->hilbert.partners, 0, sizeof(c->hilbert.partners));
+        c->hilbert.num_partners = 0;
 
         printf("  [PARALLEL] Magic Pointer 0x%016lX — %lu hexits (infinite plane)\n",
                c->hilbert.magic_ptr, num_hexits);
@@ -489,10 +502,10 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
          * The joint state IS the quantum state.
          * Uses Cooley-Tukey FFT for power-of-2 dimensions (O(D·log D) per row).
          * Falls back to direct DFT for other dimensions. */
-        if (c->hilbert.q_joint_state) {
-            Complex *joint = c->hilbert.q_joint_state;
-            uint8_t which = c->hilbert.q_which;
-            uint32_t dim = c->hilbert.q_joint_dim;
+        if (c->hilbert.num_partners > 0 && c->hilbert.partners[0].q_joint_state) {
+            Complex *joint = c->hilbert.partners[0].q_joint_state;
+            uint8_t which = c->hilbert.partners[0].q_which;
+            uint32_t dim = c->hilbert.partners[0].q_joint_dim;
             if (dim == 0) dim = 6;
             double inv_sqrt_d = 1.0 / sqrt((double)dim);
 
@@ -621,7 +634,7 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
      * transform the D amplitudes indexed by the target hexit.
      * D defaults to 6 (hexit base) but reads q_joint_dim if set.
      */
-    uint32_t base_d = c->hilbert.q_joint_dim;
+    uint32_t base_d = (c->hilbert.num_partners > 0) ? c->hilbert.partners[0].q_joint_dim : 0;
     if (base_d == 0) base_d = 6;
     uint64_t stride = power_of_6(hexit_index);
     double inv_sqrt_d = 1.0 / sqrt((double)base_d);
@@ -663,11 +676,14 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
          * result via Born rule — the Hilbert space gives us
          * the answer. */
 
-        if (c->hilbert.q_joint_state) {
-            /* ── Genuine quantum measurement (Born rule) ── */
-            Complex *joint = c->hilbert.q_joint_state;
-            uint8_t which = c->hilbert.q_which;
-            uint32_t dim = c->hilbert.q_joint_dim;
+        if (c->hilbert.num_partners > 0 && c->hilbert.partners[0].q_joint_state) {
+            /* ── Genuine quantum measurement (Born rule) ──
+             * Sample outcome from first partner, then collapse
+             * ALL partner joint states to the same result.
+             * This is crucial for star-topology GHZ. */
+            Complex *joint = c->hilbert.partners[0].q_joint_state;
+            uint8_t which = c->hilbert.partners[0].q_which;
+            uint32_t dim = c->hilbert.partners[0].q_joint_dim;
             if (dim == 0) dim = 6;
 
             /* READ: compute marginal probabilities for our side */
@@ -691,31 +707,38 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             }
             free(probs);
 
-            /* WRITE collapse back to Hilbert space:
+            /* WRITE collapse back to ALL partner joint states:
              * Zero all amplitudes incompatible with our outcome.
-             * The partner's state is automatically determined. */
-            double norm = 0.0;
-            for (uint32_t them = 0; them < dim; them++) {
-                for (uint32_t me = 0; me < dim; me++) {
-                    uint64_t idx = (which == 0)
-                        ? (uint64_t)them * dim + me
-                        : (uint64_t)me * dim + them;
-                    if ((int)me != result) {
-                        joint[idx] = cmplx(0.0, 0.0);
-                    } else {
-                        norm += cnorm2(joint[idx]);
+             * Each partner's state is automatically determined. */
+            for (uint8_t p = 0; p < c->hilbert.num_partners; p++) {
+                Complex *pj = c->hilbert.partners[p].q_joint_state;
+                uint8_t pw = c->hilbert.partners[p].q_which;
+                uint32_t pd = c->hilbert.partners[p].q_joint_dim;
+                if (!pj || pd == 0) continue;
+
+                double norm = 0.0;
+                for (uint32_t them = 0; them < pd; them++) {
+                    for (uint32_t me = 0; me < pd; me++) {
+                        uint64_t idx = (pw == 0)
+                            ? (uint64_t)them * pd + me
+                            : (uint64_t)me * pd + them;
+                        if ((int)me != result) {
+                            pj[idx] = cmplx(0.0, 0.0);
+                        } else {
+                            norm += cnorm2(pj[idx]);
+                        }
                     }
                 }
-            }
-            /* Renormalize surviving amplitudes */
-            if (norm > 0.0) {
-                double scale = 1.0 / sqrt(norm);
-                for (uint32_t them = 0; them < dim; them++) {
-                    uint64_t idx = (which == 0)
-                        ? (uint64_t)them * dim + result
-                        : (uint64_t)result * dim + them;
-                    joint[idx] = cmplx(joint[idx].real * scale,
-                                       joint[idx].imag * scale);
+                /* Renormalize surviving amplitudes */
+                if (norm > 0.0) {
+                    double scale = 1.0 / sqrt(norm);
+                    for (uint32_t them = 0; them < pd; them++) {
+                        uint64_t idx = (pw == 0)
+                            ? (uint64_t)them * pd + result
+                            : (uint64_t)result * pd + them;
+                        pj[idx] = cmplx(pj[idx].real * scale,
+                                        pj[idx].imag * scale);
+                    }
                 }
             }
 
@@ -723,8 +746,9 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             c->hilbert.q_flags = 0x02;  /* measured */
 
             printf("  [MEAS] READ Hilbert space at Ptr 0x%016lX "
-                   "(side %c, Born rule, D=%u) => %d\n",
-                   c->hilbert.magic_ptr, which == 0 ? 'A' : 'B', dim, result);
+                   "(side %c, Born rule, D=%u, %u partners) => %d\n",
+                   c->hilbert.magic_ptr, which == 0 ? 'A' : 'B', dim,
+                   c->hilbert.num_partners, result);
 
             return (uint64_t)result;
         }
@@ -734,7 +758,7 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
         uint64_t seed  = c->hilbert.q_entangle_seed;
         uint64_t basis = c->hilbert.q_basis_rotation;
         uint64_t result;
-        uint32_t fdim = c->hilbert.q_joint_dim;
+        uint32_t fdim = (c->hilbert.num_partners > 0) ? c->hilbert.partners[0].q_joint_dim : 0;
         if (fdim == 0) fdim = 6;
 
         if (seed != 0 && (flags & 0x01)) {
@@ -903,14 +927,13 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
     if (eng->chunks[a].hilbert.shadow_state == NULL &&
         eng->chunks[b].hilbert.shadow_state == NULL) {
 
-        /* Free any previous joint state */
-        if (eng->chunks[a].hilbert.q_joint_state &&
-            eng->chunks[a].hilbert.q_joint_state != eng->chunks[b].hilbert.q_joint_state) {
-            free(eng->chunks[a].hilbert.q_joint_state);
-        }
-        if (eng->chunks[b].hilbert.q_joint_state &&
-            eng->chunks[b].hilbert.q_joint_state != eng->chunks[a].hilbert.q_joint_state) {
-            free(eng->chunks[b].hilbert.q_joint_state);
+        /* Check partner capacity */
+        uint8_t pa = eng->chunks[a].hilbert.num_partners;
+        uint8_t pb = eng->chunks[b].hilbert.num_partners;
+        if (pa >= MAX_BRAID_PARTNERS || pb >= MAX_BRAID_PARTNERS) {
+            printf("  [BRAID] ERROR: max partners reached (chunk %lu=%u, chunk %lu=%u)\n",
+                   a, pa, b, pb);
+            return;
         }
 
         /* Allocate joint state in Hilbert space */
@@ -920,23 +943,27 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
         for (uint32_t k = 0; k < dim; k++)
             joint[k * dim + k] = cmplx(amp, 0.0);  /* |k⟩_A |k⟩_B */
 
-        /* WRITE to both Magic Pointer addresses */
-        eng->chunks[a].hilbert.q_joint_state = joint;
-        eng->chunks[b].hilbert.q_joint_state = joint;
-        eng->chunks[a].hilbert.q_joint_dim = dim;
-        eng->chunks[b].hilbert.q_joint_dim = dim;
-        eng->chunks[a].hilbert.q_partner = b;
-        eng->chunks[b].hilbert.q_partner = a;
-        eng->chunks[a].hilbert.q_which = 0;  /* A side */
-        eng->chunks[b].hilbert.q_which = 1;  /* B side */
+        /* APPEND to both chunks' partner arrays */
+        eng->chunks[a].hilbert.partners[pa].q_joint_state = joint;
+        eng->chunks[a].hilbert.partners[pa].q_joint_dim = dim;
+        eng->chunks[a].hilbert.partners[pa].q_partner = b;
+        eng->chunks[a].hilbert.partners[pa].q_which = 0;  /* A side */
+        eng->chunks[a].hilbert.num_partners = pa + 1;
+
+        eng->chunks[b].hilbert.partners[pb].q_joint_state = joint;
+        eng->chunks[b].hilbert.partners[pb].q_joint_dim = dim;
+        eng->chunks[b].hilbert.partners[pb].q_partner = a;
+        eng->chunks[b].hilbert.partners[pb].q_which = 1;  /* B side */
+        eng->chunks[b].hilbert.num_partners = pb + 1;
+
         eng->chunks[a].hilbert.q_flags = 0x01;  /* superposed */
         eng->chunks[b].hilbert.q_flags = 0x01;  /* superposed */
 
         printf("  [BRAID] Bell state |Ψ⟩=(1/√%u)Σ|k⟩|k⟩ WRITTEN to Hilbert space (dim=%u, %lu bytes)\n"
-               "          Ptr 0x%016lX (A) <-> Ptr 0x%016lX (B)\n",
+               "          Ptr 0x%016lX (A, slot %u) <-> Ptr 0x%016lX (B, slot %u)\n",
                dim, dim, joint_size * sizeof(Complex),
-               eng->chunks[a].hilbert.magic_ptr,
-               eng->chunks[b].hilbert.magic_ptr);
+               eng->chunks[a].hilbert.magic_ptr, pa,
+               eng->chunks[b].hilbert.magic_ptr, pb);
     } else {
         /* Shadow-backed: use seed fallback */
         uint64_t entangle_seed = engine_prng(eng);
@@ -951,7 +978,7 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
 
 void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b)
 {
-    /* Remove all links between a and b */
+    /* Remove all links between a and b from braid_links */
     uint64_t write = 0;
     for (uint64_t i = 0; i < eng->num_braid_links; i++) {
         BraidLink *l = &eng->braid_links[i];
@@ -966,17 +993,41 @@ void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b)
     }
     eng->num_braid_links = write;
 
-    /* ── Free joint state from Hilbert space ── */
+    /* ── Remove partner entries from both chunks ── */
     if (a < eng->num_chunks && b < eng->num_chunks) {
-        if (eng->chunks[a].hilbert.q_joint_state &&
-            eng->chunks[a].hilbert.q_joint_state ==
-            eng->chunks[b].hilbert.q_joint_state) {
-            free(eng->chunks[a].hilbert.q_joint_state);
+        Complex *freed_joint = NULL;
+
+        /* Remove b from a's partner list */
+        HilbertRef *ha = &eng->chunks[a].hilbert;
+        for (uint8_t i = 0; i < ha->num_partners; i++) {
+            if (ha->partners[i].q_partner == b) {
+                if (ha->partners[i].q_which == 0 && ha->partners[i].q_joint_state) {
+                    freed_joint = ha->partners[i].q_joint_state;
+                    free(ha->partners[i].q_joint_state);
+                }
+                /* Shift remaining entries down */
+                for (uint8_t j = i; j + 1 < ha->num_partners; j++)
+                    ha->partners[j] = ha->partners[j + 1];
+                ha->num_partners--;
+                memset(&ha->partners[ha->num_partners], 0, sizeof(ha->partners[0]));
+                break;
+            }
         }
-        eng->chunks[a].hilbert.q_joint_state = NULL;
-        eng->chunks[b].hilbert.q_joint_state = NULL;
-        eng->chunks[a].hilbert.q_partner = 0;
-        eng->chunks[b].hilbert.q_partner = 0;
+
+        /* Remove a from b's partner list */
+        HilbertRef *hb = &eng->chunks[b].hilbert;
+        for (uint8_t i = 0; i < hb->num_partners; i++) {
+            if (hb->partners[i].q_partner == a) {
+                /* Don't double-free: we already freed via side A above */
+                hb->partners[i].q_joint_state = NULL;
+                /* Shift remaining entries down */
+                for (uint8_t j = i; j + 1 < hb->num_partners; j++)
+                    hb->partners[j] = hb->partners[j + 1];
+                hb->num_partners--;
+                memset(&hb->partners[hb->num_partners], 0, sizeof(hb->partners[0]));
+                break;
+            }
+        }
     }
     if (a < eng->num_chunks)
         eng->chunks[a].hilbert.q_entangle_seed = 0;
@@ -1083,10 +1134,8 @@ int op_infinite_resources(HexStateEngine *eng, uint64_t chunk_id, uint64_t size)
     c->hilbert.q_flags = 0x01;  /* superposed */
     c->hilbert.q_entangle_seed = 0;
     c->hilbert.q_basis_rotation = 0;
-    c->hilbert.q_joint_state = NULL;
-    c->hilbert.q_joint_dim = 0;
-    c->hilbert.q_partner = 0;
-    c->hilbert.q_which = 0;
+    memset(c->hilbert.partners, 0, sizeof(c->hilbert.partners));
+    c->hilbert.num_partners = 0;
 
     /* Update chunk count */
     if (chunk_id >= eng->num_chunks) {
@@ -2377,13 +2426,13 @@ double *hilbert_read_joint_probs(HexStateEngine *eng, uint64_t id)
 {
     if (id >= eng->num_chunks) return NULL;
     Chunk *c = &eng->chunks[id];
-    if (!c->hilbert.q_joint_state) return NULL;
+    if (c->hilbert.num_partners == 0 || !c->hilbert.partners[0].q_joint_state) return NULL;
 
-    uint32_t dim = c->hilbert.q_joint_dim;
+    uint32_t dim = c->hilbert.partners[0].q_joint_dim;
     if (dim == 0) dim = 6;
     uint64_t d2 = (uint64_t)dim * dim;
 
-    Complex *joint = c->hilbert.q_joint_state;
+    Complex *joint = c->hilbert.partners[0].q_joint_state;
     double *probs = calloc(d2, sizeof(double));
 
     for (uint64_t i = 0; i < d2; i++)
@@ -2433,9 +2482,9 @@ typedef struct { double theta_A; double theta_B; } BellPhaseCtx;
 static void bell_phase_oracle(HexStateEngine *e, uint64_t id, void *u) {
     BellPhaseCtx *p = (BellPhaseCtx *)u;
     Chunk *ch = &e->chunks[id];
-    if (!ch->hilbert.q_joint_state) return;
-    uint32_t dim = ch->hilbert.q_joint_dim;
-    Complex *joint = ch->hilbert.q_joint_state;
+    if (ch->hilbert.num_partners == 0 || !ch->hilbert.partners[0].q_joint_state) return;
+    uint32_t dim = ch->hilbert.partners[0].q_joint_dim;
+    Complex *joint = ch->hilbert.partners[0].q_joint_state;
 
     for (uint32_t b = 0; b < dim; b++) {
         for (uint32_t a = 0; a < dim; a++) {
