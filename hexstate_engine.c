@@ -554,8 +554,20 @@ void apply_group_unitary(HexStateEngine *eng, uint64_t id,
     uint32_t my_idx = c->hilbert.group_index;
     uint32_t nm = g->num_members;
 
-    /* Worst case: each entry spawns D output entries */
+    /* ── Hash table for O(1) amortized dedup ──
+     * Key: basis index tuple (nm × uint32_t)
+     * Value: index into output arrays
+     * Uses FNV-1a hash with open addressing (linear probing). */
     uint32_t max_out = g->num_nonzero * dim;
+    /* Hash table size: next power of 2 ≥ 2× max entries for low load factor */
+    uint32_t ht_cap = 1;
+    while (ht_cap < max_out * 2) ht_cap <<= 1;
+    uint32_t ht_mask = ht_cap - 1;
+
+    /* Hash table: -1 means empty slot */
+    int32_t *ht = malloc(ht_cap * sizeof(int32_t));
+    memset(ht, -1, ht_cap * sizeof(int32_t));
+
     uint32_t *out_indices = calloc((size_t)max_out * nm, sizeof(uint32_t));
     Complex  *out_amps    = calloc(max_out, sizeof(Complex));
     uint32_t  out_count   = 0;
@@ -576,18 +588,33 @@ void apply_group_unitary(HexStateEngine *eng, uint64_t id,
 
             if (cnorm2(contrib) < 1e-30) continue;  /* skip negligible */
 
-            /* Check if this index tuple already exists in output */
+            /* Build the output tuple and compute its hash (FNV-1a) */
+            uint32_t hash = 2166136261u;
+            for (uint32_t m = 0; m < nm; m++) {
+                uint32_t val = (m == my_idx) ? new_val : row[m];
+                /* FNV-1a: XOR each byte then multiply */
+                for (int b = 0; b < 4; b++) {
+                    hash ^= (val >> (b * 8)) & 0xFF;
+                    hash *= 16777619u;
+                }
+            }
+
+            /* Probe hash table for existing entry */
+            uint32_t slot = hash & ht_mask;
             int found = -1;
-            for (uint32_t o = 0; o < out_count; o++) {
+            while (ht[slot] >= 0) {
+                /* Check if this slot's tuple matches */
+                uint32_t oi = (uint32_t)ht[slot];
                 int match = 1;
                 for (uint32_t m = 0; m < nm; m++) {
                     uint32_t expected = (m == my_idx) ? new_val : row[m];
-                    if (out_indices[o * nm + m] != expected) {
+                    if (out_indices[oi * nm + m] != expected) {
                         match = 0;
                         break;
                     }
                 }
-                if (match) { found = (int)o; break; }
+                if (match) { found = (int)oi; break; }
+                slot = (slot + 1) & ht_mask;  /* linear probe */
             }
 
             if (found >= 0) {
@@ -595,15 +622,50 @@ void apply_group_unitary(HexStateEngine *eng, uint64_t id,
                 out_amps[found].real += contrib.real;
                 out_amps[found].imag += contrib.imag;
             } else {
-                /* New entry */
+                /* New entry — write tuple, amplitude, and hash slot */
                 for (uint32_t m = 0; m < nm; m++)
                     out_indices[out_count * nm + m] =
                         (m == my_idx) ? new_val : row[m];
                 out_amps[out_count] = contrib;
+                ht[slot] = (int32_t)out_count;
                 out_count++;
+
+                /* Check if we need to grow the hash table */
+                if (out_count * 2 > ht_cap) {
+                    uint32_t new_ht_cap = ht_cap << 1;
+                    uint32_t new_ht_mask = new_ht_cap - 1;
+                    int32_t *new_ht = malloc(new_ht_cap * sizeof(int32_t));
+                    memset(new_ht, -1, new_ht_cap * sizeof(int32_t));
+                    /* Rehash all entries */
+                    for (uint32_t o = 0; o < out_count; o++) {
+                        uint32_t h = 2166136261u;
+                        for (uint32_t m = 0; m < nm; m++) {
+                            uint32_t v = out_indices[o * nm + m];
+                            for (int b2 = 0; b2 < 4; b2++) {
+                                h ^= (v >> (b2 * 8)) & 0xFF;
+                                h *= 16777619u;
+                            }
+                        }
+                        uint32_t s2 = h & new_ht_mask;
+                        while (new_ht[s2] >= 0) s2 = (s2 + 1) & new_ht_mask;
+                        new_ht[s2] = (int32_t)o;
+                    }
+                    free(ht);
+                    ht = new_ht;
+                    ht_cap = new_ht_cap;
+                    ht_mask = new_ht_mask;
+
+                    /* Also grow output arrays */
+                    uint32_t new_max = max_out * 2;
+                    out_indices = realloc(out_indices, (size_t)new_max * nm * sizeof(uint32_t));
+                    out_amps = realloc(out_amps, (size_t)new_max * sizeof(Complex));
+                    max_out = new_max;
+                }
             }
         }
     }
+
+    free(ht);
 
     /* Compact: remove near-zero entries */
     uint32_t write = 0;
@@ -1140,15 +1202,16 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
 
         if (ga && gb && ga != gb) {
             /* Both in different groups — merge gb into ga.
-             * For each nonzero entry in gb, find matching members in ga
-             * and combine. For Bell-type braiding, the constraint is:
-             * a's index must equal b's index in the merged state. */
+             * The merged state is formed by combining both groups' members
+             * and then applying the Bell constraint: a's index == b's index.
+             *
+             * Critical: ALL gb members must be reassigned to ga before gb
+             * is freed. */
             uint32_t old_ga_members = ga->num_members;
 
-            /* Add gb's non-shared members to ga */
+            /* Add ALL gb members to ga (skip if already in ga) */
             for (uint32_t m = 0; m < gb->num_members; m++) {
                 uint64_t mid = gb->member_ids[m];
-                if (mid == a || mid == b) continue;  /* skip shared */
                 /* Check not already in ga */
                 int found = 0;
                 for (uint32_t g = 0; g < ga->num_members; g++)
@@ -1161,39 +1224,118 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
                 ga->num_members++;
             }
 
-            /* Rebuild sparse state: keep only entries where a's index == b's index */
+            /* Now rebuild the sparse state for the merged group.
+             * We need to create a tensor product of ga and gb's states,
+             * then filter by the Bell constraint: a's index == b's index.
+             *
+             * The tensor product: for each entry in ga and each entry in gb,
+             * create a combined entry with all members' indices. */
             uint32_t ai = eng->chunks[a].hilbert.group_index;
-            /* Find b's index in ga (it was just added or already there) */
-            uint32_t bi = 0;
-            for (uint32_t g = 0; g < ga->num_members; g++)
-                if (ga->member_ids[g] == b) { bi = g; break; }
+            uint32_t bi = eng->chunks[b].hilbert.group_index;
+            uint32_t nm = ga->num_members;
 
-            /* Filter: keep only entries where index[ai] == index[bi] */
-            uint32_t write_pos = 0;
-            for (uint32_t e = 0; e < ga->num_nonzero; e++) {
-                uint32_t *row = &ga->basis_indices[e * ga->num_members];
-                if (row[ai] == row[bi]) {
-                    if (write_pos != e) {
-                        memcpy(&ga->basis_indices[write_pos * ga->num_members],
-                               row, ga->num_members * sizeof(uint32_t));
-                        ga->amplitudes[write_pos] = ga->amplitudes[e];
+            /* Create mapping: for each ga member slot, which old-ga/old-gb
+             * slot does it correspond to? */
+            /* old_ga entries have indices from 0..old_ga_members-1 */
+            /* new members from gb are at positions old_ga_members..nm-1 */
+
+            /* Tensor product: ga_nonzero × gb_nonzero entries */
+            uint32_t old_ga_nz = ga->num_nonzero;
+            uint32_t old_gb_nz = gb->num_nonzero;
+            uint32_t max_out = old_ga_nz * old_gb_nz;
+            if (max_out == 0) max_out = 1;
+
+            uint32_t *merged_indices = calloc((size_t)max_out * nm, sizeof(uint32_t));
+            Complex  *merged_amps   = calloc(max_out, sizeof(Complex));
+            uint32_t  merged_count  = 0;
+
+            /* Build index map: which new slot maps to which old-gb slot */
+            int gb_slot_map[MAX_GROUP_MEMBERS];  /* new slot → old gb slot, or -1 */
+            memset(gb_slot_map, -1, sizeof(gb_slot_map));
+            for (uint32_t m = 0; m < gb->num_members; m++) {
+                uint64_t mid = gb->member_ids[m];
+                for (uint32_t g = 0; g < nm; g++) {
+                    if (ga->member_ids[g] == mid) {
+                        gb_slot_map[g] = (int)m;
+                        break;
                     }
-                    write_pos++;
                 }
             }
-            ga->num_nonzero = write_pos;
+
+            for (uint32_t ea = 0; ea < old_ga_nz; ea++) {
+                for (uint32_t eb = 0; eb < old_gb_nz; eb++) {
+                    /* Build combined index tuple */
+                    uint32_t *out_row = &merged_indices[merged_count * nm];
+
+                    /* Start with ga's indices for old members */
+                    memcpy(out_row, &ga->basis_indices[ea * old_ga_members],
+                           old_ga_members * sizeof(uint32_t));
+
+                    /* Fill in new member slots from gb */
+                    for (uint32_t g = old_ga_members; g < nm; g++) {
+                        if (gb_slot_map[g] >= 0) {
+                            out_row[g] = gb->basis_indices[eb * gb->num_members + gb_slot_map[g]];
+                        }
+                    }
+
+                    /* Also fill in b's value from gb into its ga slot */
+                    for (uint32_t g = 0; g < nm; g++) {
+                        if (gb_slot_map[g] >= 0 && g < old_ga_members) {
+                            /* This ga slot is also a gb member — use gb's value */
+                            out_row[g] = gb->basis_indices[eb * gb->num_members + gb_slot_map[g]];
+                        }
+                    }
+
+                    /* Apply Bell constraint: a's index must equal b's index */
+                    if (out_row[ai] != out_row[bi]) continue;
+
+                    /* Amplitude = product of the two amplitudes */
+                    Complex amp_a = ga->amplitudes[ea];
+                    Complex amp_b = gb->amplitudes[eb];
+                    Complex combined;
+                    combined.real = amp_a.real * amp_b.real - amp_a.imag * amp_b.imag;
+                    combined.imag = amp_a.real * amp_b.imag + amp_a.imag * amp_b.real;
+
+                    if (cnorm2(combined) < 1e-30) continue;
+
+                    /* Check for duplicate tuples and merge */
+                    int found = -1;
+                    for (uint32_t o = 0; o < merged_count; o++) {
+                        if (memcmp(&merged_indices[o * nm], out_row,
+                                   nm * sizeof(uint32_t)) == 0) {
+                            found = (int)o;
+                            break;
+                        }
+                    }
+                    if (found >= 0) {
+                        merged_amps[found].real += combined.real;
+                        merged_amps[found].imag += combined.imag;
+                    } else {
+                        merged_amps[merged_count] = combined;
+                        merged_count++;
+                    }
+                }
+            }
 
             /* Renormalize */
             double norm = 0.0;
-            for (uint32_t e = 0; e < ga->num_nonzero; e++)
-                norm += cnorm2(ga->amplitudes[e]);
+            for (uint32_t e = 0; e < merged_count; e++)
+                norm += cnorm2(merged_amps[e]);
             if (norm > 0.0) {
                 double scale = 1.0 / sqrt(norm);
-                for (uint32_t e = 0; e < ga->num_nonzero; e++) {
-                    ga->amplitudes[e].real *= scale;
-                    ga->amplitudes[e].imag *= scale;
+                for (uint32_t e = 0; e < merged_count; e++) {
+                    merged_amps[e].real *= scale;
+                    merged_amps[e].imag *= scale;
                 }
             }
+
+            /* Replace ga's sparse state */
+            free(ga->basis_indices);
+            free(ga->amplitudes);
+            ga->basis_indices = merged_indices;
+            ga->amplitudes = merged_amps;
+            ga->num_nonzero = merged_count;
+            ga->sparse_cap = merged_count;
 
             /* Free gb's sparse data */
             free(gb->basis_indices);
