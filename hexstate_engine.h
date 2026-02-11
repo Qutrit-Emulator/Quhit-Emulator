@@ -54,6 +54,7 @@
 #define OP_ADDON              0x0C
 #define OP_PRINT_STATE        0x0D
 #define OP_BELL_TEST          0x0E
+#define OP_INSPECT            0x0F    /* Non-destructive Hilbert space readout */
 #define OP_SHIFT              0x10
 #define OP_REPAIR             0x11
 #define OP_NULL               0x14
@@ -313,4 +314,70 @@ BellResult bell_test(HexStateEngine *eng, uint32_t dim, uint32_t n_shots);
 /* Print formatted Bell test results */
 void bell_test_print(BellResult *r);
 
+/* ═══ Hilbert Space Inspector — non-destructive state extraction ═══
+ *
+ * CONTROVERSIAL: In real quantum mechanics, you CANNOT read the
+ * quantum state without collapsing it. But in the HexState Engine,
+ * the Hilbert space IS memory. Magic Pointers literally point to
+ * the amplitudes. We can just... read them.
+ *
+ * These functions read the full quantum state on demand:
+ * amplitudes, phases, probabilities, entanglement structure —
+ * all WITHOUT collapsing or modifying the state.
+ *
+ * Invocable via OP_INSPECT (0x0F) instruction.
+ * ═══════════════════════════════════════════════════════════════ */
+
+#define MAX_INSPECT_ENTRIES 256
+
+#define MAX_SNAP_MEMBERS 16   /* Max members to track in snapshot */
+
+/* A single entry in the state decomposition */
+typedef struct {
+    uint32_t  indices[MAX_SNAP_MEMBERS]; /* Basis index per member */
+    double    amp_real;                   /* Re(α) */
+    double    amp_imag;                   /* Im(α) */
+    double    probability;               /* |α|² */
+    double    phase_rad;                 /* arg(α) in radians */
+} StateEntry;
+
+/* Complete snapshot of a Hilbert space — read without collapse */
+typedef struct {
+    /* Identity */
+    uint64_t  chunk_id;            /* Which register was inspected */
+    uint32_t  dim;                 /* D (per-register dimension) */
+    uint32_t  num_members;         /* How many registers share this state */
+    uint64_t  member_ids[MAX_SNAP_MEMBERS];
+
+    /* Full state decomposition */
+    uint32_t  num_entries;         /* Number of non-zero amplitudes */
+    StateEntry entries[MAX_INSPECT_ENTRIES];
+
+    /* Aggregate statistics */
+    double    total_probability;   /* Should be 1.0 for normalized state */
+    double    purity;              /* Tr(ρ²) — 1.0 = pure, 1/D = maximally mixed */
+    double    entropy;             /* Von Neumann entropy S(ρ_A) for this register */
+    int       is_entangled;        /* 1 if non-zero entropy with partners */
+    int       is_collapsed;        /* 1 if measurement has occurred */
+
+    /* Marginal probabilities for the inspected register */
+    double    marginal_probs[NUM_BASIS_STATES]; /* P(k) for k=0..D-1 */
+
+    /* Reduced density matrix for inspected register: dim × dim complex */
+    Complex   rho[NUM_BASIS_STATES * NUM_BASIS_STATES];
+} HilbertSnapshot;
+
+/* Non-destructive readout: extract full state without collapse.
+ * This is what quantum mechanics says you CANNOT DO.
+ * We do it anyway because the Hilbert space is memory. */
+HilbertSnapshot inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id);
+
+/* Print formatted inspection results */
+void inspect_print(HilbertSnapshot *snap);
+
+/* Compute von Neumann entanglement entropy between chunk_id and
+ * its partners. Returns S = -Tr(ρ_A log₂ ρ_A). S > 0 = entangled. */
+double hilbert_entanglement_entropy(HexStateEngine *eng, uint64_t chunk_id);
+
 #endif /* HEXSTATE_ENGINE_H */
+
