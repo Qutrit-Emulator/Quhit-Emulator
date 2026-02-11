@@ -91,7 +91,7 @@ typedef struct {
  * collapse is automatic because all members read from it.
  * Sparse representation: for GHZ states, only D entries regardless
  * of group size. */
-#define MAX_GROUP_MEMBERS 1024
+#define MAX_GROUP_MEMBERS 8192
 typedef struct HilbertGroup {
     uint32_t  dim;              /* Per-register dimension (6) */
     uint32_t  num_members;      /* How many registers share this state */
@@ -102,6 +102,27 @@ typedef struct HilbertGroup {
     uint32_t *basis_indices;    /* Flattened: num_nonzero × num_members indices */
     Complex  *amplitudes;       /* num_nonzero amplitudes */
     uint8_t   collapsed;        /* 1 if a measurement has collapsed this group */
+
+    /* ═══ Deferred Local Unitaries ═══
+     * Instead of materializing D^N entries, store each member's
+     * pending unitary as a D×D matrix. The state is implicitly:
+     *   |Ψ⟩ = [Π CZ] · Σ_k  α_k · ⊗_m (U_m |index_{m,k}⟩)
+     * Measurement samples from this in O((N+E) × D²) without ever
+     * building the full state. The Hilbert space holds the math. */
+    Complex  *deferred_U[MAX_GROUP_MEMBERS]; /* D×D unitary per member (NULL = identity) */
+    uint32_t  num_deferred;     /* How many members have pending unitaries */
+    uint8_t   no_defer;         /* If set, force expansion (used during materialization) */
+
+    /* ═══ Deferred CZ (Non-Local) Gates ═══
+     * CZ|j,k⟩ = ω^(j·k)|j,k⟩ where ω = e^(2πi/D)
+     * Stored as pairs — NOT materialized.  At measurement time,
+     * CZ phases cancel in marginals (|ω|²=1). After sampling
+     * outcome v for member a, absorb ω^(v·j_b) into partner b's
+     * deferred unitary via diagonal left-multiplication.
+     * Cost: O((N+E) × D²) — still polynomial. */
+    uint32_t *cz_pairs;         /* Pairs: [a0,b0, a1,b1, ...] (member indices) */
+    uint32_t  num_cz;           /* Number of CZ pairs stored */
+    uint32_t  cz_cap;           /* Allocated capacity for pairs */
 } HilbertGroup;
 
 /* Hilbert Space Reference (Magic Pointer) */
@@ -249,6 +270,8 @@ void apply_group_unitary(HexStateEngine *eng, uint64_t id,
                          Complex *U, uint32_t dim);
 void apply_local_unitary(HexStateEngine *eng, uint64_t id,
                          const Complex *U, uint32_t dim);
+void materialize_deferred(HexStateEngine *eng, HilbertGroup *g);
+void apply_cz_gate(HexStateEngine *eng, uint64_t id_a, uint64_t id_b);
 uint64_t measure_chunk(HexStateEngine *eng, uint64_t id);
 void grover_diffusion(HexStateEngine *eng, uint64_t id);
 
