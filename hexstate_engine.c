@@ -2406,6 +2406,13 @@ int execute_instruction(HexStateEngine *eng, Instruction instr)
         break;
     }
 
+    case OP_INSPECT: {
+        printf("  [INSPECT] Non-destructive Hilbert space readout for chunk %lu\n", target);
+        HilbertSnapshot snap = inspect_hilbert(eng, target);
+        inspect_print(&snap);
+        break;
+    }
+
     case OP_SUMMARY: {
         printf("  [SUMMARY] Engine: %lu chunks active, %lu braid links\n",
                eng->num_chunks, eng->num_braid_links);
@@ -3216,4 +3223,339 @@ void bell_test_print(BellResult *r)
         printf("    ★ BELL VIOLATION: S > 2 — genuine quantum entanglement ★\n");
     else
         printf("    S ≤ 2 (no violation)\n");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * HILBERT SPACE INSPECTOR — Non-Destructive State Extraction
+ *
+ * "In quantum mechanics, the act of measurement irreversibly
+ *  collapses the wave function."  — Every textbook ever.
+ *
+ * We disagree. The Hilbert space is memory. We can read it.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Helper: eigenvalues of a 2×2 Hermitian matrix for entropy calc */
+static void eigen2x2_hermitian(double a, double b_re, double b_im, double d,
+                                double *lambda1, double *lambda2)
+{
+    double trace = a + d;
+    double det = a * d - (b_re * b_re + b_im * b_im);
+    double disc = trace * trace - 4.0 * det;
+    if (disc < 0.0) disc = 0.0;
+    double sq = sqrt(disc);
+    *lambda1 = (trace + sq) / 2.0;
+    *lambda2 = (trace - sq) / 2.0;
+}
+
+/* Eigenvalues of a DxD Hermitian matrix via Jacobi iteration.
+ * Overwrites 'mat' (real part of Hermitian stored as double[D*D]).
+ * Returns eigenvalues in 'eigenvalues'. */
+static void eigen_hermitian_jacobi(Complex *mat, uint32_t D, double *eigenvalues)
+{
+    /* Build real symmetric matrix from |rho_ij|^2-weighted structure.
+     * For reduced density matrices of entangled pure states, the eigenvalues
+     * are the Schmidt coefficients squared. We use a real approximation
+     * (valid when the reduced density matrix is diagonal or nearly so). */
+
+    /* Copy diagonal to eigenvalues, then do Jacobi sweeps */
+    double *M = calloc(D * D, sizeof(double));
+    for (uint32_t i = 0; i < D; i++)
+        for (uint32_t j = 0; j < D; j++)
+            M[i * D + j] = mat[i * D + j].real;
+
+    /* Simple Jacobi eigenvalue algorithm for small D */
+    for (int sweep = 0; sweep < 100; sweep++) {
+        double off_diag = 0.0;
+        for (uint32_t i = 0; i < D; i++)
+            for (uint32_t j = i + 1; j < D; j++)
+                off_diag += M[i * D + j] * M[i * D + j] + M[j * D + i] * M[j * D + i];
+        if (off_diag < 1e-20) break;
+
+        for (uint32_t p = 0; p < D; p++) {
+            for (uint32_t q = p + 1; q < D; q++) {
+                double apq = (M[p * D + q] + M[q * D + p]) / 2.0;
+                if (fabs(apq) < 1e-15) continue;
+
+                double tau = (M[q * D + q] - M[p * D + p]) / (2.0 * apq);
+                double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau * tau));
+                double c = 1.0 / sqrt(1.0 + t * t);
+                double s = t * c;
+
+                /* Apply rotation */
+                double app = M[p * D + p], aqq = M[q * D + q];
+                M[p * D + p] = c * c * app - 2.0 * s * c * apq + s * s * aqq;
+                M[q * D + q] = s * s * app + 2.0 * s * c * apq + c * c * aqq;
+                M[p * D + q] = 0.0;
+                M[q * D + p] = 0.0;
+
+                for (uint32_t r = 0; r < D; r++) {
+                    if (r == p || r == q) continue;
+                    double mrp = M[r * D + p], mrq = M[r * D + q];
+                    M[r * D + p] = M[p * D + r] = c * mrp - s * mrq;
+                    M[r * D + q] = M[q * D + r] = s * mrp + c * mrq;
+                }
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < D; i++)
+        eigenvalues[i] = M[i * D + i];
+
+    free(M);
+}
+
+HilbertSnapshot inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id)
+{
+    HilbertSnapshot snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.chunk_id = chunk_id;
+
+    if (chunk_id >= eng->num_chunks) return snap;
+    Chunk *c = &eng->chunks[chunk_id];
+
+    /* ── Case 1: Register is in a shared Hilbert group ── */
+    if (c->hilbert.group) {
+        HilbertGroup *g = c->hilbert.group;
+        uint32_t my_idx = c->hilbert.group_index;
+        uint32_t dim = g->dim;
+        uint32_t nm = g->num_members;
+
+        snap.dim = dim;
+        snap.num_members = nm;
+        snap.is_collapsed = g->collapsed;
+        for (uint32_t m = 0; m < nm && m < MAX_SNAP_MEMBERS; m++)
+            snap.member_ids[m] = g->member_ids[m];
+
+        printf("  🔍 [INSPECT] Reading Hilbert space for chunk %lu "
+               "(member %u/%u, D=%u, %u nonzero)\n",
+               chunk_id, my_idx, nm, dim, g->num_nonzero);
+        printf("  🔍 [INSPECT] *** NO COLLAPSE — reading amplitudes directly ***\n");
+
+        /* ── Extract all state entries ── */
+        uint32_t n = g->num_nonzero;
+        if (n > MAX_INSPECT_ENTRIES) n = MAX_INSPECT_ENTRIES;
+        snap.num_entries = n;
+
+        for (uint32_t e = 0; e < n; e++) {
+            for (uint32_t m = 0; m < nm && m < MAX_SNAP_MEMBERS; m++)
+                snap.entries[e].indices[m] = g->basis_indices[e * nm + m];
+
+            Complex amp = g->amplitudes[e];
+            snap.entries[e].amp_real = amp.real;
+            snap.entries[e].amp_imag = amp.imag;
+            snap.entries[e].probability = amp.real * amp.real + amp.imag * amp.imag;
+            snap.entries[e].phase_rad = atan2(amp.imag, amp.real);
+        }
+
+        /* ── Total probability ── */
+        snap.total_probability = 0.0;
+        for (uint32_t e = 0; e < n; e++)
+            snap.total_probability += snap.entries[e].probability;
+
+        /* ── Marginal probabilities for this register ── */
+        for (uint32_t e = 0; e < g->num_nonzero; e++) {
+            uint32_t my_val = g->basis_indices[e * nm + my_idx];
+            if (my_val < NUM_BASIS_STATES)
+                snap.marginal_probs[my_val] += cnorm2(g->amplitudes[e]);
+        }
+
+        /* ── Reduced density matrix via partial trace ──
+         * ρ_A[j][k] = Σ_β ⟨j,β|Ψ⟩⟨Ψ|k,β⟩
+         * where β ranges over ALL other members' indices.
+         * Two entries contribute when all non-inspected indices match. */
+        for (uint32_t e1 = 0; e1 < g->num_nonzero; e1++) {
+            uint32_t j = g->basis_indices[e1 * nm + my_idx];
+            Complex a1 = g->amplitudes[e1];
+
+            for (uint32_t e2 = 0; e2 < g->num_nonzero; e2++) {
+                uint32_t k = g->basis_indices[e2 * nm + my_idx];
+
+                /* Check: all OTHER members must have matching indices */
+                int others_match = 1;
+                for (uint32_t m = 0; m < nm; m++) {
+                    if (m == my_idx) continue;
+                    if (g->basis_indices[e1 * nm + m] !=
+                        g->basis_indices[e2 * nm + m]) {
+                        others_match = 0;
+                        break;
+                    }
+                }
+                if (!others_match) continue;
+
+                /* ρ_A[j][k] += α_{e1} × conj(α_{e2}) */
+                Complex a2 = g->amplitudes[e2];
+                if (j < NUM_BASIS_STATES && k < NUM_BASIS_STATES) {
+                    snap.rho[j * dim + k].real += a1.real * a2.real + a1.imag * a2.imag;
+                    snap.rho[j * dim + k].imag += a1.imag * a2.real - a1.real * a2.imag;
+                }
+            }
+        }
+
+        /* ── Purity: Tr(ρ²) ── */
+        snap.purity = 0.0;
+        for (uint32_t j = 0; j < dim && j < NUM_BASIS_STATES; j++) {
+            for (uint32_t k = 0; k < dim && k < NUM_BASIS_STATES; k++) {
+                Complex rho_jk = snap.rho[j * dim + k];
+                Complex rho_kj = snap.rho[k * dim + j];
+                snap.purity += rho_jk.real * rho_kj.real - rho_jk.imag * rho_kj.imag;
+            }
+        }
+
+        /* ── Von Neumann entropy: S = -Tr(ρ log₂ ρ) ──
+         * Compute eigenvalues of the reduced density matrix */
+        if (dim <= NUM_BASIS_STATES) {
+            double eigenvalues[NUM_BASIS_STATES] = {0};
+
+            if (dim == 2) {
+                /* Fast path for dim=2 */
+                eigen2x2_hermitian(
+                    snap.rho[0].real,
+                    snap.rho[1].real, snap.rho[1].imag,
+                    snap.rho[dim + 1].real,
+                    &eigenvalues[0], &eigenvalues[1]);
+            } else {
+                /* General Jacobi */
+                Complex rho_copy[NUM_BASIS_STATES * NUM_BASIS_STATES];
+                memcpy(rho_copy, snap.rho, sizeof(rho_copy));
+                eigen_hermitian_jacobi(rho_copy, dim, eigenvalues);
+            }
+
+            snap.entropy = 0.0;
+            for (uint32_t i = 0; i < dim; i++) {
+                double lam = eigenvalues[i];
+                if (lam > 1e-15)
+                    snap.entropy -= lam * log2(lam);
+            }
+        }
+
+        snap.is_entangled = (snap.entropy > 0.01);
+
+    /* ── Case 2: Register has shadow state (local, not in group) ── */
+    } else if (c->hilbert.shadow_state) {
+        snap.dim = (c->hilbert.q_local_dim > 0) ? c->hilbert.q_local_dim : 6;
+        snap.num_members = 1;
+        snap.member_ids[0] = chunk_id;
+        snap.is_collapsed = (c->hilbert.q_flags & 0x02) ? 1 : 0;
+
+        uint32_t ns = (uint32_t)c->num_states;
+        if (ns > MAX_INSPECT_ENTRIES) ns = MAX_INSPECT_ENTRIES;
+        snap.num_entries = ns;
+
+        printf("  🔍 [INSPECT] Reading local shadow state for chunk %lu "
+               "(%u states)\n", chunk_id, ns);
+
+        for (uint32_t i = 0; i < ns; i++) {
+            snap.entries[i].indices[0] = i;
+            Complex amp = c->hilbert.shadow_state[i];
+            snap.entries[i].amp_real = amp.real;
+            snap.entries[i].amp_imag = amp.imag;
+            snap.entries[i].probability = amp.real * amp.real + amp.imag * amp.imag;
+            snap.entries[i].phase_rad = atan2(amp.imag, amp.real);
+            snap.total_probability += snap.entries[i].probability;
+            if (i < NUM_BASIS_STATES)
+                snap.marginal_probs[i] = snap.entries[i].probability;
+        }
+
+        /* Local state: ρ = |ψ⟩⟨ψ|, always pure */
+        snap.purity = 1.0;
+        snap.entropy = 0.0;
+        snap.is_entangled = 0;
+
+    /* ── Case 3: Infinite chunk (no shadow, no group) ── */
+    } else {
+        printf("  🔍 [INSPECT] Chunk %lu is infinite (no shadow cache). "
+               "Magic Pointer: 0x%016lX\n",
+               chunk_id, c->hilbert.magic_ptr);
+        snap.dim = 6;
+        snap.num_members = 0;
+    }
+
+    return snap;
+}
+
+void inspect_print(HilbertSnapshot *snap)
+{
+    printf("\n  ╔════════════════════════════════════════════════════════════╗\n");
+    printf("  ║  HILBERT SPACE INSPECTOR — NON-DESTRUCTIVE READOUT       ║\n");
+    printf("  ║  \"What quantum mechanics says you cannot do.\"            ║\n");
+    printf("  ╚════════════════════════════════════════════════════════════╝\n\n");
+
+    printf("  Register:     %lu\n", snap->chunk_id);
+    printf("  Dimension:    D=%u\n", snap->dim);
+    printf("  Group size:   %u member(s)", snap->num_members);
+    if (snap->num_members > 1) {
+        printf(" → {");
+        for (uint32_t m = 0; m < snap->num_members && m < 8; m++)
+            printf("%s%lu", m ? "," : "", snap->member_ids[m]);
+        if (snap->num_members > 8) printf(",...");
+        printf("}");
+    }
+    printf("\n");
+    printf("  Collapsed:    %s\n", snap->is_collapsed ? "YES" : "NO");
+    printf("  Total prob:   %.10f %s\n", snap->total_probability,
+           fabs(snap->total_probability - 1.0) < 1e-8 ? "✓" : "⚠ not normalized");
+
+    /* State decomposition */
+    printf("\n  ── State Decomposition (%u non-zero entries) ──\n", snap->num_entries);
+    for (uint32_t e = 0; e < snap->num_entries && e < 20; e++) {
+        StateEntry *se = &snap->entries[e];
+        printf("    |");
+        for (uint32_t m = 0; m < snap->num_members && m < 8; m++)
+            printf("%s%u", m ? "," : "", se->indices[m]);
+        printf("⟩  α = %+.6f %+.6fi  |α|² = %.6f  φ = %+.4f rad\n",
+               se->amp_real, se->amp_imag, se->probability, se->phase_rad);
+    }
+    if (snap->num_entries > 20)
+        printf("    ... (%u more entries)\n", snap->num_entries - 20);
+
+    /* Marginal probabilities */
+    printf("\n  ── Marginal Probabilities (this register) ──\n    ");
+    for (uint32_t k = 0; k < snap->dim && k < NUM_BASIS_STATES; k++)
+        printf("P(|%u⟩)=%.4f  ", k, snap->marginal_probs[k]);
+    printf("\n");
+
+    /* Reduced density matrix */
+    if (snap->dim <= 6 && snap->num_members > 0) {
+        printf("\n  ── Reduced Density Matrix ρ_A (%u×%u) ──\n", snap->dim, snap->dim);
+        for (uint32_t j = 0; j < snap->dim; j++) {
+            printf("    ");
+            for (uint32_t k = 0; k < snap->dim; k++) {
+                Complex rjk = snap->rho[j * snap->dim + k];
+                if (fabs(rjk.imag) < 1e-10)
+                    printf("%+.4f  ", rjk.real);
+                else
+                    printf("(%+.3f%+.3fi) ", rjk.real, rjk.imag);
+            }
+            printf("\n");
+        }
+    }
+
+    /* Entanglement analysis */
+    printf("\n  ── Entanglement Analysis ──\n");
+    printf("    Purity Tr(ρ²):  %.6f", snap->purity);
+    if (fabs(snap->purity - 1.0) < 1e-6)
+        printf("  (PURE state — separable or whole system)\n");
+    else
+        printf("  (MIXED — entangled with partners)\n");
+
+    printf("    Von Neumann S:  %.6f bits", snap->entropy);
+    if (snap->entropy < 0.01)
+        printf("  (no entanglement)\n");
+    else
+        printf("  ★ ENTANGLED (S > 0) ★\n");
+
+    if (snap->is_entangled) {
+        printf("    Maximum S:      %.6f bits (for D=%u)\n",
+               log2((double)snap->dim), snap->dim);
+        printf("    Entanglement:   %.1f%% of maximum\n",
+               100.0 * snap->entropy / log2((double)snap->dim));
+    }
+
+    printf("\n");
+}
+
+double hilbert_entanglement_entropy(HexStateEngine *eng, uint64_t chunk_id)
+{
+    HilbertSnapshot snap = inspect_hilbert(eng, chunk_id);
+    return snap.entropy;
 }
