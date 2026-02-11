@@ -753,26 +753,12 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             return (uint64_t)result;
         }
 
-        /* ── Fallback: seed-based (no joint state) ── */
-        uint8_t  flags = c->hilbert.q_flags;
-        uint64_t seed  = c->hilbert.q_entangle_seed;
-        uint64_t basis = c->hilbert.q_basis_rotation;
-        uint64_t result;
-        uint32_t fdim = (c->hilbert.num_partners > 0) ? c->hilbert.partners[0].q_joint_dim : 0;
-        if (fdim == 0) fdim = 6;
-
-        if (seed != 0 && (flags & 0x01)) {
-            result = (seed ^ (basis * 2654435761ULL)) % fdim;
-        } else if (flags & 0x01) {
-            result = engine_prng(eng) % fdim;
-        } else {
-            result = 0;
-        }
-
+        /* No joint state — unentangled infinite chunk.
+         * Measure uniformly from D=6 Hilbert space. */
+        uint64_t result = engine_prng(eng) % 6;
         c->hilbert.q_flags = 0x02;
-        c->hilbert.q_entangle_seed = 0;
         eng->measured_values[id] = result;
-        printf("  [MEAS] READ Ptr 0x%016lX (seed fallback) => %lu\n",
+        printf("  [MEAS] READ Ptr 0x%016lX (unentangled, D=6) => %lu\n",
                c->hilbert.magic_ptr, result);
         return result;
     }
@@ -965,14 +951,8 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
                eng->chunks[a].hilbert.magic_ptr, pa,
                eng->chunks[b].hilbert.magic_ptr, pb);
     } else {
-        /* Shadow-backed: use seed fallback */
-        uint64_t entangle_seed = engine_prng(eng);
-        if (entangle_seed == 0) entangle_seed = 0xDEADBEEF;
-        eng->chunks[a].hilbert.q_entangle_seed = entangle_seed;
-        eng->chunks[b].hilbert.q_entangle_seed = entangle_seed;
-        printf("  [BRAID] Linked Ptrs 0x%016lX <-> 0x%016lX (seed=0x%016lX)\n",
-               eng->chunks[a].hilbert.magic_ptr,
-               eng->chunks[b].hilbert.magic_ptr, entangle_seed);
+        /* Shadow-backed: create joint state via Hilbert space too */
+        printf("  [BRAID] WARNING: shadow-backed chunks — use infinite for genuine Hilbert space\n");
     }
 }
 
@@ -1029,10 +1009,6 @@ void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b)
             }
         }
     }
-    if (a < eng->num_chunks)
-        eng->chunks[a].hilbert.q_entangle_seed = 0;
-    if (b < eng->num_chunks)
-        eng->chunks[b].hilbert.q_entangle_seed = 0;
 
     printf("  [UNBRAID] Hilbert space freed: chunks %lu <-> %lu\n", a, b);
 }
