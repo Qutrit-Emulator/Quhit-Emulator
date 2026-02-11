@@ -244,6 +244,8 @@ void engine_destroy(HexStateEngine *eng);
 int  init_chunk(HexStateEngine *eng, uint64_t id, uint64_t num_hexits);
 void create_superposition(HexStateEngine *eng, uint64_t id);
 void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index);
+void apply_group_unitary(HexStateEngine *eng, uint64_t id,
+                         Complex *U, uint32_t dim);
 uint64_t measure_chunk(HexStateEngine *eng, uint64_t id);
 void grover_diffusion(HexStateEngine *eng, uint64_t id);
 
