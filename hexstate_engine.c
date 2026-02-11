@@ -550,148 +550,78 @@ void apply_group_unitary(HexStateEngine *eng, uint64_t id,
         }
         return;
     }
+    /* ── Apply unitary to the shared Hilbert space ──
+     * The group's sparse state is a D-dimensional Hilbert space.
+     * Entries are indexed by the shared basis k, with amplitudes α_k.
+     * A unitary U transforms the amplitude vector:
+     *   new_α[k] = Σ_j U[k][j] × α[j]
+     * This is O(D²), keeping ≤D entries. The Hilbert space handles
+     * the computation — no client-side tensor product expansion.
+     *
+     * New entries are created when the unitary produces nonzero amplitudes
+     * for basis values not in the current state. Entries are removed when
+     * their amplitudes go to zero. */
 
-    uint32_t my_idx = c->hilbert.group_index;
+    uint32_t ns = g->num_nonzero;
     uint32_t nm = g->num_members;
 
-    /* ── Hash table for O(1) amortized dedup ──
-     * Key: basis index tuple (nm × uint32_t)
-     * Value: index into output arrays
-     * Uses FNV-1a hash with open addressing (linear probing). */
-    uint32_t max_out = g->num_nonzero * dim;
-    /* Hash table size: next power of 2 ≥ 2× max entries for low load factor */
-    uint32_t ht_cap = 1;
-    while (ht_cap < max_out * 2) ht_cap <<= 1;
-    uint32_t ht_mask = ht_cap - 1;
+    /* Build the amplitude vector indexed by basis value for this member */
+    Complex amp_in[dim];
+    memset(amp_in, 0, dim * sizeof(Complex));
+    uint32_t my_idx = c->hilbert.group_index;
 
-    /* Hash table: -1 means empty slot */
-    int32_t *ht = malloc(ht_cap * sizeof(int32_t));
-    memset(ht, -1, ht_cap * sizeof(int32_t));
-
-    uint32_t *out_indices = calloc((size_t)max_out * nm, sizeof(uint32_t));
-    Complex  *out_amps    = calloc(max_out, sizeof(Complex));
-    uint32_t  out_count   = 0;
-
-    /* For each existing entry, apply U to produce D new entries */
-    for (uint32_t e = 0; e < g->num_nonzero; e++) {
-        uint32_t *row = &g->basis_indices[e * nm];
-        uint32_t old_val = row[my_idx];
-
-        for (uint32_t new_val = 0; new_val < dim; new_val++) {
-            /* U[new_val][old_val] × amplitude */
-            Complex u_elem = U[new_val * dim + old_val];
-            Complex contrib;
-            contrib.real = u_elem.real * g->amplitudes[e].real
-                         - u_elem.imag * g->amplitudes[e].imag;
-            contrib.imag = u_elem.real * g->amplitudes[e].imag
-                         + u_elem.imag * g->amplitudes[e].real;
-
-            if (cnorm2(contrib) < 1e-30) continue;  /* skip negligible */
-
-            /* Build the output tuple and compute its hash (FNV-1a) */
-            uint32_t hash = 2166136261u;
-            for (uint32_t m = 0; m < nm; m++) {
-                uint32_t val = (m == my_idx) ? new_val : row[m];
-                /* FNV-1a: XOR each byte then multiply */
-                for (int b = 0; b < 4; b++) {
-                    hash ^= (val >> (b * 8)) & 0xFF;
-                    hash *= 16777619u;
-                }
-            }
-
-            /* Probe hash table for existing entry */
-            uint32_t slot = hash & ht_mask;
-            int found = -1;
-            while (ht[slot] >= 0) {
-                /* Check if this slot's tuple matches */
-                uint32_t oi = (uint32_t)ht[slot];
-                int match = 1;
-                for (uint32_t m = 0; m < nm; m++) {
-                    uint32_t expected = (m == my_idx) ? new_val : row[m];
-                    if (out_indices[oi * nm + m] != expected) {
-                        match = 0;
-                        break;
-                    }
-                }
-                if (match) { found = (int)oi; break; }
-                slot = (slot + 1) & ht_mask;  /* linear probe */
-            }
-
-            if (found >= 0) {
-                /* Accumulate into existing entry */
-                out_amps[found].real += contrib.real;
-                out_amps[found].imag += contrib.imag;
-            } else {
-                /* New entry — write tuple, amplitude, and hash slot */
-                for (uint32_t m = 0; m < nm; m++)
-                    out_indices[out_count * nm + m] =
-                        (m == my_idx) ? new_val : row[m];
-                out_amps[out_count] = contrib;
-                ht[slot] = (int32_t)out_count;
-                out_count++;
-
-                /* Check if we need to grow the hash table */
-                if (out_count * 2 > ht_cap) {
-                    uint32_t new_ht_cap = ht_cap << 1;
-                    uint32_t new_ht_mask = new_ht_cap - 1;
-                    int32_t *new_ht = malloc(new_ht_cap * sizeof(int32_t));
-                    memset(new_ht, -1, new_ht_cap * sizeof(int32_t));
-                    /* Rehash all entries */
-                    for (uint32_t o = 0; o < out_count; o++) {
-                        uint32_t h = 2166136261u;
-                        for (uint32_t m = 0; m < nm; m++) {
-                            uint32_t v = out_indices[o * nm + m];
-                            for (int b2 = 0; b2 < 4; b2++) {
-                                h ^= (v >> (b2 * 8)) & 0xFF;
-                                h *= 16777619u;
-                            }
-                        }
-                        uint32_t s2 = h & new_ht_mask;
-                        while (new_ht[s2] >= 0) s2 = (s2 + 1) & new_ht_mask;
-                        new_ht[s2] = (int32_t)o;
-                    }
-                    free(ht);
-                    ht = new_ht;
-                    ht_cap = new_ht_cap;
-                    ht_mask = new_ht_mask;
-
-                    /* Also grow output arrays */
-                    uint32_t new_max = max_out * 2;
-                    out_indices = realloc(out_indices, (size_t)new_max * nm * sizeof(uint32_t));
-                    out_amps = realloc(out_amps, (size_t)new_max * sizeof(Complex));
-                    max_out = new_max;
-                }
-            }
+    for (uint32_t e = 0; e < ns; e++) {
+        uint32_t k = g->basis_indices[e * nm + my_idx];
+        if (k < dim) {
+            amp_in[k].real += g->amplitudes[e].real;
+            amp_in[k].imag += g->amplitudes[e].imag;
         }
     }
 
-    free(ht);
-
-    /* Compact: remove near-zero entries */
-    uint32_t write = 0;
-    for (uint32_t o = 0; o < out_count; o++) {
-        if (cnorm2(out_amps[o]) < 1e-28) continue;
-        if (write != o) {
-            memcpy(&out_indices[write * nm], &out_indices[o * nm],
-                   nm * sizeof(uint32_t));
-            out_amps[write] = out_amps[o];
+    /* Apply U: new_α = U × old_α */
+    Complex amp_out[dim];
+    for (uint32_t i = 0; i < dim; i++) {
+        amp_out[i].real = 0.0;
+        amp_out[i].imag = 0.0;
+        for (uint32_t j = 0; j < dim; j++) {
+            amp_out[i].real += U[i * dim + j].real * amp_in[j].real
+                             - U[i * dim + j].imag * amp_in[j].imag;
+            amp_out[i].imag += U[i * dim + j].real * amp_in[j].imag
+                             + U[i * dim + j].imag * amp_in[j].real;
         }
-        write++;
+    }
+
+    /* Count how many output amplitudes are nonzero */
+    uint32_t new_count = 0;
+    for (uint32_t k = 0; k < dim; k++)
+        if (cnorm2(amp_out[k]) > 1e-28) new_count++;
+
+    /* Rebuild the sparse state with the new amplitudes.
+     * For each nonzero amp_out[k], create entry |k,k,...,k⟩ with that amplitude.
+     * The basis indices for ALL members are set to k (shared Hilbert space). */
+    uint32_t *new_indices = calloc((size_t)new_count * nm, sizeof(uint32_t));
+    Complex  *new_amps    = calloc(new_count, sizeof(Complex));
+    uint32_t  w = 0;
+    for (uint32_t k = 0; k < dim; k++) {
+        if (cnorm2(amp_out[k]) > 1e-28) {
+            for (uint32_t m = 0; m < nm; m++)
+                new_indices[w * nm + m] = k;
+            new_amps[w] = amp_out[k];
+            w++;
+        }
     }
 
     /* Replace group's sparse state */
     free(g->basis_indices);
     free(g->amplitudes);
-    g->basis_indices = realloc(out_indices, (size_t)write * nm * sizeof(uint32_t));
-    g->amplitudes    = realloc(out_amps, (size_t)write * sizeof(Complex));
-    if (!g->basis_indices) g->basis_indices = out_indices;
-    if (!g->amplitudes)    g->amplitudes    = out_amps;
-    g->num_nonzero = write;
-    g->sparse_cap  = write;
+    g->basis_indices = new_indices;
+    g->amplitudes    = new_amps;
+    g->num_nonzero   = new_count;
+    g->sparse_cap    = new_count;
 
-    printf("  [U] Applied %u×%u unitary to member %u/%u of group "
+    printf("  [U] Applied %u×%u unitary to group Hilbert space via member %u/%u "
            "(%u nonzero entries)\n",
-           dim, dim, my_idx, nm, write);
+           dim, dim, my_idx, nm, new_count);
 }
 
 /* ─── Hadamard (DFT₆) Gate ────────────────────────────────────────────────── */
@@ -1195,8 +1125,9 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
         HilbertGroup *gb = eng->chunks[b].hilbert.group;
 
         if (ga && gb && ga == gb) {
-            /* Already in the same group — nothing to do */
-            printf("  [BRAID] Chunks %lu and %lu already share Hilbert space group\n", a, b);
+            /* Already entangled in the shared Hilbert space — no-op.
+             * The Hilbert space maintains the entanglement. */
+            printf("  [BRAID] Chunks %lu and %lu already share Hilbert space\n", a, b);
             return;
         }
 
