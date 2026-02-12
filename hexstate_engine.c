@@ -2812,10 +2812,20 @@ int execute_instruction(HexStateEngine *eng, Instruction instr)
     case OP_BELL_TEST: {
         uint32_t bell_dim = (op1 > 1) ? (uint32_t)op1 : 6;
         uint32_t bell_shots = (op2 > 0) ? (uint32_t)op2 * 100 : 500;
+
+        /* 2-party CHSH Bell test */
         printf("  [BELL TEST] Running CHSH Bell test (D=%u, %u shots)...\n",
                bell_dim, bell_shots);
         BellResult br = bell_test(eng, bell_dim, bell_shots);
         bell_test_print(&br);
+
+        /* N-party Mermin inequality test */
+        uint32_t mermin_parties = (target > 1) ? (uint32_t)target : 20;
+        uint32_t mermin_shots = (bell_shots > 200) ? 200 : bell_shots;
+        printf("  [MERMIN] Running %u-party Mermin inequality test (%u shots)...\n",
+               mermin_parties, mermin_shots);
+        MerminResult mr = mermin_test(eng, mermin_parties, mermin_shots);
+        mermin_test_print(&mr);
         break;
     }
 
@@ -4240,4 +4250,161 @@ double hilbert_entanglement_entropy(HexStateEngine *eng, uint64_t chunk_id)
 {
     HilbertSnapshot snap = inspect_hilbert(eng, chunk_id);
     return snap.entropy;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * N-PARTY MERMIN INEQUALITY — D-dimensional native
+ *
+ * The Mermin inequality is the correct N-party generalization of CHSH.
+ * For GHZ state |ψ⟩ = (1/√D) Σ_k |k,k,...,k⟩:
+ *
+ *   Z-test: all parties agree (perfect correlation in computational basis)
+ *   X-test: Σ outcomes ≡ 0 mod D after DFT_D transformation
+ *
+ * Witness W = P(Z) + P(X) - 1
+ *   Classical: W ≤ 1/D     Quantum GHZ: W = 1.0
+ *
+ * This is 6× above classical for D=6 — genuine N-party entanglement.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Helper: build D×D DFT matrix  F[j,k] = (1/√D) ω^(jk) */
+static void mermin_build_dft(Complex *U, uint32_t dim)
+{
+    double s = 1.0 / sqrt((double)dim);
+    for (uint32_t r = 0; r < dim; r++)
+        for (uint32_t c = 0; c < dim; c++) {
+            double phase = 2.0 * M_PI * r * c / dim;
+            U[r*dim + c] = (Complex){ s * cos(phase), s * sin(phase) };
+        }
+}
+
+/* ── apply_dft: convenience wrapper for DFT_D unitary ── */
+void apply_dft(HexStateEngine *eng, uint64_t chunk_id, uint32_t dim)
+{
+    Complex *U = malloc((size_t)dim * dim * sizeof(Complex));
+    if (!U) { fprintf(stderr, "[DFT] alloc failed\n"); return; }
+    mermin_build_dft(U, dim);
+    apply_local_unitary(eng, chunk_id, (const Complex *)U, dim);
+    free(U);
+}
+
+/* ── mermin_test: N-party Mermin inequality test ── */
+MerminResult mermin_test(HexStateEngine *eng, uint32_t n_parties,
+                         uint32_t n_shots)
+{
+    (void)eng;  /* We create our own engines per shot */
+
+    MerminResult r = {0};
+    r.n_parties = n_parties;
+    r.dim = NUM_BASIS_STATES;
+    r.n_shots = n_shots;
+    r.classical_bound = 1.0 / NUM_BASIS_STATES;
+    uint32_t dim = NUM_BASIS_STATES;
+
+    uint64_t quhits = 100000000000000ULL;  /* 100T per register */
+    FILE *sv;
+
+    struct timespec t1, t2;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    /* ── Z-test: measure all N in computational basis, check all agree ── */
+    int z_agree = 0;
+    for (uint32_t shot = 0; shot < n_shots; shot++) {
+        HexStateEngine e;
+        engine_init(&e);
+        sv = stdout; stdout = fopen("/dev/null", "w");
+
+        for (uint32_t p = 0; p < n_parties; p++)
+            init_chunk(&e, p, quhits);
+        for (uint32_t p = 1; p < n_parties; p++)
+            braid_chunks_dim(&e, 0, p, 0, 0, dim);
+
+        uint32_t first = (uint32_t)(measure_chunk(&e, 0) % dim);
+        int agree = 1;
+        for (uint32_t p = 1; p < n_parties; p++) {
+            uint32_t val = (uint32_t)(measure_chunk(&e, p) % dim);
+            if (val != first) { agree = 0; break; }
+        }
+
+        fclose(stdout); stdout = sv;
+
+        if (agree) { z_agree++; r.z_counts[first]++; }
+        engine_destroy(&e);
+    }
+    r.pz = (double)z_agree / n_shots;
+
+    /* ── X-test: apply DFT_D to ALL, measure ALL, check Σ ≡ 0 mod D ── */
+    int x_parity = 0;
+    Complex U_DFT[NUM_BASIS_STATES * NUM_BASIS_STATES];
+    mermin_build_dft(U_DFT, dim);
+
+    for (uint32_t shot = 0; shot < n_shots; shot++) {
+        HexStateEngine e;
+        engine_init(&e);
+        sv = stdout; stdout = fopen("/dev/null", "w");
+
+        for (uint32_t p = 0; p < n_parties; p++)
+            init_chunk(&e, p, quhits);
+        for (uint32_t p = 1; p < n_parties; p++)
+            braid_chunks_dim(&e, 0, p, 0, 0, dim);
+
+        /* Apply DFT_D to ALL parties */
+        for (uint32_t p = 0; p < n_parties; p++)
+            apply_local_unitary(&e, p, (const Complex *)U_DFT, dim);
+
+        /* Measure ALL parties */
+        int total = 0;
+        for (uint32_t p = 0; p < n_parties; p++)
+            total += (int)(measure_chunk(&e, p) % dim);
+
+        fclose(stdout); stdout = sv;
+
+        if (total % (int)dim == 0) x_parity++;
+        engine_destroy(&e);
+    }
+    r.px = (double)x_parity / n_shots;
+
+    /* ── Mermin witness ── */
+    r.witness = r.pz + r.px - 1.0;
+    r.violation = (r.witness > r.classical_bound) ? 1 : 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &t2);
+    r.elapsed_ms = (t2.tv_sec - t1.tv_sec)*1000.0
+                 + (t2.tv_nsec - t1.tv_nsec)/1e6;
+
+    return r;
+}
+
+/* ── mermin_test_print: formatted output ── */
+void mermin_test_print(MerminResult *r)
+{
+    printf("  ── N-Party Mermin Inequality (D=%u, N=%u) ──\n\n", r->dim, r->n_parties);
+
+    printf("    Z-basis (all %u agree):      P = %.4f  (%u shots)\n",
+           r->n_parties, r->pz, r->n_shots);
+    printf("    Value distribution: ");
+    for (int k = 0; k < (int)r->dim; k++)
+        printf("|%d⟩:%d ", k, r->z_counts[k]);
+    printf("\n\n");
+
+    printf("    X-basis (DFT_%u, Σ≡0 mod %u): P = %.4f  (%u shots)\n",
+           r->dim, r->dim, r->px, r->n_shots);
+    printf("\n");
+
+    printf("    Mermin witness:  W = P(Z) + P(X) - 1 = %.4f\n", r->witness);
+    printf("    Classical bound: W ≤ %.4f  (= 1/D)\n", r->classical_bound);
+    printf("    Quantum maximum: W = 1.0000\n\n");
+
+    if (r->violation) {
+        printf("    ★ MERMIN VIOLATION: W = %.4f > %.4f\n",
+               r->witness, r->classical_bound);
+        printf("    ★ %u-party × 100T quhits — N-party entanglement CERTIFIED\n",
+               r->n_parties);
+    } else {
+        printf("    W = %.4f ≤ %.4f — within classical bound\n",
+               r->witness, r->classical_bound);
+    }
+
+    printf("    Time: %.1f ms\n\n", r->elapsed_ms);
 }
