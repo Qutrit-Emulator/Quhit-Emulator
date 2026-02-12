@@ -1,5 +1,9 @@
-# Notice to those cloning this
+<p align="center">
+Notice to those cloning this
+</p>
+<p align="center">
 If there is a test folder, it is stable; if there is no test folder it is being actively updated.
+</p>
 
 <p align="center">
   <strong>⬡ HEXSTATE ENGINE</strong>
