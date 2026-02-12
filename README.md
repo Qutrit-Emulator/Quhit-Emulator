@@ -245,8 +245,6 @@ The result is a system that:
 
 ## 5. Quantum Supremacy Test Suite
 
-Seven industry-standard benchmarks, all passing, all exceeding every physical quantum computer.
-
 ### Test 1: Willow Benchmark (vs. Google Willow)
 
 Head-to-head benchmark against Google Willow's 105-qubit quantum supremacy claim. Five rounds of escalating scale, each certified by the Mermin inequality (W > 1/D proves genuine N-party entanglement).
