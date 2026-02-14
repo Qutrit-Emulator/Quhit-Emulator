@@ -685,43 +685,30 @@ void apply_local_unitary(HexStateEngine *eng, uint64_t id,
      * If the base state has ≤ D entries (e.g. GHZ), applying a local
      * unitary would expand it to ≤ D² entries per member. Instead,
      * DEFER: store the D×D unitary per member. The state is implicitly:
-     *   |Ψ⟩ = Σ_k α_k · ⊗_m (U_m |index_{m,k}⟩)
-     * Measurement samples from this in O(N × D²). The Hilbert space
-     * holds the math — no expansion needed.
+     *   |Ψ⟩ = Σ_k α_k · ⊗_m (U_L · ... · U_1 |index_{m,k}⟩)
+     * Measurement replays ops as matrix-vector products: O(D² × L).
      *
      * Eligible when: num_nonzero ≤ dim (sum of ≤ D product states).
-     * We compose with existing deferred unitaries: U_new = U · U_old. */
+     * LAZY: push U to per-member list, no composition needed. */
     if (ns <= dim && nm >= 2 && !g->no_defer) {
-        Complex *existing = g->deferred_U[my_idx];
-
-        if (!existing) {
-            /* First deferred unitary for this member — just store it */
-            g->deferred_U[my_idx] = calloc((size_t)dim * dim, sizeof(Complex));
-            memcpy(g->deferred_U[my_idx], U, (size_t)dim * dim * sizeof(Complex));
-            g->num_deferred++;
-        } else {
-            /* Compose: U_new = U_applied × U_old (D×D matrix multiply) */
-            Complex *composed = calloc((size_t)dim * dim, sizeof(Complex));
-            for (uint32_t i = 0; i < dim; i++) {
-                for (uint32_t j = 0; j < dim; j++) {
-                    double re = 0.0, im = 0.0;
-                    for (uint32_t k = 0; k < dim; k++) {
-                        re += U[i * dim + k].real * existing[k * dim + j].real
-                            - U[i * dim + k].imag * existing[k * dim + j].imag;
-                        im += U[i * dim + k].real * existing[k * dim + j].imag
-                            + U[i * dim + k].imag * existing[k * dim + j].real;
-                    }
-                    composed[i * dim + j].real = re;
-                    composed[i * dim + j].imag = im;
-                }
-            }
-            free(existing);
-            g->deferred_U[my_idx] = composed;
+        /* Grow lazy list if needed */
+        if (g->lazy_count[my_idx] >= g->lazy_cap[my_idx]) {
+            uint32_t new_cap = g->lazy_cap[my_idx] ? g->lazy_cap[my_idx] * 2 : 8;
+            g->lazy_U[my_idx] = realloc(g->lazy_U[my_idx],
+                                        new_cap * sizeof(Complex*));
+            g->lazy_cap[my_idx] = new_cap;
         }
+        /* Store copy of U */
+        Complex *copy = malloc((size_t)dim * dim * sizeof(Complex));
+        memcpy(copy, U, (size_t)dim * dim * sizeof(Complex));
+        g->lazy_U[my_idx][g->lazy_count[my_idx]++] = copy;
 
-        printf("  [LOCAL U] DEFERRED %u×%u unitary for member %u/%u "
-               "(base entries: %u, stored in Hilbert space)\n",
-               dim, dim, my_idx, nm, ns);
+        if (g->lazy_count[my_idx] == 1)
+            g->num_deferred++;
+
+        printf("  [LOCAL U] LAZY push %u×%u unitary for member %u/%u "
+               "(op #%u, base entries: %u)\n",
+               dim, dim, my_idx, nm, g->lazy_count[my_idx], ns);
         return;
     }
 
@@ -1030,6 +1017,59 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
 /* Forces expansion of all deferred unitaries into the explicit state vector.
  * After this, num_nonzero = D^N and each amplitude is fully computed.
  * This MUST be called before any non-local gate. */
+/* ─── Lazy replay helper: apply lazy op list to a D-vector in-place ───────── */
+static void lazy_apply_vec(Complex **ops, uint32_t num_ops,
+                           Complex *vec, uint32_t dim)
+{
+    Complex *tmp = malloc(dim * sizeof(Complex));
+    for (uint32_t op = 0; op < num_ops; op++) {
+        Complex *M = ops[op];
+        for (uint32_t i = 0; i < dim; i++) {
+            double re = 0.0, im = 0.0;
+            for (uint32_t j = 0; j < dim; j++) {
+                re += M[i*dim+j].real * vec[j].real - M[i*dim+j].imag * vec[j].imag;
+                im += M[i*dim+j].real * vec[j].imag + M[i*dim+j].imag * vec[j].real;
+            }
+            tmp[i].real = re;
+            tmp[i].imag = im;
+        }
+        memcpy(vec, tmp, dim * sizeof(Complex));
+    }
+    free(tmp);
+}
+
+/* ─── Lazy compose: build composed D×D matrix from lazy op list ──────────── */
+/* Computes U = U_L · ... · U_1 by replaying ops on each basis vector.
+ * Cost: O(D² × L) instead of O(D³ × L) for matrix-matrix multiply. */
+Complex *lazy_compose(Complex **ops, uint32_t num_ops, uint32_t dim)
+{
+    Complex *composed = calloc((size_t)dim * dim, sizeof(Complex));
+    Complex *col = malloc(dim * sizeof(Complex));
+    for (uint32_t k = 0; k < dim; k++) {
+        /* Start with basis vector e_k */
+        memset(col, 0, dim * sizeof(Complex));
+        col[k].real = 1.0;
+        /* Replay all ops */
+        lazy_apply_vec(ops, num_ops, col, dim);
+        /* Column k of composed matrix */
+        for (uint32_t j = 0; j < dim; j++)
+            composed[j * dim + k] = col[j];
+    }
+    free(col);
+    return composed;
+}
+
+/* ─── Free lazy ops for a member ─────────────────────────────────────────── */
+static void lazy_free_member(HilbertGroup *g, uint32_t m)
+{
+    for (uint32_t i = 0; i < g->lazy_count[m]; i++)
+        free(g->lazy_U[m][i]);
+    free(g->lazy_U[m]);
+    g->lazy_U[m] = NULL;
+    g->lazy_count[m] = 0;
+    g->lazy_cap[m] = 0;
+}
+
 void materialize_deferred(HexStateEngine *eng, HilbertGroup *g)
 {
     if (!g || g->num_deferred == 0) return;
@@ -1039,44 +1079,32 @@ void materialize_deferred(HexStateEngine *eng, HilbertGroup *g)
     /* Set no_defer to prevent re-deferral during expansion */
     g->no_defer = 1;
 
-    /* Save and clear all deferred unitaries */
-    Complex *saved[MAX_GROUP_MEMBERS];
-    memset(saved, 0, sizeof(saved));
+    /* Compose each member's lazy ops into a single matrix, then apply */
     for (uint32_t m = 0; m < g->num_members; m++) {
-        saved[m] = g->deferred_U[m];
-        g->deferred_U[m] = NULL;
+        if (g->lazy_count[m] == 0) continue;
+
+        Complex *composed = lazy_compose(g->lazy_U[m], g->lazy_count[m], dim);
+        lazy_free_member(g, m);
+
+        uint64_t chunk_id = g->member_ids[m];
+        apply_local_unitary(eng, chunk_id, composed, dim);
+        free(composed);
     }
     g->num_deferred = 0;
 
-    /* Apply each saved unitary through the expansion path */
-    for (uint32_t m = 0; m < g->num_members; m++) {
-        if (!saved[m]) continue;
+    g->no_defer = 0;
 
-        /* Find the chunk for this member and apply */
-        uint64_t chunk_id = g->member_ids[m];
-        apply_local_unitary(eng, chunk_id, saved[m], dim);
-        free(saved[m]);
-    }
-
-    g->no_defer = 0;  /* Re-enable deferral for future operations */
-
-    printf("  [MATERIALIZE] Expanded deferred unitaries: "
+    printf("  [MATERIALIZE] Expanded lazy unitaries: "
            "%u entries, %.1f KB\n",
            g->num_nonzero,
            (double)g->num_nonzero * (g->num_members * sizeof(uint32_t) + sizeof(Complex)) / 1024.0);
 }
 
-/* ─── Controlled Phase Gate (Non-Local) — MATERIALIZED ───────────────────── */
+/* ─── Controlled Phase Gate (Non-Local) — DEFERRED ────────────────────────── */
 /* CZ|j,k⟩ = ω^(j·k) |j,k⟩  where ω = e^(2πi/D)
  *
- * GENUINELY NON-LOCAL — materializes deferred unitaries first to expand
- * the sparse state to its full representation, then applies the CZ phase
- * directly to each sparse entry. This ensures the state correctly carries
- * entanglement information through the circuit.
- *
- * Cost: O(D²) for materialization + O(ns) for phase application.
- * The entangled state is maintained in the sparse representation, allowing
- * subsequent local unitaries and measurements to see correct correlations. */
+ * Stores CZ pairs for absorption at measurement time.
+ * Cost: O(1) at gate time, O(D²) at measurement. */
 void apply_cz_gate(HexStateEngine *eng, uint64_t id_a, uint64_t id_b)
 {
     if (id_a >= eng->num_chunks || id_b >= eng->num_chunks) return;
@@ -1087,37 +1115,18 @@ void apply_cz_gate(HexStateEngine *eng, uint64_t id_a, uint64_t id_b)
 
     uint32_t idx_a = ca->hilbert.group_index;
     uint32_t idx_b = cb->hilbert.group_index;
-    uint32_t dim = g->dim;
-    uint32_t nm = g->num_members;
 
-    /* ═══ Step 1: Materialize any deferred unitaries ═══
-     * This expands the sparse state so each basis entry has
-     * concrete indices — no implicit U transforms left. */
-    if (g->num_deferred > 0) {
-        materialize_deferred(eng, g);
+    if (g->num_cz >= g->cz_cap) {
+        uint32_t new_cap = g->cz_cap ? g->cz_cap * 2 : 64;
+        g->cz_pairs = realloc(g->cz_pairs, new_cap * 2 * sizeof(uint32_t));
+        g->cz_cap = new_cap;
     }
+    g->cz_pairs[g->num_cz * 2 + 0] = idx_a;
+    g->cz_pairs[g->num_cz * 2 + 1] = idx_b;
+    g->num_cz++;
 
-    /* ═══ Step 2: Apply CZ phase directly to each sparse entry ═══
-     * For entry |..., j_a, ..., j_b, ...⟩ with amplitude α:
-     *   α ← α × ω^(j_a · j_b)
-     * where ω = e^(2πi/D). This is O(ns) — no state expansion. */
-    double omega = 2.0 * M_PI / (double)dim;
-    for (uint32_t e = 0; e < g->num_nonzero; e++) {
-        uint32_t j_a = g->basis_indices[e * nm + idx_a];
-        uint32_t j_b = g->basis_indices[e * nm + idx_b];
-        uint32_t phase_idx = ((uint64_t)j_a * j_b) % dim;
-        if (phase_idx == 0) continue;  /* ω^0 = 1, no change */
-
-        double angle = omega * (double)phase_idx;
-        double c = cos(angle), s = sin(angle);
-        Complex old = g->amplitudes[e];
-        g->amplitudes[e].real = old.real * c - old.imag * s;
-        g->amplitudes[e].imag = old.real * s + old.imag * c;
-    }
-
-    printf("  [CZ] MATERIALIZED phase gate between members %u and %u "
-           "(D=%u, %u entries updated)\n",
-           idx_a, idx_b, dim, g->num_nonzero);
+    printf("  [CZ] DEFERRED between members %u and %u (pair %u stored)\n",
+           idx_a, idx_b, g->num_cz);
 }
 
 /* ─── Measurement (Born Rule) ─────────────────────────────────────────────── */
@@ -1184,9 +1193,18 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
                 for (uint32_t m = 0; m < nm; m++)
                     if (m != my_idx) order[oi++] = m;
 
+                /* Pre-compose lazy ops into per-member matrices via lazy replay
+                 * Cost: O(D² × L) per member instead of O(D³ × L) for eager composition */
+                Complex *composed_U[2] = {NULL, NULL};
+                for (uint32_t mi = 0; mi < nm && mi < 2; mi++) {
+                    if (g->lazy_count[mi] > 0)
+                        composed_U[mi] = lazy_compose(g->lazy_U[mi],
+                                                      g->lazy_count[mi], dim_local);
+                }
+
                 for (uint32_t step = 0; step < nm; step++) {
                     uint32_t m = order[step];
-                    Complex *U_m = g->deferred_U[m]; /* NULL = identity */
+                    Complex *U_m = (m < 2) ? composed_U[m] : NULL;
                     uint32_t members_remaining = nm - step;
 
                     /* Compute marginal P(v) for this member.
@@ -1313,30 +1331,21 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
                         else if (b == m && !measured[a]) partner = a;
                         if (partner == UINT32_MAX) continue;
 
-                        /* Ensure partner has a deferred unitary to modify */
-                        if (!g->deferred_U[partner]) {
-                            g->deferred_U[partner] = calloc(
-                                (size_t)dim_local * dim_local, sizeof(Complex));
-                            /* Initialize as identity */
-                            for (uint32_t d = 0; d < dim_local; d++)
-                                g->deferred_U[partner][d * dim_local + d] =
-                                    (Complex){1.0, 0.0};
-                            g->num_deferred++;
-                        }
-
-                        /* Left-multiply by D_v: row j gets multiplied by ω^(v·j) */
-                        Complex *U_b = g->deferred_U[partner];
-                        for (uint32_t j = 0; j < dim_local; j++) {
-                            uint32_t phase_idx = ((uint32_t)result_v * j) % dim_local;
-                            if (phase_idx == 0) continue;
-                            double angle = omega * (double)phase_idx;
-                            double c = cos(angle), s = sin(angle);
-                            for (uint32_t k = 0; k < dim_local; k++) {
-                                Complex old = U_b[j * dim_local + k];
-                                U_b[j * dim_local + k].real =
-                                    old.real * c - old.imag * s;
-                                U_b[j * dim_local + k].imag =
-                                    old.real * s + old.imag * c;
+                        /* Absorb CZ into partner's composed matrix */
+                        if (partner < 2 && composed_U[partner]) {
+                            Complex *U_b = composed_U[partner];
+                            for (uint32_t j = 0; j < dim_local; j++) {
+                                uint32_t phase_idx = ((uint32_t)result_v * j) % dim_local;
+                                if (phase_idx == 0) continue;
+                                double angle = omega * (double)phase_idx;
+                                double c = cos(angle), s = sin(angle);
+                                for (uint32_t k = 0; k < dim_local; k++) {
+                                    Complex old = U_b[j * dim_local + k];
+                                    U_b[j * dim_local + k].real =
+                                        old.real * c - old.imag * s;
+                                    U_b[j * dim_local + k].imag =
+                                        old.real * s + old.imag * c;
+                                }
                             }
                         }
                     }
@@ -1356,13 +1365,12 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
                 g->amplitudes[0] = (Complex){1.0, 0.0};
                 g->collapsed = 1;
 
-                /* Free deferred unitaries */
-                for (uint32_t m = 0; m < nm; m++) {
-                    if (g->deferred_U[m]) {
-                        free(g->deferred_U[m]);
-                        g->deferred_U[m] = NULL;
-                    }
+                /* Free composed and lazy unitaries */
+                for (uint32_t mi = 0; mi < nm && mi < 2; mi++) {
+                    if (composed_U[mi]) free(composed_U[mi]);
                 }
+                for (uint32_t m = 0; m < nm; m++)
+                    if (g->lazy_count[m] > 0) lazy_free_member(g, m);
                 g->num_deferred = 0;
 
                 /* Free CZ pairs */
@@ -3611,14 +3619,18 @@ void hilbert_set_deferred(HilbertGroup *g, uint32_t member_idx,
 {
     if (!g || member_idx >= g->num_members) return;
 
-    /* Free existing deferred unitary if present */
-    if (g->deferred_U[member_idx]) {
-        free(g->deferred_U[member_idx]);
+    /* Clear existing lazy ops for this member */
+    if (g->lazy_count[member_idx] > 0) {
+        lazy_free_member(g, member_idx);
         g->num_deferred--;
     }
 
-    g->deferred_U[member_idx] = calloc((size_t)dim * dim, sizeof(Complex));
-    memcpy(g->deferred_U[member_idx], U, (size_t)dim * dim * sizeof(Complex));
+    /* Push as a single lazy op */
+    g->lazy_U[member_idx] = malloc(sizeof(Complex*));
+    g->lazy_U[member_idx][0] = calloc((size_t)dim * dim, sizeof(Complex));
+    memcpy(g->lazy_U[member_idx][0], U, (size_t)dim * dim * sizeof(Complex));
+    g->lazy_count[member_idx] = 1;
+    g->lazy_cap[member_idx] = 1;
     g->num_deferred++;
 }
 
@@ -3626,9 +3638,8 @@ void hilbert_clear_deferred(HilbertGroup *g, uint32_t member_idx)
 {
     if (!g || member_idx >= g->num_members) return;
 
-    if (g->deferred_U[member_idx]) {
-        free(g->deferred_U[member_idx]);
-        g->deferred_U[member_idx] = NULL;
+    if (g->lazy_count[member_idx] > 0) {
+        lazy_free_member(g, member_idx);
         g->num_deferred--;
     }
 }
