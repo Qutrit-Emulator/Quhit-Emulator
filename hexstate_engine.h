@@ -289,6 +289,7 @@ typedef struct HexStateEngine_s {
         uint64_t  chunk_id;                   /* Parent chunk ID */
         uint64_t  n_quhits;                   /* Number of Magic Pointer quhits */
         uint32_t  dim;                        /* Dimension per quhit (D=6) */
+        uint8_t   bulk_rule;                   /* 0=constant, 1=cyclic V(k)=k%D */
         /* ─── The Hilbert Space (self-describing hardware) ─── */
         uint32_t          num_nonzero;
         QuhitBasisEntry   entries[MAX_QUHIT_HILBERT_ENTRIES];
@@ -617,6 +618,12 @@ void braid_quhits(HexStateEngine *eng,
 void apply_cz_quhits(HexStateEngine *eng,
                      uint64_t chunk_a, uint64_t quhit_a,
                      uint64_t chunk_b, uint64_t quhit_b);
+
+/* SUM gate (generalized CNOT): |a,b⟩ → |a, (a+b) mod D⟩
+ * Creates value correlations. DFT(ctrl) + SUM(ctrl→tgt) = Bell pair. */
+void apply_sum_quhits(HexStateEngine *eng,
+                      uint64_t chunk_ctrl, uint64_t quhit_ctrl,
+                      uint64_t chunk_tgt,  uint64_t quhit_tgt);
 
 /* Non-destructive inspection of a specific quhit's Hilbert space. */
 HilbertSnapshot inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
