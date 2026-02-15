@@ -5041,7 +5041,7 @@ void apply_dft_quhit(HexStateEngine *eng, uint64_t chunk_id,
             uint32_t v_b = eng->quhit_regs[r].entry_value[e] % dim;
             Complex alpha = eng->quhit_regs[r].amplitudes[e];
 
-            for (uint32_t j = 0; j < dim && new_nz < MAX_QUHIT_HILBERT_ENTRIES; j++) {
+            for (uint32_t j = 0; j < dim; j++) {
                 double phase = omega * v_p * j;
                 double cr = cos(phase) * inv_sqrt_d;
                 double ci = sin(phase) * inv_sqrt_d;
@@ -5057,7 +5057,7 @@ void apply_dft_quhit(HexStateEngine *eng, uint64_t chunk_id,
                 if (found >= 0) {
                     new_amps[found].real += a.real;
                     new_amps[found].imag += a.imag;
-                } else {
+                } else if (new_nz < MAX_QUHIT_HILBERT_ENTRIES) {
                     new_vals[new_nz] = new_val;
                     new_amps[new_nz] = a;
                     new_nz++;
@@ -5084,7 +5084,7 @@ void apply_dft_quhit(HexStateEngine *eng, uint64_t chunk_id,
             uint32_t v_b = eng->quhit_regs[r].entry_value[e] % dim;
             Complex alpha = eng->quhit_regs[r].amplitudes[e];
 
-            for (uint32_t j = 0; j < dim && new_nz < MAX_QUHIT_HILBERT_ENTRIES; j++) {
+            for (uint32_t j = 0; j < dim; j++) {
                 double phase = omega * v_b * j;
                 double cr = cos(phase) * inv_sqrt_d;
                 double ci = sin(phase) * inv_sqrt_d;
@@ -5100,7 +5100,7 @@ void apply_dft_quhit(HexStateEngine *eng, uint64_t chunk_id,
                 if (found >= 0) {
                     new_amps[found].real += a.real;
                     new_amps[found].imag += a.imag;
-                } else {
+                } else if (new_nz < MAX_QUHIT_HILBERT_ENTRIES) {
                     new_vals[new_nz] = new_val;
                     new_amps[new_nz] = a;
                     new_nz++;
