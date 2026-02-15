@@ -22,6 +22,13 @@
 #define MAX_STATES_STANDARD   1679616     /* 6^8 */
 #define MAX_CHUNKS            16777216
 #define INITIAL_CHUNK_CAP     4096        /* Start small, grow as needed */
+
+/* ═══ Sub-Chunk Quhit Addressing ═══
+ * Virtual chunk IDs for individually addressable quhits within a chunk.
+ * Maps (chunk_id, quhit_idx) → virtual_chunk_id in a reserved range. */
+#define QUHIT_VCHUNK_BASE     1024ULL    /* Virtual chunk ID start — low enough for mmap */
+#define MAX_QUHIT_REGISTERS   256          /* Max chunks with quhit addressing */
+#define MAX_QUHITS_PER_REG    4096         /* Max individually addressable quhits per chunk */
 #define MAX_BRAID_LINKS       16777216
 #define MAX_ADDONS            32
 #define CAUSAL_SAFEGUARD      4096
@@ -245,6 +252,16 @@ typedef struct HexStateEngine_s {
 
     /* BigInt workspace */
     BigInt          bigint_temp[3];
+
+    /* ═══ Sub-Chunk Quhit Mapping ═══ */
+    struct {
+        uint64_t  chunk_id;                          /* Parent chunk ID */
+        uint64_t  n_quhits;                          /* Number of quhits */
+        uint64_t  vchunk_base;                       /* First virtual chunk ID */
+        uint32_t  dim;                               /* Dimension per quhit */
+        HilbertGroup *group;                         /* Shared group for all quhits */
+    } quhit_regs[MAX_QUHIT_REGISTERS];
+    uint32_t        num_quhit_regs;
 } HexStateEngine;
 
 /* ─── Instruction Word Layout ─────────────────────────────────────────────── */
@@ -514,5 +531,58 @@ void generalized_bell_state(HexStateEngine *eng, uint64_t a, uint64_t b,
 double partial_transpose_negativity(HexStateEngine *eng, uint64_t chunk_id,
                                     double *log_negativity);
 
-#endif /* HEXSTATE_ENGINE_H */
+/* ═══ Sub-Chunk Quhit API — Individual Quhit Addressing ═══════════════════
+ *
+ * Address individual quhits within a chunk by index. Each quhit is an
+ * independent D=6 quantum system within a shared HilbertGroup.
+ *
+ * Architecture: (chunk_id, quhit_idx) maps to a virtual chunk ID.
+ * Virtual chunks are lightweight infinite chunks that share a
+ * HilbertGroup with sparse representation.
+ *
+ * Usage:
+ *   init_quhit_register(eng, 0, 100, 6);       // 100 D=6 quhits in chunk 0
+ *   braid_quhits(eng, 0, 3, 0, 7, 6);           // entangle quhit 3 ↔ 7
+ *   apply_dft_quhit(eng, 0, 3, 6);              // DFT on quhit 3
+ *   uint64_t val = measure_quhit(eng, 0, 3);    // measure quhit 3
+ * ═══════════════════════════════════════════════════════════════════════ */
 
+/* Initialize N individually addressable quhits within a single chunk.
+ * Each quhit starts in |0⟩. All share a HilbertGroup for efficient
+ * sparse state tracking. */
+int init_quhit_register(HexStateEngine *eng, uint64_t chunk_id,
+                        uint64_t n_quhits, uint32_t dim);
+
+/* Resolve (chunk_id, quhit_idx) → virtual chunk ID.
+ * Returns the internal chunk ID for a specific quhit, or UINT64_MAX on error. */
+uint64_t resolve_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_idx);
+
+/* Measure a specific quhit by index within a chunk.
+ * Collapses that quhit and any entangled partners. */
+uint64_t measure_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_idx);
+
+/* Apply DFT to a specific quhit within a chunk. */
+void apply_dft_quhit(HexStateEngine *eng, uint64_t chunk_id,
+                     uint64_t quhit_idx, uint32_t dim);
+
+/* Apply a custom D×D unitary to a specific quhit. */
+void apply_unitary_quhit(HexStateEngine *eng, uint64_t chunk_id,
+                         uint64_t quhit_idx, const Complex *U, uint32_t dim);
+
+/* Entangle two specific quhits (can be within same chunk or across chunks).
+ * Creates a Bell state |Ψ⟩ = Σ|k,k⟩/√D in their joint space. */
+void braid_quhits(HexStateEngine *eng,
+                  uint64_t chunk_a, uint64_t quhit_a,
+                  uint64_t chunk_b, uint64_t quhit_b,
+                  uint32_t dim);
+
+/* Apply CZ gate between two specific quhits. */
+void apply_cz_quhits(HexStateEngine *eng,
+                     uint64_t chunk_a, uint64_t quhit_a,
+                     uint64_t chunk_b, uint64_t quhit_b);
+
+/* Non-destructive inspection of a specific quhit. */
+HilbertSnapshot inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
+                              uint64_t quhit_idx);
+
+#endif /* HEXSTATE_ENGINE_H */
