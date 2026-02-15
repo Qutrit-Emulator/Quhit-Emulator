@@ -58,6 +58,7 @@
 #define OP_SHIFT              0x10
 #define OP_REPAIR             0x11
 #define OP_NULL               0x14
+#define OP_SUBSYSTEM          0x15    /* Sub-system entanglement (D=6=2⊗3) */
 #define OP_SUMMARY            0x1F
 #define OP_HALT               0xFF
 
@@ -461,6 +462,57 @@ void inspect_print(HilbertSnapshot *snap);
 /* Compute von Neumann entanglement entropy between chunk_id and
  * its partners. Returns S = -Tr(ρ_A log₂ ρ_A). S > 0 = entangled. */
 double hilbert_entanglement_entropy(HexStateEngine *eng, uint64_t chunk_id);
+
+/* ═══ Sub-System Entanglement — D=6 = 2⊗3 Novel Capability ═══════════════
+ *
+ * D=6 is the SMALLEST dimension with THREE unique capabilities:
+ *   1. Internal entanglement (qubit⊗qutrit within a single register)
+ *   2. 36 generalized Bell states (vs 4 for qubits)
+ *   3. Bound entanglement (PPT entangled states)
+ *
+ * The decomposition maps: |k⟩ → |k/3⟩_qubit ⊗ |k%3⟩_qutrit
+ *   |0⟩=|0,0⟩  |1⟩=|0,1⟩  |2⟩=|0,2⟩  |3⟩=|1,0⟩  |4⟩=|1,1⟩  |5⟩=|1,2⟩
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+/* Sub-system decomposition result */
+typedef struct {
+    uint32_t dim_a, dim_b;     /* Factor dimensions (2, 3 for D=6) */
+    Complex  rho_a[4];         /* 2×2 reduced density matrix (qubit) */
+    Complex  rho_b[9];         /* 3×3 reduced density matrix (qutrit) */
+    double   entropy_a;        /* von Neumann entropy of qubit subsystem (bits) */
+    double   entropy_b;        /* von Neumann entropy of qutrit subsystem (bits) */
+    double   mutual_info;      /* Mutual information I(A:B) (bits) */
+    int      is_entangled;     /* 1 if subsystems are internally entangled */
+    double   eigenvalues_a[2]; /* Eigenvalues of ρ_A */
+    double   eigenvalues_b[3]; /* Eigenvalues of ρ_B */
+} SubSystemDecomp;
+
+/* Decompose D=6 register into qubit(2)⊗qutrit(3) subsystems.
+ * Reads amplitudes from HilbertGroup, computes partial traces,
+ * eigenvalues, and von Neumann entropy for each subsystem. */
+SubSystemDecomp subsystem_decompose(HexStateEngine *eng, uint64_t chunk_id);
+void subsystem_decompose_print(SubSystemDecomp *d);
+
+/* Create internally entangled state within a single D=6 register.
+ *   type 0: (|0,0⟩+|1,1⟩)/√2 — maximally entangled (qubit-qutrit Bell)
+ *   type 1: (|0,0⟩+|1,2⟩)/√2 — maximally entangled (shifted Bell)
+ *   type 2: custom state (pass 6-component Complex vector) */
+void subsystem_entangle(HexStateEngine *eng, uint64_t chunk_id,
+                        int type, const Complex *custom_state);
+
+/* Create generalized Bell state |Ψ_mn⟩ between two chunks:
+ *   |Ψ_mn⟩ = (1/√D) Σ_k ω^(mk) |k, (k+n) mod D⟩
+ *   For D=6: 36 unique maximally entangled states (m,n ∈ 0..5)
+ *   Superdense coding: log₂(36) = 5.17 bits/pair (vs 2 for qubits) */
+void generalized_bell_state(HexStateEngine *eng, uint64_t a, uint64_t b,
+                            uint32_t m, uint32_t n, uint32_t dim);
+
+/* Compute partial transpose negativity (entanglement witness).
+ *   Returns negativity N ≥ 0.  N > 0 ⟹ NPT ⟹ definitely entangled.
+ *   Stores log-negativity E_N = log₂(2N+1) in *log_negativity if non-NULL.
+ *   For D=6 Bell state: N = 2.5, E_N = 2.58 */
+double partial_transpose_negativity(HexStateEngine *eng, uint64_t chunk_id,
+                                    double *log_negativity);
 
 #endif /* HEXSTATE_ENGINE_H */
 
