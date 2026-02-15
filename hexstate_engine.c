@@ -4744,3 +4744,150 @@ double partial_transpose_negativity(HexStateEngine *eng, uint64_t chunk_id,
     if (log_negativity) *log_negativity = 0;
     return 0;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * SUB-CHUNK QUHIT API — Individual Quhit Addressing
+ *
+ * Maps (chunk_id, quhit_idx) → virtual chunk ID in a reserved range.
+ * Each virtual chunk is a lightweight infinite chunk that can join
+ * HilbertGroups, be measured, and have unitaries applied independently.
+ *
+ * Architecture:
+ *   - init_quhit_register(eng, chunk_id, N, D) creates N virtual chunks
+ *     starting at QUHIT_VCHUNK_BASE + reg_index * MAX_QUHITS_PER_REG
+ *   - Each virtual chunk has q_local_state = |0⟩ (D-amplitude vector)
+ *   - resolve_quhit() translates (chunk_id, idx) → virtual_chunk_id
+ *   - All other functions delegate to existing engine functions
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+int init_quhit_register(HexStateEngine *eng, uint64_t chunk_id,
+                        uint64_t n_quhits, uint32_t dim)
+{
+    if (!eng) return -1;
+    if (dim == 0) dim = 6;
+    if (n_quhits == 0 || n_quhits > MAX_QUHITS_PER_REG) {
+        printf("  [QUHIT] Error: n_quhits must be 1..%d (got %lu)\n",
+               MAX_QUHITS_PER_REG, (unsigned long)n_quhits);
+        return -1;
+    }
+    if (eng->num_quhit_regs >= MAX_QUHIT_REGISTERS) {
+        printf("  [QUHIT] Error: max %d quhit registers\n", MAX_QUHIT_REGISTERS);
+        return -1;
+    }
+
+    /* Check for duplicate chunk_id */
+    for (uint32_t r = 0; r < eng->num_quhit_regs; r++) {
+        if (eng->quhit_regs[r].chunk_id == chunk_id) {
+            printf("  [QUHIT] Error: chunk %lu already has quhit register\n",
+                   (unsigned long)chunk_id);
+            return -1;
+        }
+    }
+
+    uint32_t reg_idx = eng->num_quhit_regs;
+    uint64_t vbase = QUHIT_VCHUNK_BASE + (uint64_t)reg_idx * MAX_QUHITS_PER_REG;
+
+    printf("  [QUHIT] Initializing %lu individual quhits in chunk %lu (D=%u)\n",
+           (unsigned long)n_quhits, (unsigned long)chunk_id, dim);
+    printf("  [QUHIT] Virtual chunk range: %lu .. %lu\n",
+           (unsigned long)vbase, (unsigned long)(vbase + n_quhits - 1));
+
+    /* Init the parent chunk itself as infinite via Magic Pointer */
+    op_infinite_resources_dim(eng, chunk_id, 0, dim);
+
+    /* Each quhit is a Magic Pointer — use op_infinite_resources_dim.
+     * No manual memory allocation. The engine's Hilbert space reference
+     * system handles everything: Magic Pointer tag, local state, q_flags. */
+    for (uint64_t i = 0; i < n_quhits; i++) {
+        uint64_t vid = vbase + i;
+        op_infinite_resources_dim(eng, vid, 1, dim);
+    }
+
+    /* Store the mapping */
+    eng->quhit_regs[reg_idx].chunk_id = chunk_id;
+    eng->quhit_regs[reg_idx].n_quhits = n_quhits;
+    eng->quhit_regs[reg_idx].vchunk_base = vbase;
+    eng->quhit_regs[reg_idx].dim = dim;
+    eng->quhit_regs[reg_idx].group = NULL;  /* created on first braid */
+    eng->num_quhit_regs++;
+
+    printf("  [QUHIT] ✓ %lu quhits ready — each individually addressable\n",
+           (unsigned long)n_quhits);
+    printf("  [QUHIT] Hilbert space: D^N = %u^%lu\n", dim, (unsigned long)n_quhits);
+    return 0;
+}
+
+uint64_t resolve_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_idx)
+{
+    for (uint32_t r = 0; r < eng->num_quhit_regs; r++) {
+        if (eng->quhit_regs[r].chunk_id == chunk_id) {
+            if (quhit_idx >= eng->quhit_regs[r].n_quhits) {
+                printf("  [QUHIT] Error: quhit %lu out of range (max %lu) in chunk %lu\n",
+                       (unsigned long)quhit_idx,
+                       (unsigned long)eng->quhit_regs[r].n_quhits - 1,
+                       (unsigned long)chunk_id);
+                return UINT64_MAX;
+            }
+            return eng->quhit_regs[r].vchunk_base + quhit_idx;
+        }
+    }
+    printf("  [QUHIT] Error: chunk %lu has no quhit register\n",
+           (unsigned long)chunk_id);
+    return UINT64_MAX;
+}
+
+uint64_t measure_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_idx)
+{
+    uint64_t vid = resolve_quhit(eng, chunk_id, quhit_idx);
+    if (vid == UINT64_MAX) return UINT64_MAX;
+    return measure_chunk(eng, vid);
+}
+
+void apply_dft_quhit(HexStateEngine *eng, uint64_t chunk_id,
+                     uint64_t quhit_idx, uint32_t dim)
+{
+    uint64_t vid = resolve_quhit(eng, chunk_id, quhit_idx);
+    if (vid == UINT64_MAX) return;
+    apply_dft(eng, vid, dim);
+}
+
+void apply_unitary_quhit(HexStateEngine *eng, uint64_t chunk_id,
+                         uint64_t quhit_idx, const Complex *U, uint32_t dim)
+{
+    uint64_t vid = resolve_quhit(eng, chunk_id, quhit_idx);
+    if (vid == UINT64_MAX) return;
+    apply_local_unitary(eng, vid, U, dim);
+}
+
+void braid_quhits(HexStateEngine *eng,
+                  uint64_t chunk_a, uint64_t quhit_a,
+                  uint64_t chunk_b, uint64_t quhit_b,
+                  uint32_t dim)
+{
+    uint64_t vid_a = resolve_quhit(eng, chunk_a, quhit_a);
+    uint64_t vid_b = resolve_quhit(eng, chunk_b, quhit_b);
+    if (vid_a == UINT64_MAX || vid_b == UINT64_MAX) return;
+    braid_chunks_dim(eng, vid_a, vid_b, 0, 0, dim);
+}
+
+void apply_cz_quhits(HexStateEngine *eng,
+                     uint64_t chunk_a, uint64_t quhit_a,
+                     uint64_t chunk_b, uint64_t quhit_b)
+{
+    uint64_t vid_a = resolve_quhit(eng, chunk_a, quhit_a);
+    uint64_t vid_b = resolve_quhit(eng, chunk_b, quhit_b);
+    if (vid_a == UINT64_MAX || vid_b == UINT64_MAX) return;
+    apply_cz_gate(eng, vid_a, vid_b);
+}
+
+HilbertSnapshot inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
+                              uint64_t quhit_idx)
+{
+    uint64_t vid = resolve_quhit(eng, chunk_id, quhit_idx);
+    if (vid == UINT64_MAX) {
+        HilbertSnapshot empty;
+        memset(&empty, 0, sizeof(empty));
+        return empty;
+    }
+    return inspect_hilbert(eng, vid);
+}
