@@ -4879,6 +4879,75 @@ void entangle_all_quhits(HexStateEngine *eng, uint64_t chunk_id)
            eng->quhit_regs[r].num_nonzero);
 }
 
+/* ── apply_cz_all_quhits: CZ between ALL N(N-1)/2 pairs ──────────────── */
+void apply_cz_all_quhits(HexStateEngine *eng, uint64_t chunk_id)
+{
+    int r = find_quhit_reg(eng, chunk_id);
+    if (r < 0) return;
+
+    uint64_t N = eng->quhit_regs[r].n_quhits;
+    uint32_t D = eng->quhit_regs[r].dim;
+    double omega = 2.0 * M_PI / D;
+
+    /*
+     * For each entry with bulk_value v, num_addr individually-addressed quhits:
+     *
+     * Total CZ phase = product of ω^(v_i · v_j) over all i<j.
+     *
+     * N_bulk = N - num_addr  (quhits sharing bulk value v)
+     *
+     * 1) Bulk-Bulk pairs: C(N_bulk, 2) pairs, each contributing ω^(v²)
+     *    → total phase exponent = v² × N_bulk × (N_bulk - 1) / 2
+     *
+     * 2) Addr-Bulk cross terms: each addr quhit with value a pairs with
+     *    N_bulk bulk quhits → phase exponent = a × v × N_bulk
+     *
+     * 3) Addr-Addr pairs: each pair (i,j) of addr quhits → ω^(a_i × a_j)
+     *
+     * 4) Addr self-with-bulk (included in 2): already counted.
+     *
+     * Total exponent (mod D):
+     *   E = v² × N_bulk(N_bulk-1)/2 + v × N_bulk × Σ a_i + Σ_{i<j} a_i × a_j
+     */
+
+    for (uint32_t e = 0; e < eng->quhit_regs[r].num_nonzero; e++) {
+        QuhitBasisEntry *ent = &eng->quhit_regs[r].entries[e];
+        uint64_t v = ent->bulk_value;
+        uint64_t n_addr = ent->num_addr;
+        uint64_t n_bulk = N - n_addr;
+
+        /* 1) Bulk-Bulk: v² × C(n_bulk, 2) */
+        uint64_t bb_exp = (v * v % D) * ((n_bulk % D) * ((n_bulk - 1) % D) % D) % D;
+        /* We need (n_bulk * (n_bulk-1) / 2) mod D.
+         * Since D=6, one of n_bulk or n_bulk-1 is even, so /2 is exact mod D. */
+        uint64_t nb_mod = n_bulk % (2 * D);  /* enough precision */
+        uint64_t half_pairs = (nb_mod * ((nb_mod - 1 + 2*D) % (2*D))) / 2;
+        uint64_t phase_exp = (v * v % D) * (half_pairs % D) % D;
+
+        /* 2) Addr-Bulk: Σ a_i × v × n_bulk */
+        uint64_t sum_a = 0;
+        for (uint64_t i = 0; i < n_addr; i++)
+            sum_a += ent->addr[i].value;
+        phase_exp = (phase_exp + (sum_a % D) * (v % D) % D * (n_bulk % D) % D) % D;
+
+        /* 3) Addr-Addr: Σ_{i<j} a_i × a_j */
+        for (uint64_t i = 0; i < n_addr; i++)
+            for (uint64_t j = i + 1; j < n_addr; j++)
+                phase_exp = (phase_exp + (uint64_t)ent->addr[i].value * ent->addr[j].value) % D;
+
+        /* Apply the phase rotation */
+        double angle = omega * (double)(phase_exp % D);
+        double cr = cos(angle), ci = sin(angle);
+        Complex a = ent->amplitude;
+        ent->amplitude.real = a.real * cr - a.imag * ci;
+        ent->amplitude.imag = a.real * ci + a.imag * cr;
+    }
+
+    printf("  [QUHIT] ✓ CZ-all: %lu quhits, %lu pairs, %u entries\n",
+           (unsigned long)N, (unsigned long)(N/2) * (N > 0 ? N-1 : 0),
+           eng->quhit_regs[r].num_nonzero);
+}
+
 uint64_t resolve_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_idx)
 {
     int r = find_quhit_reg(eng, chunk_id);
