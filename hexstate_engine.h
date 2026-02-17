@@ -220,8 +220,8 @@ typedef struct {
 /* ─── Engine State ────────────────────────────────────────────────────────── */
 
 /* Self-describing Hilbert space entry types (used by quhit registers) */
-#define MAX_QUHIT_HILBERT_ENTRIES 1296   /* D^4: bulk × 3 individually-addressed quhits */
-#define MAX_ADDR_PER_ENTRY 3        /* individually-addressed quhits per basis state */
+#define MAX_QUHIT_HILBERT_ENTRIES 7776   /* D^5: bulk × up to 5 individually-addressed quhits */
+#define MAX_ADDR_PER_ENTRY 5        /* individually-addressed quhits per basis state */
 
 typedef struct {
     uint64_t quhit_idx;         /* Magic Pointer address of this quhit */
@@ -324,6 +324,8 @@ void engine_destroy(HexStateEngine *eng);
 int  init_chunk(HexStateEngine *eng, uint64_t id, uint64_t num_hexits);
 void create_superposition(HexStateEngine *eng, uint64_t id);
 void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index);
+void apply_dna_gate(HexStateEngine *eng, uint64_t id,
+                    double bond_strength, double temperature);
 void apply_group_unitary(HexStateEngine *eng, uint64_t id,
                          Complex *U, uint32_t dim);
 void apply_local_unitary(HexStateEngine *eng, uint64_t id,
@@ -628,5 +630,24 @@ void apply_sum_quhits(HexStateEngine *eng,
 /* Non-destructive inspection of a specific quhit's Hilbert space. */
 HilbertSnapshot inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
                               uint64_t quhit_idx);
+
+/* ── DNA Gate (Mode 2: Individual Quhit Registers) ───────────────────
+ *
+ * Complement-focusing unitary on quhit registers.
+ * Dual of DFT: where DFT spreads, DNA gate focuses to WC complement.
+ *
+ * apply_dna_bulk_quhits:  Transforms bulk amplitudes — ALL quhits
+ *                         simultaneously, no promotion needed.
+ *                         Like entangle_all_quhits but with DNA unitary.
+ *
+ * apply_dna_quhit:        Transforms a SINGLE quhit, promoting it to
+ *                         addr[] with complement-focused amplitudes.
+ *                         Like apply_dft_quhit but with DNA unitary.
+ * ─────────────────────────────────────────────────────────────────── */
+void apply_dna_bulk_quhits(HexStateEngine *eng, uint64_t chunk_id,
+                           double bond_strength, double temperature);
+void apply_dna_quhit(HexStateEngine *eng, uint64_t chunk_id,
+                     uint64_t quhit_idx,
+                     double bond_strength, double temperature);
 
 #endif /* HEXSTATE_ENGINE_H */
