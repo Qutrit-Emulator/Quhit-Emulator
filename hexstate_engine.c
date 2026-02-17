@@ -5678,3 +5678,166 @@ void apply_dna_quhit(HexStateEngine *eng, uint64_t chunk_id,
     printf("  [QUHIT] ✓ DNA gate on quhit %lu: %u entries\n",
            (unsigned long)quhit_idx, new_nz);
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Lazy State Vector Streaming — Zero-copy iterator over quantum state
+ *
+ *  Walks the sparse representation one entry at a time.
+ *  No heap allocation.  Non-destructive.  Works in all 3 state modes.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+int state_iter_begin(HexStateEngine *eng, uint64_t chunk_id, StateIterator *it)
+{
+    memset(it, 0, sizeof(*it));
+    it->eng      = eng;
+    it->chunk_id = chunk_id;
+    it->reg_idx  = -1;
+
+    /* ── Priority 1: Quhit register (Mode 2 — infinite resource) ── */
+    int r = find_quhit_reg(eng, chunk_id);
+    if (r >= 0 && eng->quhit_regs[r].num_nonzero > 0) {
+        it->mode          = 0;
+        it->reg_idx       = r;
+        it->entries       = eng->quhit_regs[r].entries;
+        it->total_entries = eng->quhit_regs[r].num_nonzero;
+        it->n_quhits      = eng->quhit_regs[r].n_quhits;
+        it->dim            = eng->quhit_regs[r].dim;
+        it->bulk_rule      = eng->quhit_regs[r].bulk_rule;
+        it->entry_index    = (uint32_t)-1;  /* pre-first */
+        return 0;
+    }
+
+    /* ── Priority 2: HilbertGroup (braided multi-party state) ── */
+    if (chunk_id < eng->num_chunks) {
+        Chunk *c = &eng->chunks[chunk_id];
+        if (c->hilbert.group && c->hilbert.group->num_nonzero > 0) {
+            const HilbertGroup *g = c->hilbert.group;
+            it->mode          = 3;
+            it->group         = g;
+            it->total_entries = g->num_nonzero;
+            it->dim           = g->dim;
+            it->n_quhits      = g->num_members;
+            it->entry_index   = (uint32_t)-1;
+            /* Find this chunk's member index in the group */
+            it->group_member_idx = 0;
+            for (uint32_t m = 0; m < g->num_members; m++) {
+                if (g->member_ids[m] == chunk_id) {
+                    it->group_member_idx = m;
+                    break;
+                }
+            }
+            return 0;
+        }
+
+        /* ── Priority 2b: Legacy joint state (pairwise fallback) ── */
+        if (c->hilbert.num_partners > 0 &&
+            c->hilbert.partners[0].q_joint_state) {
+            uint32_t jd = c->hilbert.partners[0].q_joint_dim;
+            it->mode          = 2;
+            it->local_ptr     = c->hilbert.partners[0].q_joint_state;
+            it->local_dim     = jd;
+            it->total_entries = jd * jd;
+            it->dim           = jd;
+            it->n_quhits      = 2;  /* joint = 2 parties */
+            it->entry_index   = (uint32_t)-1;
+            return 0;
+        }
+
+        /* ── Priority 3: Local D-dimensional state ── */
+        if (c->hilbert.q_local_state) {
+            it->mode          = 1;
+            it->local_ptr     = c->hilbert.q_local_state;
+            it->local_dim     = c->hilbert.q_local_dim;
+            it->total_entries = c->hilbert.q_local_dim;
+            it->dim           = c->hilbert.q_local_dim;
+            it->n_quhits      = c->size;
+            it->entry_index   = (uint32_t)-1;
+            return 0;
+        }
+    }
+
+    return -1;  /* no state found */
+}
+
+int state_iter_next(StateIterator *it)
+{
+    it->entry_index++;
+    if (it->entry_index >= it->total_entries)
+        return 0;  /* done */
+
+    switch (it->mode) {
+    case 0: {
+        /* Quhit register: sparse entries */
+        const QuhitBasisEntry *e = &it->entries[it->entry_index];
+        it->bulk_value   = e->bulk_value;
+        it->amplitude    = e->amplitude;
+        it->probability  = e->amplitude.real * e->amplitude.real +
+                           e->amplitude.imag * e->amplitude.imag;
+        it->num_addr     = e->num_addr;
+        it->addr         = e->addr;
+        return 1;
+    }
+    case 1:
+    case 2: {
+        /* Local or joint state: dense D (or D²) array */
+        uint32_t i = it->entry_index;
+        it->amplitude    = it->local_ptr[i];
+        it->probability  = it->amplitude.real * it->amplitude.real +
+                           it->amplitude.imag * it->amplitude.imag;
+        it->bulk_value   = i;
+        it->num_addr     = 0;
+        it->addr         = NULL;
+        return 1;
+    }
+    case 3: {
+        /* HilbertGroup: sparse entries with per-member basis indices */
+        const HilbertGroup *g = it->group;
+        uint32_t ei = it->entry_index;
+        it->amplitude   = g->amplitudes[ei];
+        it->probability = g->amplitudes[ei].real * g->amplitudes[ei].real +
+                          g->amplitudes[ei].imag * g->amplitudes[ei].imag;
+        /* bulk_value = this member's basis index in this entry */
+        it->bulk_value  = g->basis_indices[ei * g->num_members + it->group_member_idx];
+        it->num_addr    = 0;
+        it->addr        = NULL;
+        return 1;
+    }
+    }
+    return 0;
+}
+
+uint32_t state_iter_resolve(const StateIterator *it, uint64_t quhit_idx)
+{
+    if (it->mode == 0) {
+        /* Use lazy_resolve on the current sparse entry */
+        return lazy_resolve(&it->entries[it->entry_index],
+                            quhit_idx, it->bulk_rule, it->dim);
+    }
+    /* For local/joint: bulk_value IS the basis index */
+    if (it->mode == 2) {
+        /* Joint state: row = party A, col = party B */
+        uint32_t i = it->entry_index;
+        if (quhit_idx == 0) return i / it->local_dim;  /* party A */
+        else                return i % it->local_dim;  /* party B */
+    }
+    if (it->mode == 3) {
+        /* HilbertGroup: look up any member's basis index */
+        const HilbertGroup *g = it->group;
+        if (quhit_idx < g->num_members) {
+            return g->basis_indices[it->entry_index * g->num_members + (uint32_t)quhit_idx];
+        }
+        return it->bulk_value;  /* fallback */
+    }
+    return it->bulk_value;  /* local: single value */
+}
+
+Complex state_iter_amplitude(const StateIterator *it)
+{
+    return it->amplitude;
+}
+
+void state_iter_end(StateIterator *it)
+{
+    /* No heap to free.  Zero the struct to prevent stale reads. */
+    memset(it, 0, sizeof(*it));
+}
