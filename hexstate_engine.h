@@ -627,6 +627,9 @@ void apply_sum_quhits(HexStateEngine *eng,
                       uint64_t chunk_ctrl, uint64_t quhit_ctrl,
                       uint64_t chunk_tgt,  uint64_t quhit_tgt);
 
+/* Find the quhit register index for a given chunk ID. Returns -1 if not found. */
+int find_quhit_reg(HexStateEngine *eng, uint64_t chunk_id);
+
 /* Non-destructive inspection of a specific quhit's Hilbert space. */
 HilbertSnapshot inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
                               uint64_t quhit_idx);
