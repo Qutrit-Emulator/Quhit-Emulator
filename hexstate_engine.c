@@ -11,6 +11,7 @@
  */
 
 #include "hexstate_engine.h"
+#include "born_rule.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -172,7 +173,7 @@ static int     dft6_initialized = 0;
 static void init_dft6(void)
 {
     if (dft6_initialized) return;
-    double inv_sqrt6 = 1.0 / sqrt(6.0);
+    double inv_sqrt6 = born_fast_isqrt(6.0);
     for (int j = 0; j < 6; j++) {
         for (int k = 0; k < 6; k++) {
             double angle = 2.0 * M_PI * j * k / 6.0;
@@ -521,7 +522,7 @@ void create_superposition(HexStateEngine *eng, uint64_t id)
         if (c->hilbert.q_local_state) {
             uint32_t d = c->hilbert.q_local_dim;
             if (d == 0) d = 6;
-            double amp = 1.0 / sqrt((double)d);
+            double amp = born_fast_isqrt((double)d);
             for (uint32_t i = 0; i < d; i++)
                 c->hilbert.q_local_state[i] = cmplx(amp, 0.0);
         }
@@ -530,7 +531,7 @@ void create_superposition(HexStateEngine *eng, uint64_t id)
         return;
     }
 
-    double inv_sqrt_n = 1.0 / sqrt((double)ns);
+    double inv_sqrt_n = born_fast_isqrt((double)ns);
     for (uint64_t i = 0; i < ns; i++) {
         state[i].real = inv_sqrt_n;
         state[i].imag = 0.0;
@@ -648,7 +649,7 @@ void apply_dna_gate(HexStateEngine *eng, uint64_t id,
         for (uint32_t j = 0; j < dim; j++)
             norm += U[i*dim+j].real * U[i*dim+j].real + U[i*dim+j].imag * U[i*dim+j].imag;
         if (norm > 1e-15) {
-            double inv = 1.0 / sqrt(norm);
+            double inv = born_fast_isqrt(norm);
             for (uint32_t j = 0; j < dim; j++) {
                 U[i*dim+j].real *= inv;
                 U[i*dim+j].imag *= inv;
@@ -964,7 +965,7 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
         /* ── Group-first: apply DFT as local unitary ── */
         if (c->hilbert.group) {
             uint32_t dim = c->hilbert.group->dim;
-            double inv_sqrt_d = 1.0 / sqrt((double)dim);
+            double inv_sqrt_d = born_fast_isqrt((double)dim);
             Complex *dft = calloc((size_t)dim * dim, sizeof(Complex));
             for (uint32_t j = 0; j < dim; j++)
                 for (uint32_t k = 0; k < dim; k++) {
@@ -985,7 +986,7 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
             uint8_t which = c->hilbert.partners[0].q_which;
             uint32_t dim = c->hilbert.partners[0].q_joint_dim;
             if (dim == 0) dim = 6;
-            double inv_sqrt_d = 1.0 / sqrt((double)dim);
+            double inv_sqrt_d = born_fast_isqrt((double)dim);
 
             /* Check if dim is power of 2 */
             int is_pow2 = (dim > 0) && ((dim & (dim - 1)) == 0);
@@ -1096,7 +1097,7 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
             uint32_t d = c->hilbert.q_local_dim;
             if (d == 0) d = 6;
             bluestein_dft(c->hilbert.q_local_state, d);
-            double inv_sqrt_d = 1.0 / sqrt((double)d);
+            double inv_sqrt_d = born_fast_isqrt((double)d);
             for (uint32_t i = 0; i < d; i++)
                 c->hilbert.q_local_state[i] = cmplx(
                     c->hilbert.q_local_state[i].real * inv_sqrt_d,
@@ -1123,7 +1124,7 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
     uint32_t base_d = (c->hilbert.num_partners > 0) ? c->hilbert.partners[0].q_joint_dim : 0;
     if (base_d == 0) base_d = 6;
     uint64_t stride = power_of_6(hexit_index);
-    double inv_sqrt_d = 1.0 / sqrt((double)base_d);
+    double inv_sqrt_d = born_fast_isqrt((double)base_d);
 
     Complex *temp = calloc(base_d, sizeof(Complex));
 
@@ -1443,7 +1444,7 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
                         for (uint32_t e = 0; e < ns; e++)
                             ck_norm += cnorm2(c_k[e]);
                         if (ck_norm > 0.0 && (ck_norm < 1e-200 || ck_norm > 1e200)) {
-                            double scale = 1.0 / sqrt(ck_norm);
+                            double scale = born_fast_isqrt(ck_norm);
                             for (uint32_t e = 0; e < ns; e++) {
                                 c_k[e].real *= scale;
                                 c_k[e].imag *= scale;
@@ -1568,7 +1569,7 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             for (uint32_t e = 0; e < g->num_nonzero; e++)
                 norm += cnorm2(g->amplitudes[e]);
             if (norm > 0.0) {
-                double scale = 1.0 / sqrt(norm);
+                double scale = born_fast_isqrt(norm);
                 for (uint32_t e = 0; e < g->num_nonzero; e++) {
                     g->amplitudes[e].real *= scale;
                     g->amplitudes[e].imag *= scale;
@@ -1682,7 +1683,7 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             }
             /* Renormalize */
             if (total > 0.0) {
-                double norm = 1.0 / sqrt(total);
+                double norm = born_fast_isqrt(total);
                 for (uint64_t j = 0; j < p_ns; j++) {
                     p_state[j].real *= norm;
                     p_state[j].imag *= norm;
@@ -1941,7 +1942,7 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
             for (uint32_t e = 0; e < merged_count; e++)
                 norm += cnorm2(merged_amps[e]);
             if (norm > 0.0) {
-                double scale = 1.0 / sqrt(norm);
+                double scale = born_fast_isqrt(norm);
                 for (uint32_t e = 0; e < merged_count; e++) {
                     merged_amps[e].real *= scale;
                     merged_amps[e].imag *= scale;
@@ -2045,7 +2046,7 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
             g->basis_indices = calloc((size_t)dim * 2, sizeof(uint32_t));
             g->amplitudes = calloc(dim, sizeof(Complex));
 
-            double amp = 1.0 / sqrt((double)dim);
+            double amp = born_fast_isqrt((double)dim);
             for (uint32_t k = 0; k < dim; k++) {
                 g->basis_indices[k * 2 + 0] = k;  /* A's index */
                 g->basis_indices[k * 2 + 1] = k;  /* B's index */
@@ -2684,7 +2685,7 @@ static void builtin_period_find(HexStateEngine *eng, uint64_t chunk_id,
         if (count_in_class == 0) count_in_class = 1;  /* Safety */
 
         /* Second pass: zero non-matching, renormalize matching */
-        double norm = 1.0 / sqrt((double)count_in_class);
+        double norm = born_fast_isqrt((double)count_in_class);
         fx = 1;
         for (uint64_t x = 0; x < Q; x++) {
             if (fx == 1) {
@@ -3184,7 +3185,7 @@ int execute_instruction(HexStateEngine *eng, Instruction instr)
                 total += cnorm2(rc_state[i]);
             }
             if (total > 1e-15) {
-                double scale = 1.0 / sqrt(total);
+                double scale = born_fast_isqrt(total);
                 for (uint64_t i = 0; i < rc_ns; i++) {
                     rc_state[i].real *= scale;
                     rc_state[i].imag *= scale;
@@ -3505,7 +3506,7 @@ int run_self_test(HexStateEngine *eng)
     create_superposition(eng, 0);
     {
         Chunk *c = &eng->chunks[0];
-        double expected = 1.0 / sqrt(36.0);
+        double expected = born_fast_isqrt(36.0);
         double actual = c->hilbert.shadow_state[0].real;
         int ok = fabs(actual - expected) < 1e-10;
         printf("  Amplitude[0]: %.10f (expected %.10f) %s\n",
@@ -3884,7 +3885,7 @@ static void eigen_hermitian_jacobi(Complex *mat, uint32_t D, double *eigenvalues
 
                 double tau = (M[q * D + q] - M[p * D + p]) / (2.0 * apq);
                 double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau * tau));
-                double c = 1.0 / sqrt(1.0 + t * t);
+                double c = born_fast_isqrt(1.0 + t * t);
                 double s = t * c;
 
                 /* Apply rotation */
@@ -4185,7 +4186,7 @@ double hilbert_entanglement_entropy(HexStateEngine *eng, uint64_t chunk_id)
 /* Helper: build D×D DFT matrix  F[j,k] = (1/√D) ω^(jk) */
 static void mermin_build_dft(Complex *U, uint32_t dim)
 {
-    double s = 1.0 / sqrt((double)dim);
+    double s = born_fast_isqrt((double)dim);
     for (uint32_t r = 0; r < dim; r++)
         for (uint32_t c = 0; c < dim; c++) {
             double phase = 2.0 * M_PI * r * c / dim;
@@ -4553,7 +4554,7 @@ void subsystem_entangle(HexStateEngine *eng, uint64_t chunk_id,
     Complex target[6];
     memset(target, 0, sizeof(target));
 
-    double s2 = 1.0 / sqrt(2.0);
+    double s2 = born_fast_isqrt(2.0);
     switch (type) {
         case 0: /* (|0,0⟩+|1,1⟩)/√2 = (|0⟩+|4⟩)/√2 */
             target[0] = (Complex){s2, 0};
@@ -4835,7 +4836,7 @@ double partial_transpose_negativity(HexStateEngine *eng, uint64_t chunk_id,
 
                     double tau = (H[qq*dim+qq] - H[p*dim+p]) / (2.0 * apq);
                     double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau*tau));
-                    double co = 1.0 / sqrt(1.0 + t*t);
+                    double co = born_fast_isqrt(1.0 + t*t);
                     double si = t * co;
 
                     /* Rotate */
@@ -4996,7 +4997,7 @@ void entangle_all_quhits(HexStateEngine *eng, uint64_t chunk_id)
      * This is a proper unitary — no information is destroyed.
      * Then apply CZ between quhit pair (0,1) for phase correlations. */
 
-    double inv_sqrt_d = 1.0 / sqrt((double)dim);
+    double inv_sqrt_d = born_fast_isqrt((double)dim);
     double omega = 2.0 * M_PI / (double)dim;
 
     static QuhitBasisEntry new_entries[MAX_QUHIT_HILBERT_ENTRIES];
@@ -5251,7 +5252,7 @@ uint64_t measure_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_id
                 eng->quhit_regs[r].entries[e].amplitude.imag;
     }
     if (norm > 0.0) {
-        double scale = 1.0 / sqrt(norm);
+        double scale = born_fast_isqrt(norm);
         for (uint32_t e = 0; e < write_pos; e++) {
             eng->quhit_regs[r].entries[e].amplitude.real *= scale;
             eng->quhit_regs[r].entries[e].amplitude.imag *= scale;
@@ -5276,7 +5277,7 @@ void apply_dft_quhit(HexStateEngine *eng, uint64_t chunk_id,
 
     uint32_t nz = eng->quhit_regs[r].num_nonzero;
     double omega = 2.0 * M_PI / dim;
-    double inv_sqrt_d = 1.0 / sqrt((double)dim);
+    double inv_sqrt_d = born_fast_isqrt((double)dim);
 
     /* DFT on quhit at Magic Pointer address quhit_idx.
      * For each entry, lazily resolve the quhit's current value,
@@ -5547,7 +5548,7 @@ static Complex *build_quhit_dna_unitary(uint32_t dim,
         for (uint32_t j = 0; j < dim; j++)
             norm += U[i*dim+j].real * U[i*dim+j].real + U[i*dim+j].imag * U[i*dim+j].imag;
         if (norm > 1e-15) {
-            double inv = 1.0 / sqrt(norm);
+            double inv = born_fast_isqrt(norm);
             for (uint32_t j = 0; j < dim; j++) {
                 U[i*dim+j].real *= inv;
                 U[i*dim+j].imag *= inv;
