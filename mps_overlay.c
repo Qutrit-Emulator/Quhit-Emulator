@@ -727,7 +727,7 @@ void mps_build_dft6(double *U_re, double *U_im)
     double inv = 1.0 / sqrt(6.0);
     for (int j = 0; j < 6; j++)
         for (int k = 0; k < 6; k++) {
-            double angle = 2.0 * M_PI * j * k / 6.0;
+            double angle = 2.0 * M_PI * j * k / (double)MPS_PHYS;
             U_re[j * 6 + k] = inv * cos(angle);
             U_im[j * 6 + k] = inv * sin(angle);
         }
@@ -741,7 +741,7 @@ void mps_build_cz(double *G_re, double *G_im)
     for (int k = 0; k < MPS_PHYS; k++)
         for (int l = 0; l < MPS_PHYS; l++) {
             int idx = (k * MPS_PHYS + l) * D2 + (k * MPS_PHYS + l);
-            double angle = 2.0 * M_PI * k * l / 6.0;
+            double angle = 2.0 * M_PI * k * l / (double)MPS_PHYS;
             G_re[idx] = cos(angle);
             G_im[idx] = sin(angle);
         }

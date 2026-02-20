@@ -20,7 +20,9 @@
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #define MPS_CHI  128
+#ifndef MPS_PHYS
 #define MPS_PHYS 6
+#endif
 
 /* Total entries per tensor: D × χ² = 216 complex numbers */
 #define MPS_TENSOR_SIZE (MPS_PHYS * MPS_CHI * MPS_CHI)
