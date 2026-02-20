@@ -104,12 +104,23 @@ void mps_build_hadamard2(double *U_re, double *U_im);
 double mps_overlay_norm(QuhitEngine *eng, uint32_t *quhits, int n);
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * DEFERRED RENORMALIZATION
+ * CANONICAL SWEEP DIRECTION
  *
- * Set mps_defer_renorm = 1 to skip per-gate O(N) norm computation.
- * Call mps_renormalize_chain once per layer instead. O(N) per call.
+ * mps_sweep_right = 1 (default): L→R sweep.
+ *   Left site  = U  (left-canonical).
+ *   Right site = σ·V (gauge center moves right).
+ *
+ * mps_sweep_right = 0: R→L sweep.
+ *   Left site  = U·σ (gauge center moves left).
+ *   Right site = V   (right-canonical).
+ *
+ * O(1) renormalization: σ is rescaled so that Σσ²=1 at each SVD.
+ * In canonical form this IS the global norm.  No O(N) trace needed.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
+extern int mps_sweep_right;
+
+/* Legacy full-chain renormalization (O(N) — for verification only) */
 extern int mps_defer_renorm;
 void mps_renormalize_chain(QuhitEngine *eng, uint32_t *quhits, int n);
 

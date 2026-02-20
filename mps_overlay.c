@@ -13,6 +13,7 @@
 MpsTensor *mps_store   = NULL;
 int        mps_store_n = 0;
 int        mps_defer_renorm = 0;
+int        mps_sweep_right  = 1;  /* 1 = L→R (default), 0 = R→L */
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * INIT / FREE
@@ -360,69 +361,112 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                 }
         }
 
-    /* Step 5: SVD via Jacobi eigendecomposition of H = M^T M (36×36)
-     * Keep top χ=6 singular values → EXACT since rank ≤ min(DCHI, DCHI) = 36 ≥ χ.
+    /* Step 5: SVD via eigendecomposition of M†M (36×36 complex Hermitian)
+     *
+     * M†M is complex Hermitian, NOT real symmetric.
+     *   (M†M)_re[j][k] = Σ_r M_re[r][j]*M_re[r][k] + M_im[r][j]*M_im[r][k]
+     *   (M†M)_im[j][k] = Σ_r M_re[r][j]*M_im[r][k] - M_im[r][j]*M_re[r][k]
+     *
+     * We diagonalize the FULL Hermitian matrix with complex Jacobi rotations:
+     *   1. Phase-rotate column q by e^{-iφ} to make H[p][q] real
+     *   2. Apply real Givens rotation to zero the (now-real) off-diagonal
+     *   3. Accumulate complex eigenvectors in V = V_re + i·V_im
      */
 
-    /* Heap-allocate H and V (36×36 each = ~10KB) to avoid stack overflow */
-    double (*H)[DCHI] = (double (*)[DCHI])calloc(DCHI, sizeof(double[DCHI]));
-    double (*V)[DCHI] = (double (*)[DCHI])calloc(DCHI, sizeof(double[DCHI]));
+    /* Heap-allocate all 36×36 arrays (4 × ~10KB = ~40KB) */
+    double (*Hr)[DCHI] = (double (*)[DCHI])calloc(DCHI, sizeof(double[DCHI]));
+    double (*Hi)[DCHI] = (double (*)[DCHI])calloc(DCHI, sizeof(double[DCHI]));
+    double (*Vr)[DCHI] = (double (*)[DCHI])calloc(DCHI, sizeof(double[DCHI]));
+    double (*Vi)[DCHI] = (double (*)[DCHI])calloc(DCHI, sizeof(double[DCHI]));
 
-    /* H = M^T M + M_im^T M_im */
+    /* H = M†M (complex Hermitian) */
     for (int i = 0; i < DCHI; i++)
         for (int j = 0; j < DCHI; j++) {
-            double s = 0;
-            for (int r = 0; r < DCHI; r++)
-                s += M_re[r][i] * M_re[r][j] + M_im[r][i] * M_im[r][j];
-            H[i][j] = s;
+            double sr = 0, si2 = 0;
+            for (int r = 0; r < DCHI; r++) {
+                sr  += M_re[r][i]*M_re[r][j] + M_im[r][i]*M_im[r][j];
+                si2 += M_re[r][i]*M_im[r][j] - M_im[r][i]*M_re[r][j];
+            }
+            Hr[i][j] = sr;
+            Hi[i][j] = si2;
         }
 
-    /* V = I */
-    for (int i = 0; i < DCHI; i++) V[i][i] = 1.0;
+    /* V = I (complex) */
+    for (int i = 0; i < DCHI; i++) Vr[i][i] = 1.0;
 
-    /* Jacobi sweeps */
+    /* Complex Hermitian Jacobi sweeps */
     for (int sweep = 0; sweep < 200; sweep++) {
         double off = 0;
         for (int i = 0; i < DCHI; i++)
             for (int j = i + 1; j < DCHI; j++)
-                off += H[i][j] * H[i][j];
+                off += Hr[i][j]*Hr[i][j] + Hi[i][j]*Hi[i][j];
         if (off < 1e-28) break;
 
         for (int p = 0; p < DCHI; p++)
             for (int q = p + 1; q < DCHI; q++) {
-                if (fabs(H[p][q]) < 1e-15) continue;
-                double tau = (H[q][q] - H[p][p]) / (2.0 * H[p][q]);
+                double hpq_r = Hr[p][q], hpq_i = Hi[p][q];
+                double mag = sqrt(hpq_r*hpq_r + hpq_i*hpq_i);
+                if (mag < 1e-15) continue;
+
+                /* Phase rotation: multiply col q by e^{-iφ}, row q by e^{+iφ}
+                 * to make H[p][q] purely real = mag */
+                double eR = hpq_r / mag, eI = -hpq_i / mag; /* e^{-iφ} */
+
+                for (int i = 0; i < DCHI; i++) {
+                    double xr = Hr[i][q], xi = Hi[i][q];
+                    Hr[i][q] = xr*eR - xi*eI;
+                    Hi[i][q] = xr*eI + xi*eR;
+                }
+                for (int j = 0; j < DCHI; j++) {
+                    double xr = Hr[q][j], xi = Hi[q][j];
+                    Hr[q][j] =  xr*eR + xi*eI;
+                    Hi[q][j] = -xr*eI + xi*eR;
+                }
+                for (int i = 0; i < DCHI; i++) {
+                    double xr = Vr[i][q], xi = Vi[i][q];
+                    Vr[i][q] = xr*eR - xi*eI;
+                    Vi[i][q] = xr*eI + xi*eR;
+                }
+
+                /* Standard real Givens to zero H[p][q] (now real ≈ mag) */
+                double hpp = Hr[p][p], hqq = Hr[q][q];
+                double hpq_real = Hr[p][q];
+
+                double tau = (hqq - hpp) / (2.0 * hpq_real);
                 double t;
                 if (fabs(tau) > 1e15)
                     t = 1.0 / (2.0 * tau);
                 else
-                    t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau*tau));
+                    t = (tau >= 0 ? 1.0 : -1.0) /
+                        (fabs(tau) + sqrt(1.0 + tau*tau));
                 double c = 1.0 / sqrt(1.0 + t*t);
                 double s = t * c;
 
-                /* Rotate rows p, q of H */
-                double Hp[DCHI], Hq[DCHI];
-                for (int i = 0; i < DCHI; i++) {
-                    Hp[i] = c*H[p][i] - s*H[q][i];
-                    Hq[i] = s*H[p][i] + c*H[q][i];
+                /* Rotate rows p, q */
+                for (int j = 0; j < DCHI; j++) {
+                    double rp = Hr[p][j], ip = Hi[p][j];
+                    double rq = Hr[q][j], iq = Hi[q][j];
+                    Hr[p][j] = c*rp - s*rq;  Hi[p][j] = c*ip - s*iq;
+                    Hr[q][j] = s*rp + c*rq;  Hi[q][j] = s*ip + c*iq;
                 }
-                for (int i = 0; i < DCHI; i++) { H[p][i] = Hp[i]; H[q][i] = Hq[i]; }
-                /* Rotate columns p, q of H */
+                /* Rotate cols p, q */
                 for (int i = 0; i < DCHI; i++) {
-                    double hip = H[i][p], hiq = H[i][q];
-                    H[i][p] = c*hip - s*hiq;
-                    H[i][q] = s*hip + c*hiq;
+                    double rp = Hr[i][p], ip = Hi[i][p];
+                    double rq = Hr[i][q], iq = Hi[i][q];
+                    Hr[i][p] = c*rp - s*rq;  Hi[i][p] = c*ip - s*iq;
+                    Hr[i][q] = s*rp + c*rq;  Hi[i][q] = s*ip + c*iq;
                 }
-                /* Accumulate in V */
+                /* Rotate V cols p, q */
                 for (int i = 0; i < DCHI; i++) {
-                    double vip = V[i][p], viq = V[i][q];
-                    V[i][p] = c*vip - s*viq;
-                    V[i][q] = s*vip + c*viq;
+                    double rp = Vr[i][p], ip = Vi[i][p];
+                    double rq = Vr[i][q], iq = Vi[i][q];
+                    Vr[i][p] = c*rp - s*rq;  Vi[i][p] = c*ip - s*iq;
+                    Vr[i][q] = s*rp + c*rq;  Vi[i][q] = s*ip + c*iq;
                 }
             }
     }
 
-    /* Find top-χ eigenvalue indices (selection sort by H[i][i] descending) */
+    /* Find top-χ eigenvalue indices (selection sort by Hr[i][i] descending) */
     int top[MPS_CHI];
     {
         int used[DCHI];
@@ -431,8 +475,8 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
             int best = -1;
             double best_val = -1e30;
             for (int i = 0; i < DCHI; i++) {
-                if (!used[i] && H[i][i] > best_val) {
-                    best_val = H[i][i]; best = i;
+                if (!used[i] && Hr[i][i] > best_val) {
+                    best_val = Hr[i][i]; best = i;
                 }
             }
             top[t] = best;
@@ -440,19 +484,41 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
         }
     }
 
-    /* Extract singular values and right singular vectors */
+    /* Extract singular values and complex right singular vectors */
     double sig[MPS_CHI];
-    double v_cols[MPS_CHI][DCHI]; /* v_cols[t][i] = V[i][top[t]] */
+    double vc_re[MPS_CHI][DCHI], vc_im[MPS_CHI][DCHI];
     for (int t = 0; t < MPS_CHI; t++) {
-        sig[t] = (top[t] >= 0) ? sqrt(fabs(H[top[t]][top[t]])) : 0;
-        for (int i = 0; i < DCHI; i++)
-            v_cols[t][i] = (top[t] >= 0) ? V[i][top[t]] : 0;
+        sig[t] = (top[t] >= 0) ? sqrt(fabs(Hr[top[t]][top[t]])) : 0;
+        for (int i = 0; i < DCHI; i++) {
+            vc_re[t][i] = (top[t] >= 0) ? Vr[i][top[t]] : 0;
+            vc_im[t][i] = (top[t] >= 0) ? Vi[i][top[t]] : 0;
+        }
+    }
+
+    /* U columns: u_t = M × v_t / σ_t  (complex M × complex v) */
+    double u_re[MPS_CHI][DCHI], u_im[MPS_CHI][DCHI];
+    memset(u_re, 0, sizeof(u_re));
+    memset(u_im, 0, sizeof(u_im));
+    for (int t = 0; t < MPS_CHI; t++) {
+        if (sig[t] > 1e-30) {
+            for (int i = 0; i < DCHI; i++) {
+                double sr = 0, si2 = 0;
+                for (int j = 0; j < DCHI; j++) {
+                    sr  += M_re[i][j]*vc_re[t][j] - M_im[i][j]*vc_im[t][j];
+                    si2 += M_re[i][j]*vc_im[t][j] + M_im[i][j]*vc_re[t][j];
+                }
+                u_re[t][i] = sr / sig[t];
+                u_im[t][i] = si2 / sig[t];
+            }
+        }
     }
 
     /* ── LOCAL O(1) RENORMALIZATION ──────────────────────────────
      * In mixed-canonical form, kept_norm_sq = Σ σ_t² IS the exact
      * global norm ||ψ||². We rescale σ to restore ||ψ|| = 1.0
      * without touching the rest of the chain.  Cost: O(χ) = O(1).
+     * U columns were computed above using original σ so they remain
+     * orthonormal (left-canonical).
      * ─────────────────────────────────────────────────────────── */
     double kept_norm_sq = 0;
     for (int t = 0; t < MPS_CHI; t++) kept_norm_sq += sig[t] * sig[t];
@@ -462,45 +528,59 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
         for (int t = 0; t < MPS_CHI; t++) sig[t] *= scale;
     }
 
-    /* U columns: u_t = M × v_t / σ_t */
-    double u_re[MPS_CHI][DCHI], u_im[MPS_CHI][DCHI];
-    memset(u_re, 0, sizeof(u_re));
-    memset(u_im, 0, sizeof(u_im));
-    for (int t = 0; t < MPS_CHI; t++) {
-        if (sig[t] > 1e-30) {
-            for (int i = 0; i < DCHI; i++) {
-                double sr = 0, si2 = 0;
-                for (int j = 0; j < DCHI; j++) {
-                    sr += M_re[i][j] * v_cols[t][j];
-                    si2 += M_im[i][j] * v_cols[t][j];
-                }
-                u_re[t][i] = sr / sig[t];
-                u_im[t][i] = si2 / sig[t];
+    /* Step 6: Write back — direction depends on sweep
+     *
+     * L→R (mps_sweep_right=1):
+     *   Left site  = U             (left-canonical)
+     *   Right site = σ·V           (gauge center, moves right)
+     *
+     * R→L (mps_sweep_right=0):
+     *   Left site  = U·σ           (gauge center, moves left)
+     *   Right site = V             (right-canonical)
+     *
+     * V is now complex — both re and im parts stored.
+     */
+    mps_zero_site(si);
+    mps_zero_site(sj);
+
+    if (mps_sweep_right) {
+        /* ── L→R: A_i = U (left-canonical), A_j = σ·V (gauge) ── */
+        for (int kp = 0; kp < MPS_PHYS; kp++)
+            for (int a = 0; a < MPS_CHI; a++) {
+                int r = kp * MPS_CHI + a;
+                for (int bp = 0; bp < MPS_CHI; bp++)
+                    mps_write_tensor(si, kp, a, bp,
+                                     u_re[bp][r], u_im[bp][r]);
             }
-        }
+        for (int lp = 0; lp < MPS_PHYS; lp++)
+            for (int g = 0; g < MPS_CHI; g++) {
+                int cc = lp * MPS_CHI + g;
+                for (int bp = 0; bp < MPS_CHI; bp++)
+                    mps_write_tensor(sj, lp, bp, g,
+                                     sig[bp]*vc_re[bp][cc],
+                                     sig[bp]*vc_im[bp][cc]);
+            }
+    } else {
+        /* ── R→L: A_i = U·σ (gauge), A_j = V (right-canonical) ── */
+        for (int kp = 0; kp < MPS_PHYS; kp++)
+            for (int a = 0; a < MPS_CHI; a++) {
+                int r = kp * MPS_CHI + a;
+                for (int bp = 0; bp < MPS_CHI; bp++)
+                    mps_write_tensor(si, kp, a, bp,
+                                     u_re[bp][r] * sig[bp],
+                                     u_im[bp][r] * sig[bp]);
+            }
+        for (int lp = 0; lp < MPS_PHYS; lp++)
+            for (int g = 0; g < MPS_CHI; g++) {
+                int cc = lp * MPS_CHI + g;
+                for (int bp = 0; bp < MPS_CHI; bp++)
+                    mps_write_tensor(sj, lp, bp, g,
+                                     vc_re[bp][cc], vc_im[bp][cc]);
+            }
     }
 
-    /* Step 6: Write back */
-    /* A'_i[k'][α][β'] = U_col_β'[k'χ+α]  (β' = 0..χ-1) */
-    mps_zero_site(si);
-    for (int kp = 0; kp < MPS_PHYS; kp++)
-        for (int a = 0; a < MPS_CHI; a++) {
-            int r = kp * MPS_CHI + a;
-            for (int bp = 0; bp < MPS_CHI; bp++)
-                mps_write_tensor(si, kp, a, bp, u_re[bp][r], u_im[bp][r]);
-        }
-
-    /* A'_j[l'][β'][γ] = σ_{β'} × v_{β'}[l'χ+γ]  (real V) */
-    mps_zero_site(sj);
-    for (int lp = 0; lp < MPS_PHYS; lp++)
-        for (int g = 0; g < MPS_CHI; g++) {
-            int c = lp * MPS_CHI + g;
-            for (int bp = 0; bp < MPS_CHI; bp++)
-                mps_write_tensor(sj, lp, bp, g, sig[bp] * v_cols[bp][c], 0);
-        }
-
-    free(H);
-    free(V);
+    free(Hr); free(Hi);
+    free(Vr); free(Vi);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
