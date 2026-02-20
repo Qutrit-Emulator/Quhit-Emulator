@@ -876,7 +876,7 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
         /* ── Group-first: apply DFT as local unitary ── */
         if (c->hilbert.group) {
             uint32_t dim = c->hilbert.group->dim;
-            double inv_sqrt_d = born_fast_isqrt((double)dim);
+            double inv_sqrt_d = 1.0 / sqrt((double)dim);
             Complex *dft = sv_calloc_aligned((size_t)dim * dim, sizeof(Complex));
             for (uint32_t j = 0; j < dim; j++)
                 for (uint32_t k = 0; k < dim; k++) {
@@ -897,7 +897,7 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
             uint8_t which = c->hilbert.partners[0].q_which;
             uint32_t dim = c->hilbert.partners[0].q_joint_dim;
             if (dim == 0) dim = 6;
-            double inv_sqrt_d = born_fast_isqrt((double)dim);
+            double inv_sqrt_d = 1.0 / sqrt((double)dim);
 
             /* Check if dim is power of 2 */
             int is_pow2 = (dim > 0) && ((dim & (dim - 1)) == 0);
