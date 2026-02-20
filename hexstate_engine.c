@@ -309,7 +309,6 @@ void engine_destroy(HexStateEngine *eng)
             if (freed_groups[f] == g) { already = 1; break; }
         if (already) continue;
         if (nfreed < 1024) freed_groups[nfreed++] = g;
-        free(g->basis_indices);
         free(g->amplitudes);
         free(g);
         eng->chunks[i].hilbert.group = NULL;
@@ -715,78 +714,57 @@ void apply_group_unitary(HexStateEngine *eng, uint64_t id,
         }
         return;
     }
-    /* ── Apply unitary to the shared Hilbert space ──
-     * The group's sparse state is a D-dimensional Hilbert space.
-     * Entries are indexed by the shared basis k, with amplitudes α_k.
-     * A unitary U transforms the amplitude vector:
-     *   new_α[k] = Σ_j U[k][j] × α[j]
-     * This is O(D²), keeping ≤D entries. The Hilbert space handles
-     * the computation — no client-side tensor product expansion.
-     *
-     * New entries are created when the unitary produces nonzero amplitudes
-     * for basis values not in the current state. Entries are removed when
-     * their amplitudes go to zero. */
+    /* ── Apply local unitary to one member's subsystem in the dense state ──
+     * For a dense state |Ψ⟩ = Σ α[flat] |i_0, ..., i_{N-1}⟩:
+     * Applying U to member m transforms:
+     *   α'[..., i_m', ...] = Σ_{i_m} U[i_m'][i_m] × α[..., i_m, ...]
+     * We iterate over all flat indices, group by the "other" indices,
+     * and apply U to the target member's slice. */
 
-    uint32_t ns = g->num_nonzero;
-    uint32_t nm = g->num_members;
-
-    /* Build the amplitude vector indexed by basis value for this member */
-    Complex amp_in[dim];
-    memset(amp_in, 0, dim * sizeof(Complex));
     uint32_t my_idx = c->hilbert.group_index;
+    uint32_t D = g->dim;
+    uint64_t td = g->total_dim;
 
-    for (uint32_t e = 0; e < ns; e++) {
-        uint32_t k = g->basis_indices[e * nm + my_idx];
-        if (k < dim) {
-            amp_in[k].real += g->amplitudes[e].real;
-            amp_in[k].imag += g->amplitudes[e].imag;
+    /* Compute stride for member my_idx:
+     * stride = D^(num_members - 1 - my_idx) */
+    uint64_t stride = 1;
+    for (uint32_t i = my_idx + 1; i < g->num_members; i++) stride *= D;
+
+    /* Allocate output buffer */
+    Complex *new_amps = sv_calloc_aligned(td, sizeof(Complex));
+
+    /* For each flat index, compute the transformed amplitude */
+    for (uint64_t flat = 0; flat < td; flat++) {
+        /* Extract this member's index from flat */
+        uint32_t i_m = (uint32_t)((flat / stride) % D);
+
+        /* This flat index contributes to new_flat where
+         * the target member's index is i_m'.
+         * new_flat = flat - i_m * stride + i_m' * stride
+         * We accumulate: new_amps[new_flat] += U[i_m'][i_m] * old_amps[flat] */
+        Complex old_amp = g->amplitudes[flat];
+        if (cnorm2(old_amp) < 1e-30) continue;
+
+        /* Base flat with target member zeroed out */
+        uint64_t base_flat = flat - (uint64_t)i_m * stride;
+
+        for (uint32_t i_m_new = 0; i_m_new < D; i_m_new++) {
+            uint64_t new_flat = base_flat + (uint64_t)i_m_new * stride;
+            Complex u_elem = U[i_m_new * dim + i_m];  /* U[row][col] */
+            new_amps[new_flat].real += u_elem.real * old_amp.real
+                                    - u_elem.imag * old_amp.imag;
+            new_amps[new_flat].imag += u_elem.real * old_amp.imag
+                                    + u_elem.imag * old_amp.real;
         }
     }
 
-    /* Apply U: new_α = U × old_α */
-    Complex amp_out[dim];
-    for (uint32_t i = 0; i < dim; i++) {
-        amp_out[i].real = 0.0;
-        amp_out[i].imag = 0.0;
-        for (uint32_t j = 0; j < dim; j++) {
-            amp_out[i].real += U[i * dim + j].real * amp_in[j].real
-                             - U[i * dim + j].imag * amp_in[j].imag;
-            amp_out[i].imag += U[i * dim + j].real * amp_in[j].imag
-                             + U[i * dim + j].imag * amp_in[j].real;
-        }
-    }
-
-    /* Count how many output amplitudes are nonzero */
-    uint32_t new_count = 0;
-    for (uint32_t k = 0; k < dim; k++)
-        if (cnorm2(amp_out[k]) > 1e-28) new_count++;
-
-    /* Rebuild the sparse state with the new amplitudes.
-     * For each nonzero amp_out[k], create entry |k,k,...,k⟩ with that amplitude.
-     * The basis indices for ALL members are set to k (shared Hilbert space). */
-    uint32_t *new_indices = calloc((size_t)new_count * nm, sizeof(uint32_t));
-    Complex  *new_amps    = sv_calloc_aligned(new_count, sizeof(Complex));
-    uint32_t  w = 0;
-    for (uint32_t k = 0; k < dim; k++) {
-        if (cnorm2(amp_out[k]) > 1e-28) {
-            for (uint32_t m = 0; m < nm; m++)
-                new_indices[w * nm + m] = k;
-            new_amps[w] = amp_out[k];
-            w++;
-        }
-    }
-
-    /* Replace group's sparse state */
-    free(g->basis_indices);
+    /* Replace group's state */
     free(g->amplitudes);
-    g->basis_indices = new_indices;
-    g->amplitudes    = new_amps;
-    g->num_nonzero   = new_count;
-    g->sparse_cap    = new_count;
+    g->amplitudes = new_amps;
 
-    printf("  [U] Applied %u×%u unitary to group Hilbert space via member %u/%u "
-           "(%u nonzero entries)\n",
-           dim, dim, my_idx, nm, new_count);
+    printf("  [U] Applied %u×%u unitary to dense Hilbert space via member %u/%u "
+           "(%lu total_dim)\n",
+           dim, dim, my_idx, g->num_members, (unsigned long)td);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -812,22 +790,22 @@ void apply_local_unitary(HexStateEngine *eng, uint64_t id,
     if (id >= eng->num_chunks) return;
     Chunk *c = &eng->chunks[id];
     HilbertGroup *g = c->hilbert.group;
-    if (!g || g->num_nonzero == 0) return;
+    if (!g || g->total_dim == 0) return;
 
     uint32_t nm = g->num_members;
-    uint32_t ns = g->num_nonzero;
     uint32_t my_idx = c->hilbert.group_index;
 
     /* ═══ Deferred Local Unitary Path ═══
-     * If the base state has ≤ D entries (e.g. GHZ), applying a local
-     * unitary would expand it to ≤ D² entries per member. Instead,
-     * DEFER: store the D×D unitary per member. The state is implicitly:
-     *   |Ψ⟩ = Σ_k α_k · ⊗_m (U_L · ... · U_1 |index_{m,k}⟩)
-     * Measurement replays ops as matrix-vector products: O(D² × L).
+     * If the state is still compact (e.g. post-braid Bell state with mostly
+     * zeros), defer the unitary. Store the D×D matrix per member.
+     * At measurement, replay ops as matrix-vector products.
      *
-     * Eligible when: num_nonzero ≤ dim (sum of ≤ D product states).
-     * LAZY: push U to per-member list, no composition needed. */
-    if (ns <= dim && nm >= 2 && !g->no_defer) {
+     * We defer when the number of nonzero entries is ≤ D and nm >= 2. */
+    uint64_t nnz = 0;
+    for (uint64_t f = 0; f < g->total_dim; f++)
+        if (cnorm2(g->amplitudes[f]) > 1e-28) nnz++;
+
+    if (nnz <= dim && nm >= 2 && !g->no_defer) {
         /* Grow lazy list if needed */
         if (g->lazy_count[my_idx] >= g->lazy_cap[my_idx]) {
             uint32_t new_cap = g->lazy_cap[my_idx] ? g->lazy_cap[my_idx] * 2 : 8;
@@ -844,113 +822,45 @@ void apply_local_unitary(HexStateEngine *eng, uint64_t id,
             g->num_deferred++;
 
         printf("  [LOCAL U] LAZY push %u×%u unitary for member %u/%u "
-               "(op #%u, base entries: %u)\n",
-               dim, dim, my_idx, nm, g->lazy_count[my_idx], ns);
+               "(op #%u, nnz: %lu)\n",
+               dim, dim, my_idx, nm, g->lazy_count[my_idx], (unsigned long)nnz);
         return;
     }
 
-    /* Maximum output: each entry can split into dim entries */
-    uint32_t max_out = ns * dim;
+    /* ── Eager path: apply U to member my_idx's subsystem (dense) ──
+     * Same stride-based approach as apply_group_unitary. */
+    uint64_t td = g->total_dim;
+    uint32_t D = g->dim;
 
-    /* ── Hash table for O(n) deduplication ──
-     * Instead of O(n²) pairwise comparison, we hash each index tuple
-     * and merge amplitudes in O(1) per entry.
-     * Table size: next power of 2 ≥ 2 × max_out for low collision rate */
-    uint32_t ht_size = 1;
-    while (ht_size < max_out * 2) ht_size <<= 1;
-    uint32_t ht_mask = ht_size - 1;
+    /* Compute stride for member my_idx */
+    uint64_t stride = 1;
+    for (uint32_t i = my_idx + 1; i < nm; i++) stride *= D;
 
-    /* Hash table: each slot stores an index into the output arrays, or UINT32_MAX if empty */
-    uint32_t *ht_slots = malloc(ht_size * sizeof(uint32_t));
-    memset(ht_slots, 0xFF, ht_size * sizeof(uint32_t));  /* fill with UINT32_MAX */
+    Complex *new_amps = sv_calloc_aligned(td, sizeof(Complex));
 
-    uint32_t *new_indices = calloc((size_t)max_out * nm, sizeof(uint32_t));
-    Complex  *new_amps    = sv_calloc_aligned(max_out, sizeof(Complex));
-    uint32_t  out_count   = 0;
+    for (uint64_t flat = 0; flat < td; flat++) {
+        Complex old_amp = g->amplitudes[flat];
+        if (cnorm2(old_amp) < 1e-30) continue;
 
-    for (uint32_t e = 0; e < ns; e++) {
-        uint32_t *old_row = &g->basis_indices[e * nm];
-        uint32_t k = old_row[my_idx];
-        Complex  alpha = g->amplitudes[e];
+        uint32_t i_m = (uint32_t)((flat / stride) % D);
+        uint64_t base_flat = flat - (uint64_t)i_m * stride;
 
-        for (uint32_t j = 0; j < dim; j++) {
-            Complex u_jk = U[j * dim + k];
-            Complex new_amp;
-            new_amp.real = alpha.real * u_jk.real - alpha.imag * u_jk.imag;
-            new_amp.imag = alpha.real * u_jk.imag + alpha.imag * u_jk.real;
-
-            if (cnorm2(new_amp) < 1e-28) continue;
-
-            /* Build the candidate index tuple in-place:
-             * same as old_row but with my_idx changed to j */
-
-            /* FNV-1a hash of the index tuple */
-            uint32_t hash = 2166136261u;
-            for (uint32_t m = 0; m < nm; m++) {
-                uint32_t val = (m == my_idx) ? j : old_row[m];
-                hash ^= val;
-                hash *= 16777619u;
-            }
-
-            /* Open addressing: linear probe for matching tuple or empty slot */
-            uint32_t slot = hash & ht_mask;
-            for (;;) {
-                if (ht_slots[slot] == UINT32_MAX) {
-                    /* Empty slot — insert new entry */
-                    uint32_t *new_row = &new_indices[out_count * nm];
-                    memcpy(new_row, old_row, nm * sizeof(uint32_t));
-                    new_row[my_idx] = j;
-                    new_amps[out_count] = new_amp;
-                    ht_slots[slot] = out_count;
-                    out_count++;
-                    break;
-                }
-
-                /* Slot occupied — check if tuples match */
-                uint32_t existing = ht_slots[slot];
-                uint32_t *ex_row = &new_indices[existing * nm];
-                int same = 1;
-                for (uint32_t m = 0; m < nm; m++) {
-                    uint32_t val = (m == my_idx) ? j : old_row[m];
-                    if (ex_row[m] != val) { same = 0; break; }
-                }
-                if (same) {
-                    /* Merge amplitudes */
-                    new_amps[existing].real += new_amp.real;
-                    new_amps[existing].imag += new_amp.imag;
-                    break;
-                }
-
-                /* Collision — linear probe */
-                slot = (slot + 1) & ht_mask;
-            }
+        for (uint32_t j = 0; j < D; j++) {
+            uint64_t new_flat = base_flat + (uint64_t)j * stride;
+            Complex u_jk = U[j * dim + i_m];
+            new_amps[new_flat].real += u_jk.real * old_amp.real
+                                    - u_jk.imag * old_amp.imag;
+            new_amps[new_flat].imag += u_jk.real * old_amp.imag
+                                    + u_jk.imag * old_amp.real;
         }
     }
 
-    free(ht_slots);
-
-    /* Compact: remove zero entries */
-    uint32_t w = 0;
-    for (uint32_t i = 0; i < out_count; i++) {
-        if (cnorm2(new_amps[i]) < 1e-28) continue;
-        if (w != i) {
-            memcpy(&new_indices[w * nm], &new_indices[i * nm],
-                   nm * sizeof(uint32_t));
-            new_amps[w] = new_amps[i];
-        }
-        w++;
-    }
-
-    free(g->basis_indices);
     free(g->amplitudes);
-    g->basis_indices = new_indices;
-    g->amplitudes    = new_amps;
-    g->num_nonzero   = w;
-    g->sparse_cap    = max_out;
+    g->amplitudes = new_amps;
 
     printf("  [LOCAL U] Applied %u×%u local unitary to member %u/%u "
-           "(%u → %u entries)\n",
-           dim, dim, my_idx, nm, ns, w);
+           "(dense, %lu total_dim)\n",
+           dim, dim, my_idx, nm, (unsigned long)td);
 }
 
 /* ─── Hadamard (DFT₆) Gate ────────────────────────────────────────────────── */
@@ -1152,7 +1062,7 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
 
 /* ─── Materialize Deferred Unitaries ──────────────────────────────────────── */
 /* Forces expansion of all deferred unitaries into the explicit state vector.
- * After this, num_nonzero = D^N and each amplitude is fully computed.
+ * After this, the dense state (total_dim = D^N amplitudes) is fully computed.
  * This MUST be called before any non-local gate. */
 /* ─── Lazy replay helper: apply lazy op list to a D-vector in-place ───────── */
 static void lazy_apply_vec(Complex **ops, uint32_t num_ops,
@@ -1232,9 +1142,9 @@ void materialize_deferred(HexStateEngine *eng, HilbertGroup *g)
     g->no_defer = 0;
 
     printf("  [MATERIALIZE] Expanded lazy unitaries: "
-           "%u entries, %.1f KB\n",
-           g->num_nonzero,
-           (double)g->num_nonzero * (g->num_members * sizeof(uint32_t) + sizeof(Complex)) / 1024.0);
+           "dense %lu entries, %.1f KB\n",
+           (unsigned long)g->total_dim,
+           (double)g->total_dim * sizeof(Complex) / 1024.0);
 }
 
 /* ─── Controlled Phase Gate (Non-Local) — DEFERRED ────────────────────────── */
@@ -1302,238 +1212,144 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
              *   |Ψ⟩ = Σ_k α_k · ⊗_m (U_m |index_{m,k}⟩)
              * We sample ALL members sequentially in O(N × D²):
              *
-             * Algorithm:
-             * 1. Maintain D complex coefficients c_k (initialized from amplitudes)
-             * 2. For each member m (except last):
-             *    P(v) = Σ_k |c_k|² · |U_m[v, idx_{m,k}]|²   (unitarity kills cross-terms)
-             *    Sample v, update c_k ← c_k · U_m[v, idx_{m,k}]
-             * 3. For last member: P(v) = |Σ_k c_k · U[v, idx_k]|²  (full interference)
-             * 4. Collapse group to single entry.
+             * Algorithm (dense):
+             * 1. Materialize all deferred unitaries into the dense state.
+             * 2. Compute marginal P(v) = Σ_{flat: member_m == v} |α[flat]|²
+             * 3. Born-rule sample v.
+             * 4. Collapse: zero all amplitudes where member_m ≠ v, renormalize.
+             * 5. Apply CZ phases to surviving amplitudes.
              *
-             * Total: O(N × D²) time, O(D) space. The Hilbert space holds the math. */
+             * Total: O(total_dim × D) time. */
             if (g->num_deferred > 0 || g->num_cz > 0) {
-                uint32_t ns = g->num_nonzero;
+                /* Materialize all lazy unitaries first */
+                if (g->num_deferred > 0)
+                    materialize_deferred(eng, g);
+
                 uint32_t nm = g->num_members;
                 uint32_t dim_local = g->dim;
-                /* Allocate tracking arrays */
-                Complex *c_k = sv_calloc_aligned(ns, sizeof(Complex));
-                for (uint32_t e = 0; e < ns; e++)
-                    c_k[e] = g->amplitudes[e];
+                uint64_t td = g->total_dim;
 
-                uint64_t *outcomes = calloc(nm, sizeof(uint64_t));
-                int *measured = calloc(nm, sizeof(int));
+                /* Compute stride for my_idx */
+                uint64_t my_stride = 1;
+                for (uint32_t i = my_idx + 1; i < nm; i++) my_stride *= dim_local;
 
-                /* Build measurement order: requested member first */
-                uint32_t *order = calloc(nm, sizeof(uint32_t));
-                order[0] = my_idx;
-                uint32_t oi = 1;
-                for (uint32_t m = 0; m < nm; m++)
-                    if (m != my_idx) order[oi++] = m;
-
-                /* Pre-compose lazy ops into per-member matrices via lazy replay
-                 * Cost: O(D² × L) per member instead of O(D³ × L) for eager composition */
-                Complex *composed_U[2] = {NULL, NULL};
-                for (uint32_t mi = 0; mi < nm && mi < 2; mi++) {
-                    if (g->lazy_count[mi] > 0)
-                        composed_U[mi] = lazy_compose(g->lazy_U[mi],
-                                                      g->lazy_count[mi], dim_local);
+                /* Compute marginal P(v) for this member */
+                double probs[NUM_BASIS_STATES];
+                memset(probs, 0, dim_local * sizeof(double));
+                for (uint64_t flat = 0; flat < td; flat++) {
+                    uint32_t v = (uint32_t)((flat / my_stride) % dim_local);
+                    probs[v] += cnorm2(g->amplitudes[flat]);
                 }
 
-                for (uint32_t step = 0; step < nm; step++) {
-                    uint32_t m = order[step];
-                    Complex *U_m = (m < 2) ? composed_U[m] : NULL;
-                    uint32_t members_remaining = nm - step;
+                /* Normalize */
+                double total = 0.0;
+                for (uint32_t v = 0; v < dim_local; v++) total += probs[v];
+                if (total > 0.0)
+                    for (uint32_t v = 0; v < dim_local; v++) probs[v] /= total;
 
-                    /* Compute marginal P(v) for this member.
-                     * CZ phases cancel in marginals: |ω^(j·k)|² = 1.
-                     * So the formula is the SAME as without CZ. */
-                    double probs[NUM_BASIS_STATES];
-                    memset(probs, 0, dim_local * sizeof(double));
+                /* Born rule sample */
+                double r = prng_uniform(eng);
+                double cumul = 0.0;
+                uint32_t result_v = dim_local - 1;
+                for (uint32_t v = 0; v < dim_local; v++) {
+                    cumul += probs[v];
+                    if (cumul >= r) { result_v = v; break; }
+                }
 
-                    if (members_remaining > 1) {
-                        /* ═══ COHERENT marginal — preserves DFT phase ═══
-                         * P(v) = |Σ_k c_k · U_m[v, idx_{m,k}]|²
-                         *
-                         * Previous code used incoherent sum (|c_k|²·|U|²)
-                         * claiming "cross-terms vanish by unitarity."
-                         * WRONG: cross-terms only vanish when marginalizing
-                         * over ALL remaining members simultaneously. Once
-                         * c_k carries phase from prior measurements, the
-                         * cross-terms are physical and must be kept.
-                         *
-                         * The coherent formula is exact for GHZ states
-                         * because all members share the same basis index k
-                         * in each branch — there's no multi-outcome sum
-                         * needed for the other members within a branch. */
-                        for (uint32_t v = 0; v < dim_local; v++) {
-                            Complex amp = {0.0, 0.0};
-                            for (uint32_t e = 0; e < ns; e++) {
-                                uint32_t idx_mk = g->basis_indices[e * nm + m];
-                                Complex u_val;
-                                if (U_m)
-                                    u_val = U_m[v * dim_local + idx_mk];
-                                else
-                                    u_val = (v == idx_mk) ?
-                                        (Complex){1.0, 0.0} : (Complex){0.0, 0.0};
-                                amp.real += c_k[e].real * u_val.real
-                                          - c_k[e].imag * u_val.imag;
-                                amp.imag += c_k[e].real * u_val.imag
-                                          + c_k[e].imag * u_val.real;
-                            }
-                            probs[v] = cnorm2(amp);
-                        }
-                    } else {
-                        /* LAST member: full quantum interference (same formula) */
-                        for (uint32_t v = 0; v < dim_local; v++) {
-                            Complex amp = {0.0, 0.0};
-                            for (uint32_t e = 0; e < ns; e++) {
-                                uint32_t idx_mk = g->basis_indices[e * nm + m];
-                                Complex u_val;
-                                if (U_m)
-                                    u_val = U_m[v * dim_local + idx_mk];
-                                else
-                                    u_val = (v == idx_mk) ?
-                                        (Complex){1.0, 0.0} : (Complex){0.0, 0.0};
-                                amp.real += c_k[e].real * u_val.real
-                                          - c_k[e].imag * u_val.imag;
-                                amp.imag += c_k[e].real * u_val.imag
-                                          + c_k[e].imag * u_val.real;
-                            }
-                            probs[v] = cnorm2(amp);
-                        }
-                    }
+                /* Collapse: zero amplitudes where my member ≠ result_v */
+                for (uint64_t flat = 0; flat < td; flat++) {
+                    uint32_t v = (uint32_t)((flat / my_stride) % dim_local);
+                    if (v != result_v)
+                        g->amplitudes[flat] = (Complex){0.0, 0.0};
+                }
 
-                    /* Normalize */
-                    double total = 0.0;
-                    for (uint32_t v = 0; v < dim_local; v++) total += probs[v];
-                    if (total > 0.0)
-                        for (uint32_t v = 0; v < dim_local; v++) probs[v] /= total;
-
-                    /* Born rule sample */
-                    double r = prng_uniform(eng);
-                    double cumul = 0.0;
-                    uint32_t result_v = dim_local - 1;
-                    for (uint32_t v = 0; v < dim_local; v++) {
-                        cumul += probs[v];
-                        if (cumul >= r) { result_v = v; break; }
-                    }
-
-                    outcomes[m] = result_v;
-                    measured[m] = 1;
-
-                    /* Update c_k: c_k[e] ← c_k[e] × U_m[result_v, idx_{m,e}] */
-                    for (uint32_t e = 0; e < ns; e++) {
-                        uint32_t idx_mk = g->basis_indices[e * nm + m];
-                        Complex u_val;
-                        if (U_m)
-                            u_val = U_m[result_v * dim_local + idx_mk];
-                        else
-                            u_val = (result_v == idx_mk) ?
-                                (Complex){1.0, 0.0} : (Complex){0.0, 0.0};
-                        Complex old = c_k[e];
-                        c_k[e].real = old.real * u_val.real - old.imag * u_val.imag;
-                        c_k[e].imag = old.real * u_val.imag + old.imag * u_val.real;
-                    }
-
-                    /* ── Renormalize c_k to prevent numerical underflow ──
-                     * Each step multiplies |c_k| by |U[v,k]| ≈ 1/√D.
-                     * After N steps, |c_k| ≈ (1/√D)^N which underflows
-                     * for large N (e.g. N=1000, D=6 → (0.408)^1000 ≈ 0).
-                     * Renormalizing preserves relative phases/magnitudes. */
-                    {
-                        double ck_norm = 0.0;
-                        for (uint32_t e = 0; e < ns; e++)
-                            ck_norm += cnorm2(c_k[e]);
-                        if (ck_norm > 0.0 && (ck_norm < 1e-200 || ck_norm > 1e200)) {
-                            double scale = born_fast_isqrt(ck_norm);
-                            for (uint32_t e = 0; e < ns; e++) {
-                                c_k[e].real *= scale;
-                                c_k[e].imag *= scale;
-                            }
-                        }
-                    }
-
-                    /* ═══ CZ ABSORPTION ═══
-                     * After sampling outcome v for member m, absorb CZ phases
-                     * into unmeasured partners' unitaries.
-                     * CZ(m, b) with outcome v: U_b' = D_v · U_b
-                     * where D_v = diag(ω^(v·0), ω^(v·1), ..., ω^(v·(D-1)))
-                     * This is O(D²) per CZ pair — still polynomial. */
+                /* Apply CZ phases to surviving amplitudes */
+                if (g->num_cz > 0) {
                     double omega = 2.0 * M_PI / (double)dim_local;
                     for (uint32_t ci = 0; ci < g->num_cz; ci++) {
-                        uint32_t a = g->cz_pairs[ci * 2 + 0];
-                        uint32_t b = g->cz_pairs[ci * 2 + 1];
-                        uint32_t partner = UINT32_MAX;
-                        if (a == m && !measured[b]) partner = b;
-                        else if (b == m && !measured[a]) partner = a;
-                        if (partner == UINT32_MAX) continue;
-
-                        /* Absorb CZ into partner's composed matrix */
-                        if (partner < 2 && composed_U[partner]) {
-                            Complex *U_b = composed_U[partner];
-                            for (uint32_t j = 0; j < dim_local; j++) {
-                                uint32_t phase_idx = ((uint32_t)result_v * j) % dim_local;
-                                if (phase_idx == 0) continue;
-                                double angle = omega * (double)phase_idx;
-                                double c = cos(angle), s = sin(angle);
-                                for (uint32_t k = 0; k < dim_local; k++) {
-                                    Complex old = U_b[j * dim_local + k];
-                                    U_b[j * dim_local + k].real =
-                                        old.real * c - old.imag * s;
-                                    U_b[j * dim_local + k].imag =
-                                        old.real * s + old.imag * c;
-                                }
-                            }
+                        uint32_t ca = g->cz_pairs[ci * 2 + 0];
+                        uint32_t cb = g->cz_pairs[ci * 2 + 1];
+                        for (uint64_t flat = 0; flat < td; flat++) {
+                            if (cnorm2(g->amplitudes[flat]) < 1e-30) continue;
+                            uint32_t ja = hilbert_extract_index(g, flat, ca);
+                            uint32_t jb = hilbert_extract_index(g, flat, cb);
+                            uint32_t phase_idx = (ja * jb) % dim_local;
+                            if (phase_idx == 0) continue;
+                            double angle = omega * (double)phase_idx;
+                            double cs = cos(angle), sn = sin(angle);
+                            Complex old = g->amplitudes[flat];
+                            g->amplitudes[flat].real = old.real * cs - old.imag * sn;
+                            g->amplitudes[flat].imag = old.real * sn + old.imag * cs;
                         }
                     }
                 }
 
-                /* Record all outcomes */
-                for (uint32_t m = 0; m < nm; m++) {
-                    uint64_t mid = g->member_ids[m];
-                    eng->measured_values[mid] = outcomes[m];
-                    eng->chunks[mid].hilbert.q_flags = 0x02;
+                /* Renormalize surviving amplitudes */
+                double norm = 0.0;
+                for (uint64_t e = 0; e < td; e++)
+                    norm += cnorm2(g->amplitudes[e]);
+                if (norm > 0.0) {
+                    double scale = born_fast_isqrt(norm);
+                    for (uint64_t e = 0; e < td; e++) {
+                        g->amplitudes[e].real *= scale;
+                        g->amplitudes[e].imag *= scale;
+                    }
                 }
 
-                /* Collapse group to single entry */
-                g->num_nonzero = 1;
-                for (uint32_t m = 0; m < nm; m++)
-                    g->basis_indices[m] = (uint32_t)outcomes[m];
-                g->amplitudes[0] = (Complex){1.0, 0.0};
-                g->collapsed = 1;
+                /* Record our measurement */
+                eng->measured_values[id] = (uint64_t)result_v;
+                c->hilbert.q_flags = 0x02;
 
-                /* Free composed and lazy unitaries */
-                for (uint32_t mi = 0; mi < nm && mi < 2; mi++) {
-                    if (composed_U[mi]) free(composed_U[mi]);
+                /* Check if all members are now determined
+                 * (only 1 nonzero amplitude left) */
+                uint64_t nnz = 0;
+                uint64_t last_nz = 0;
+                for (uint64_t e = 0; e < td; e++) {
+                    if (cnorm2(g->amplitudes[e]) > 1e-28) {
+                        nnz++;
+                        last_nz = e;
+                    }
                 }
-                for (uint32_t m = 0; m < nm; m++)
-                    if (g->lazy_count[m] > 0) lazy_free_member(g, m);
-                g->num_deferred = 0;
+                if (nnz == 1) {
+                    for (uint32_t m = 0; m < nm; m++) {
+                        uint64_t mid = g->member_ids[m];
+                        eng->measured_values[mid] = hilbert_extract_index(g, last_nz, m);
+                        eng->chunks[mid].hilbert.q_flags = 0x02;
+                    }
+                    g->collapsed = 1;
+                }
 
                 /* Free CZ pairs */
                 if (g->cz_pairs) { free(g->cz_pairs); g->cz_pairs = NULL; }
                 g->num_cz = 0;
                 g->cz_cap = 0;
 
-                uint64_t my_result = outcomes[my_idx];
+                /* Free lazy unitaries */
+                for (uint32_t m = 0; m < nm; m++)
+                    if (g->lazy_count[m] > 0) lazy_free_member(g, m);
+                g->num_deferred = 0;
 
-                printf("  [MEAS] DEFERRED measurement via Hilbert space O((N+E)×D²): "
-                       "member %u/%u => %lu (all %u members determined)\n",
-                       my_idx, nm, my_result, nm);
+                printf("  [MEAS] DEFERRED+DENSE measurement via Hilbert space: "
+                       "member %u/%u => %u (total_dim=%lu)\n",
+                       my_idx, nm, result_v, (unsigned long)td);
 
-                free(c_k);
-                free(outcomes);
-                free(measured);
-                free(order);
-                return my_result;
+                return (uint64_t)result_v;
             }
 
+            /* ── Simple group measurement (no deferred ops) ── */
             /* Compute marginal probability for this register:
-             * P(v) = Σ_{entries where my_index == v} |amplitude|² */
+             * P(v) = Σ_{flat: member_v == v} |amplitude[flat]|² */
+            uint64_t td = g->total_dim;
+            uint32_t D = g->dim;
+
+            /* Compute stride for my_idx */
+            uint64_t my_stride = 1;
+            for (uint32_t i = my_idx + 1; i < g->num_members; i++) my_stride *= D;
+
             double *probs = calloc(dim, sizeof(double));
-            for (uint32_t e = 0; e < g->num_nonzero; e++) {
-                uint32_t my_val = g->basis_indices[e * g->num_members + my_idx];
-                probs[my_val] += cnorm2(g->amplitudes[e]);
+            for (uint64_t flat = 0; flat < td; flat++) {
+                uint32_t my_val = (uint32_t)((flat / my_stride) % D);
+                probs[my_val] += cnorm2(g->amplitudes[flat]);
             }
 
             /* Born rule: sample from the Hilbert space */
@@ -1546,32 +1362,20 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             }
             free(probs);
 
-            /* Collapse the shared state: remove all entries where
-             * this register's index ≠ result. This is a WRITE to the
-             * shared Hilbert space — all other members automatically
-             * see only the surviving amplitudes on their next read. */
-            uint32_t write_pos = 0;
-            for (uint32_t e = 0; e < g->num_nonzero; e++) {
-                uint32_t my_val = g->basis_indices[e * g->num_members + my_idx];
-                if ((int)my_val == result) {
-                    if (write_pos != e) {
-                        memcpy(&g->basis_indices[write_pos * g->num_members],
-                               &g->basis_indices[e * g->num_members],
-                               g->num_members * sizeof(uint32_t));
-                        g->amplitudes[write_pos] = g->amplitudes[e];
-                    }
-                    write_pos++;
-                }
+            /* Collapse: zero all amplitudes where this member ≠ result */
+            for (uint64_t flat = 0; flat < td; flat++) {
+                uint32_t my_val = (uint32_t)((flat / my_stride) % D);
+                if ((int)my_val != result)
+                    g->amplitudes[flat] = (Complex){0.0, 0.0};
             }
-            g->num_nonzero = write_pos;
 
             /* Renormalize surviving amplitudes */
             double norm = 0.0;
-            for (uint32_t e = 0; e < g->num_nonzero; e++)
+            for (uint64_t e = 0; e < td; e++)
                 norm += cnorm2(g->amplitudes[e]);
             if (norm > 0.0) {
                 double scale = born_fast_isqrt(norm);
-                for (uint32_t e = 0; e < g->num_nonzero; e++) {
+                for (uint64_t e = 0; e < td; e++) {
                     g->amplitudes[e].real *= scale;
                     g->amplitudes[e].imag *= scale;
                 }
@@ -1581,20 +1385,28 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             eng->measured_values[id] = (uint64_t)result;
             c->hilbert.q_flags = 0x02;
 
-            /* Check if any other group members are now fully determined.
-             * If only 1 nonzero entry left, ALL members are determined. */
-            if (g->num_nonzero == 1) {
+            /* Check if only 1 nonzero entry left — all members determined */
+            uint64_t nnz = 0;
+            uint64_t last_nz = 0;
+            for (uint64_t e = 0; e < td; e++) {
+                if (cnorm2(g->amplitudes[e]) > 1e-28) {
+                    nnz++;
+                    last_nz = e;
+                }
+            }
+            if (nnz == 1) {
                 for (uint32_t m = 0; m < g->num_members; m++) {
                     uint64_t mid = g->member_ids[m];
-                    uint32_t mval = g->basis_indices[m]; /* only 1 entry */
+                    uint32_t mval = hilbert_extract_index(g, last_nz, m);
                     eng->measured_values[mid] = mval;
                     eng->chunks[mid].hilbert.q_flags = 0x02;
                 }
+                g->collapsed = 1;
             }
 
-            printf("  [MEAS] READ shared Hilbert space group "
-                   "(member %u/%u, D=%u, %u nonzero remaining) => %d\n",
-                   my_idx, g->num_members, dim, g->num_nonzero, result);
+            printf("  [MEAS] READ dense Hilbert space group "
+                   "(member %u/%u, D=%u, total_dim=%lu) => %d\n",
+                   my_idx, g->num_members, dim, (unsigned long)td, result);
 
             return (uint64_t)result;
         }
@@ -1823,17 +1635,13 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
 
         if (ga && gb && ga != gb) {
             /* Both in different groups — merge gb into ga.
-             * The merged state is formed by combining both groups' members
-             * and then applying the Bell constraint: a's index == b's index.
-             *
-             * Critical: ALL gb members must be reassigned to ga before gb
-             * is freed. */
+             * Dense tensor product: new total_dim = ga->total_dim × gb->total_dim / dim
+             * (divided by dim because Bell constraint reduces one degree of freedom) */
             uint32_t old_ga_members = ga->num_members;
 
             /* Add ALL gb members to ga (skip if already in ga) */
             for (uint32_t m = 0; m < gb->num_members; m++) {
                 uint64_t mid = gb->member_ids[m];
-                /* Check not already in ga */
                 int found = 0;
                 for (uint32_t g = 0; g < ga->num_members; g++)
                     if (ga->member_ids[g] == mid) { found = 1; break; }
@@ -1845,33 +1653,18 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
                 ga->num_members++;
             }
 
-            /* Now rebuild the sparse state for the merged group.
-             * We need to create a tensor product of ga and gb's states,
-             * then filter by the Bell constraint: a's index == b's index.
-             *
-             * The tensor product: for each entry in ga and each entry in gb,
-             * create a combined entry with all members' indices. */
+            uint32_t nm = ga->num_members;
             uint32_t ai = eng->chunks[a].hilbert.group_index;
             uint32_t bi = eng->chunks[b].hilbert.group_index;
-            uint32_t nm = ga->num_members;
 
-            /* Create mapping: for each ga member slot, which old-ga/old-gb
-             * slot does it correspond to? */
-            /* old_ga entries have indices from 0..old_ga_members-1 */
-            /* new members from gb are at positions old_ga_members..nm-1 */
+            /* Compute new total_dim = D^nm */
+            uint64_t new_total = 1;
+            for (uint32_t m = 0; m < nm; m++) new_total *= dim;
 
-            /* Tensor product: ga_nonzero × gb_nonzero entries */
-            uint32_t old_ga_nz = ga->num_nonzero;
-            uint32_t old_gb_nz = gb->num_nonzero;
-            uint32_t max_out = old_ga_nz * old_gb_nz;
-            if (max_out == 0) max_out = 1;
-
-            uint32_t *merged_indices = calloc((size_t)max_out * nm, sizeof(uint32_t));
-            Complex  *merged_amps   = sv_calloc_aligned(max_out, sizeof(Complex));
-            uint32_t  merged_count  = 0;
+            Complex *merged = sv_calloc_aligned(new_total, sizeof(Complex));
 
             /* Build index map: which new slot maps to which old-gb slot */
-            int gb_slot_map[MAX_GROUP_MEMBERS];  /* new slot → old gb slot, or -1 */
+            int gb_slot_map[MAX_GROUP_MEMBERS];
             memset(gb_slot_map, -1, sizeof(gb_slot_map));
             for (uint32_t m = 0; m < gb->num_members; m++) {
                 uint64_t mid = gb->member_ids[m];
@@ -1883,88 +1676,64 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
                 }
             }
 
-            for (uint32_t ea = 0; ea < old_ga_nz; ea++) {
-                for (uint32_t eb = 0; eb < old_gb_nz; eb++) {
-                    /* Build combined index tuple */
-                    uint32_t *out_row = &merged_indices[merged_count * nm];
+            /* Iterate over all ga entries × all gb entries */
+            for (uint64_t fa = 0; fa < ga->total_dim; fa++) {
+                if (cnorm2(ga->amplitudes[fa]) < 1e-30) continue;
+                for (uint64_t fb = 0; fb < gb->total_dim; fb++) {
+                    if (cnorm2(gb->amplitudes[fb]) < 1e-30) continue;
 
-                    /* Start with ga's indices for old members */
-                    memcpy(out_row, &ga->basis_indices[ea * old_ga_members],
-                           old_ga_members * sizeof(uint32_t));
-
-                    /* Fill in new member slots from gb */
+                    /* Build combined multi-index in the new merged space */
+                    uint32_t indices[MAX_GROUP_MEMBERS];
+                    /* Start from ga's indices for old members */
+                    for (uint32_t m = 0; m < old_ga_members; m++)
+                        indices[m] = hilbert_extract_index(ga, fa, m);
+                    /* Fill in gb's indices for new members */
                     for (uint32_t g = old_ga_members; g < nm; g++) {
-                        if (gb_slot_map[g] >= 0) {
-                            out_row[g] = gb->basis_indices[eb * gb->num_members + gb_slot_map[g]];
-                        }
+                        if (gb_slot_map[g] >= 0)
+                            indices[g] = hilbert_extract_index(gb, fb, (uint32_t)gb_slot_map[g]);
                     }
-
                     /* Also fill in b's value from gb into its ga slot */
                     for (uint32_t g = 0; g < nm; g++) {
-                        if (gb_slot_map[g] >= 0 && g < old_ga_members) {
-                            /* This ga slot is also a gb member — use gb's value */
-                            out_row[g] = gb->basis_indices[eb * gb->num_members + gb_slot_map[g]];
-                        }
+                        if (gb_slot_map[g] >= 0 && g < old_ga_members)
+                            indices[g] = hilbert_extract_index(gb, fb, (uint32_t)gb_slot_map[g]);
                     }
 
-                    /* Apply Bell constraint: a's index must equal b's index */
-                    if (out_row[ai] != out_row[bi]) continue;
+                    /* Bell constraint: a's index must equal b's index */
+                    if (indices[ai] != indices[bi]) continue;
 
-                    /* Amplitude = product of the two amplitudes */
-                    Complex amp_a = ga->amplitudes[ea];
-                    Complex amp_b = gb->amplitudes[eb];
-                    Complex combined;
-                    combined.real = amp_a.real * amp_b.real - amp_a.imag * amp_b.imag;
-                    combined.imag = amp_a.real * amp_b.imag + amp_a.imag * amp_b.real;
-
+                    Complex combined = cmul(ga->amplitudes[fa], gb->amplitudes[fb]);
                     if (cnorm2(combined) < 1e-30) continue;
 
-                    /* Check for duplicate tuples and merge */
-                    int found = -1;
-                    for (uint32_t o = 0; o < merged_count; o++) {
-                        if (memcmp(&merged_indices[o * nm], out_row,
-                                   nm * sizeof(uint32_t)) == 0) {
-                            found = (int)o;
-                            break;
-                        }
-                    }
-                    if (found >= 0) {
-                        merged_amps[found].real += combined.real;
-                        merged_amps[found].imag += combined.imag;
-                    } else {
-                        merged_amps[merged_count] = combined;
-                        merged_count++;
-                    }
+                    uint64_t flat = hilbert_flat_index(ga, indices);
+                    /* Note: ga->num_members already updated to nm */
+                    /* Accumulate (handles duplicate tuples) */
+                    merged[flat] = cadd(merged[flat], combined);
                 }
             }
 
             /* Renormalize */
             double norm = 0.0;
-            for (uint32_t e = 0; e < merged_count; e++)
-                norm += cnorm2(merged_amps[e]);
+            for (uint64_t e = 0; e < new_total; e++)
+                norm += cnorm2(merged[e]);
             if (norm > 0.0) {
                 double scale = born_fast_isqrt(norm);
-                for (uint32_t e = 0; e < merged_count; e++) {
-                    merged_amps[e].real *= scale;
-                    merged_amps[e].imag *= scale;
+                for (uint64_t e = 0; e < new_total; e++) {
+                    merged[e].real *= scale;
+                    merged[e].imag *= scale;
                 }
             }
 
-            /* Replace ga's sparse state */
-            free(ga->basis_indices);
+            /* Replace ga's state */
             free(ga->amplitudes);
-            ga->basis_indices = merged_indices;
-            ga->amplitudes = merged_amps;
-            ga->num_nonzero = merged_count;
-            ga->sparse_cap = merged_count;
+            ga->amplitudes = merged;
+            ga->total_dim = new_total;
 
-            /* Free gb's sparse data */
-            free(gb->basis_indices);
+            /* Free gb */
             free(gb->amplitudes);
             free(gb);
 
-            printf("  [BRAID] MERGED groups via Hilbert space (%u members, %u nonzero)\n",
-                   ga->num_members, ga->num_nonzero);
+            printf("  [BRAID] MERGED groups via dense Hilbert space (%u members, %lu total_dim)\n",
+                   ga->num_members, (unsigned long)ga->total_dim);
 
         } else if (ga && !gb) {
             /* A is in a group, B is not — extend A's group to include B.
@@ -1981,27 +1750,36 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
             eng->chunks[b].hilbert.group_index = new_idx;
             eng->chunks[b].hilbert.q_flags = 0x01;
 
-            /* Expand sparse basis to include B's index */
             uint32_t ai = eng->chunks[a].hilbert.group_index;
-            uint32_t old_members = new_idx;  /* members before adding B */
+            uint32_t old_nm = new_idx;  /* members before adding B */
 
-            /* Reallocate index arrays for wider rows */
-            uint32_t *new_indices = calloc((size_t)ga->num_nonzero * ga->num_members,
-                                           sizeof(uint32_t));
-            for (uint32_t e = 0; e < ga->num_nonzero; e++) {
-                /* Copy existing indices */
-                memcpy(&new_indices[e * ga->num_members],
-                       &ga->basis_indices[e * old_members],
-                       old_members * sizeof(uint32_t));
-                /* B's index = A's index (Bell constraint) */
-                new_indices[e * ga->num_members + new_idx] =
-                    ga->basis_indices[e * old_members + ai];
+            /* New total_dim = old_total × D */
+            uint64_t new_total = ga->total_dim * dim;
+            Complex *new_amps = sv_calloc_aligned(new_total, sizeof(Complex));
+
+            /* Embed: for each old flat index, extract A's index,
+             * set B's index = A's index (Bell constraint) */
+            for (uint64_t f_old = 0; f_old < ga->total_dim; f_old++) {
+                if (cnorm2(ga->amplitudes[f_old]) < 1e-30) continue;
+                /* Extract all old indices */
+                uint32_t indices[MAX_GROUP_MEMBERS];
+                for (uint32_t m = 0; m < old_nm; m++)
+                    indices[m] = hilbert_extract_index(ga, f_old, m);
+                /* B's index = A's index */
+                indices[new_idx] = indices[ai];
+                /* Compute new flat index (now with nm = old_nm + 1) */
+                uint64_t f_new = 0;
+                for (uint32_t m = 0; m < ga->num_members; m++)
+                    f_new = f_new * dim + indices[m];
+                new_amps[f_new] = ga->amplitudes[f_old];
             }
-            free(ga->basis_indices);
-            ga->basis_indices = new_indices;
 
-            printf("  [BRAID] EXTENDED group: chunk %lu joined via Hilbert space "
-                   "(%u members, %u nonzero)\n", b, ga->num_members, ga->num_nonzero);
+            free(ga->amplitudes);
+            ga->amplitudes = new_amps;
+            ga->total_dim = new_total;
+
+            printf("  [BRAID] EXTENDED group: chunk %lu joined via dense Hilbert space "
+                   "(%u members, %lu total_dim)\n", b, ga->num_members, (unsigned long)ga->total_dim);
 
         } else if (!ga && gb) {
             /* B is in a group, A is not — extend B's group to include A. */
@@ -2018,40 +1796,46 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
             eng->chunks[a].hilbert.q_flags = 0x01;
 
             uint32_t bi = eng->chunks[b].hilbert.group_index;
-            uint32_t old_members = new_idx;
+            uint32_t old_nm = new_idx;
 
-            uint32_t *new_indices = calloc((size_t)gb->num_nonzero * gb->num_members,
-                                           sizeof(uint32_t));
-            for (uint32_t e = 0; e < gb->num_nonzero; e++) {
-                memcpy(&new_indices[e * gb->num_members],
-                       &gb->basis_indices[e * old_members],
-                       old_members * sizeof(uint32_t));
-                new_indices[e * gb->num_members + new_idx] =
-                    gb->basis_indices[e * old_members + bi];
+            uint64_t new_total = gb->total_dim * dim;
+            Complex *new_amps = sv_calloc_aligned(new_total, sizeof(Complex));
+
+            for (uint64_t f_old = 0; f_old < gb->total_dim; f_old++) {
+                if (cnorm2(gb->amplitudes[f_old]) < 1e-30) continue;
+                uint32_t indices[MAX_GROUP_MEMBERS];
+                for (uint32_t m = 0; m < old_nm; m++)
+                    indices[m] = hilbert_extract_index(gb, f_old, m);
+                indices[new_idx] = indices[bi];
+                uint64_t f_new = 0;
+                for (uint32_t m = 0; m < gb->num_members; m++)
+                    f_new = f_new * dim + indices[m];
+                new_amps[f_new] = gb->amplitudes[f_old];
             }
-            free(gb->basis_indices);
-            gb->basis_indices = new_indices;
 
-            printf("  [BRAID] EXTENDED group: chunk %lu joined via Hilbert space "
-                   "(%u members, %u nonzero)\n", a, gb->num_members, gb->num_nonzero);
+            free(gb->amplitudes);
+            gb->amplitudes = new_amps;
+            gb->total_dim = new_total;
+
+            printf("  [BRAID] EXTENDED group: chunk %lu joined via dense Hilbert space "
+                   "(%u members, %lu total_dim)\n", a, gb->num_members, (unsigned long)gb->total_dim);
 
         } else {
-            /* Neither in a group — create new 2-member group with Bell state */
+            /* Neither in a group — create new 2-member group with Bell state.
+             * Dense: D² amplitudes, diagonal entries = 1/√D. */
+            uint64_t td = (uint64_t)dim * dim;
             HilbertGroup *g = calloc(1, sizeof(HilbertGroup));
             g->dim = dim;
             g->num_members = 2;
             g->member_ids[0] = a;
             g->member_ids[1] = b;
-            g->num_nonzero = dim;
-            g->sparse_cap = dim;
-            g->basis_indices = calloc((size_t)dim * 2, sizeof(uint32_t));
-            g->amplitudes = sv_calloc_aligned(dim, sizeof(Complex));
+            g->total_dim = td;
+            g->amplitudes = sv_calloc_aligned(td, sizeof(Complex));
 
             double amp = born_fast_isqrt((double)dim);
             for (uint32_t k = 0; k < dim; k++) {
-                g->basis_indices[k * 2 + 0] = k;  /* A's index */
-                g->basis_indices[k * 2 + 1] = k;  /* B's index */
-                g->amplitudes[k] = cmplx(amp, 0.0);
+                /* Bell state: |k,k⟩ → flat index = k*D + k */
+                g->amplitudes[k * dim + k] = cmplx(amp, 0.0);
             }
 
             eng->chunks[a].hilbert.group = g;
@@ -2061,10 +1845,9 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
             eng->chunks[a].hilbert.q_flags = 0x01;
             eng->chunks[b].hilbert.q_flags = 0x01;
 
-            printf("  [BRAID] Bell state WRITTEN to shared Hilbert space group "
-                   "(dim=%u, %u members, %u nonzero, %lu bytes)\n",
-                   dim, 2, dim,
-                   dim * (2 * sizeof(uint32_t) + sizeof(Complex)));
+            printf("  [BRAID] Bell state WRITTEN to dense Hilbert space group "
+                   "(dim=%u, %u members, %lu total_dim, %lu bytes)\n",
+                   dim, 2, (unsigned long)td, (unsigned long)(td * sizeof(Complex)));
         }
 
 
@@ -2114,13 +1897,11 @@ void product_state_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
     g->member_ids[0] = a;
     g->member_ids[1] = b;
 
-    /* Product state: single entry |0⟩|0⟩ with amplitude 1.0 */
-    g->num_nonzero = 1;
-    g->sparse_cap  = 1;
-    g->basis_indices = calloc(2, sizeof(uint32_t));   /* [0, 0] */
-    g->amplitudes    = sv_calloc_aligned(1, sizeof(Complex));
-    g->amplitudes[0] = cmplx(1.0, 0.0);
-    /* basis_indices already zeroed by calloc → |0⟩|0⟩ */
+    /* Product state: dense D² array, |0⟩|0⟩ at flat index 0 */
+    uint64_t td = (uint64_t)dim * dim;
+    g->total_dim = td;
+    g->amplitudes = sv_calloc_aligned(td, sizeof(Complex));
+    g->amplitudes[0] = cmplx(1.0, 0.0);  /* |0,0⟩ = flat index 0 */
 
     eng->chunks[a].hilbert.group = g;
     eng->chunks[a].hilbert.group_index = 0;
@@ -2129,8 +1910,8 @@ void product_state_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
     eng->chunks[a].hilbert.q_flags = 0x01;
     eng->chunks[b].hilbert.q_flags = 0x01;
 
-    printf("  [PRODUCT] |0⟩⊗|0⟩ WRITTEN to shared Hilbert space "
-           "(dim=%u, 2 members, 1 nonzero — NOT entangled)\n", dim);
+    printf("  [PRODUCT] |0⟩⊗|0⟩ WRITTEN to dense Hilbert space "
+           "(dim=%u, 2 members, total_dim=%lu — NOT entangled)\n", dim, (unsigned long)td);
 }
 
 void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b)
@@ -2159,7 +1940,6 @@ void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b)
             /* Both in the same group */
             if (ga->num_members <= 2) {
                 /* Group has only these two — free the whole group */
-                free(ga->basis_indices);
                 free(ga->amplitudes);
                 free(ga);
                 eng->chunks[a].hilbert.group = NULL;
@@ -2167,34 +1947,63 @@ void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b)
                 eng->chunks[b].hilbert.group = NULL;
                 eng->chunks[b].hilbert.group_index = 0;
             } else {
-                /* Larger group — remove both a and b from the group.
-                 * For simplicity, remove b's slot, then a's slot. */
+                /* Larger group — remove both a and b.
+                 * In the dense model, we need to perform a partial trace
+                 * (project out the removed dimensions). For simplicity,
+                 * we sum over the removed members' indices and rebuild
+                 * a smaller dense array. */
                 uint32_t idx_a = eng->chunks[a].hilbert.group_index;
                 uint32_t idx_b = eng->chunks[b].hilbert.group_index;
-                /* Remove higher index first to avoid shifting issues */
-                uint32_t first = (idx_a > idx_b) ? idx_a : idx_b;
-                uint32_t second = (idx_a > idx_b) ? idx_b : idx_a;
+                uint32_t D = ga->dim;
+                uint32_t old_nm = ga->num_members;
+                uint32_t new_nm = old_nm - 2;
 
-                /* Remove member at 'first' */
-                for (uint32_t m = first; m + 1 < ga->num_members; m++)
-                    ga->member_ids[m] = ga->member_ids[m + 1];
-                /* Remove column from all sparse entries */
-                for (uint32_t e = 0; e < ga->num_nonzero; e++) {
-                    uint32_t *row = &ga->basis_indices[e * ga->num_members];
-                    for (uint32_t m = first; m + 1 < ga->num_members; m++)
-                        row[m] = row[m + 1];
+                /* Build mapping: old member slot -> new member slot */
+                uint32_t new_slot[MAX_GROUP_MEMBERS];
+                uint32_t ns = 0;
+                for (uint32_t m = 0; m < old_nm; m++) {
+                    if (m == idx_a || m == idx_b) {
+                        new_slot[m] = UINT32_MAX;
+                    } else {
+                        new_slot[m] = ns++;
+                    }
                 }
-                ga->num_members--;
 
-                /* Remove member at 'second' (now shifted) */
-                for (uint32_t m = second; m + 1 < ga->num_members; m++)
-                    ga->member_ids[m] = ga->member_ids[m + 1];
-                for (uint32_t e = 0; e < ga->num_nonzero; e++) {
-                    uint32_t *row = &ga->basis_indices[e * ga->num_members];
-                    for (uint32_t m = second; m + 1 < ga->num_members; m++)
-                        row[m] = row[m + 1];
+                /* Compute new total_dim */
+                uint64_t new_td = 1;
+                for (uint32_t m = 0; m < new_nm; m++) new_td *= D;
+
+                Complex *new_amps = sv_calloc_aligned(new_td, sizeof(Complex));
+
+                /* Partial trace: sum over removed members' indices */
+                for (uint64_t flat = 0; flat < ga->total_dim; flat++) {
+                    if (cnorm2(ga->amplitudes[flat]) < 1e-30) continue;
+                    /* Extract indices for remaining members */
+                    uint32_t new_indices[MAX_GROUP_MEMBERS];
+                    for (uint32_t m = 0; m < old_nm; m++) {
+                        if (new_slot[m] != UINT32_MAX)
+                            new_indices[new_slot[m]] = hilbert_extract_index(ga, flat, m);
+                    }
+                    uint64_t new_flat = 0;
+                    for (uint32_t m = 0; m < new_nm; m++)
+                        new_flat = new_flat * D + new_indices[m];
+                    /* Accumulate (partial trace sums over removed indices) */
+                    new_amps[new_flat] = cadd(new_amps[new_flat], ga->amplitudes[flat]);
                 }
-                ga->num_members--;
+
+                /* Update member list */
+                uint64_t new_member_ids[MAX_GROUP_MEMBERS];
+                ns = 0;
+                for (uint32_t m = 0; m < old_nm; m++) {
+                    if (m != idx_a && m != idx_b)
+                        new_member_ids[ns++] = ga->member_ids[m];
+                }
+                memcpy(ga->member_ids, new_member_ids, new_nm * sizeof(uint64_t));
+                ga->num_members = new_nm;
+
+                free(ga->amplitudes);
+                ga->amplitudes = new_amps;
+                ga->total_dim = new_td;
 
                 /* Update group_index for remaining members */
                 for (uint32_t m = 0; m < ga->num_members; m++) {
@@ -3935,25 +3744,24 @@ HilbertSnapshot inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id)
             snap.member_ids[m] = g->member_ids[m];
 
         printf("  🔍 [INSPECT] Reading Hilbert space for chunk %lu "
-               "(member %u/%u, D=%u, %u nonzero)\n",
-               chunk_id, my_idx, nm, dim, g->num_nonzero);
+               "(member %u/%u, D=%u, total_dim=%lu)\n",
+               chunk_id, my_idx, nm, dim, (unsigned long)g->total_dim);
         printf("  🔍 [INSPECT] *** NO COLLAPSE — reading amplitudes directly ***\n");
 
-        /* ── Extract all state entries ── */
-        uint32_t n = g->num_nonzero;
-        if (n > MAX_INSPECT_ENTRIES) n = MAX_INSPECT_ENTRIES;
-        snap.num_entries = n;
-
-        for (uint32_t e = 0; e < n; e++) {
+        /* ── Extract nonzero state entries from dense array ── */
+        uint32_t n = 0;
+        for (uint64_t flat = 0; flat < g->total_dim && n < MAX_INSPECT_ENTRIES; flat++) {
+            Complex amp = g->amplitudes[flat];
+            if (cnorm2(amp) < 1e-28) continue;
             for (uint32_t m = 0; m < nm && m < MAX_SNAP_MEMBERS; m++)
-                snap.entries[e].indices[m] = g->basis_indices[e * nm + m];
-
-            Complex amp = g->amplitudes[e];
-            snap.entries[e].amp_real = amp.real;
-            snap.entries[e].amp_imag = amp.imag;
-            snap.entries[e].probability = amp.real * amp.real + amp.imag * amp.imag;
-            snap.entries[e].phase_rad = atan2(amp.imag, amp.real);
+                snap.entries[n].indices[m] = hilbert_extract_index(g, flat, m);
+            snap.entries[n].amp_real = amp.real;
+            snap.entries[n].amp_imag = amp.imag;
+            snap.entries[n].probability = cnorm2(amp);
+            snap.entries[n].phase_rad = atan2(amp.imag, amp.real);
+            n++;
         }
+        snap.num_entries = n;
 
         /* ── Total probability ── */
         snap.total_probability = 0.0;
@@ -3961,37 +3769,29 @@ HilbertSnapshot inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id)
             snap.total_probability += snap.entries[e].probability;
 
         /* ── Marginal probabilities for this register ── */
-        for (uint32_t e = 0; e < g->num_nonzero; e++) {
-            uint32_t my_val = g->basis_indices[e * nm + my_idx];
+        uint64_t my_stride = 1;
+        for (uint32_t i = my_idx + 1; i < nm; i++) my_stride *= dim;
+        for (uint64_t flat = 0; flat < g->total_dim; flat++) {
+            uint32_t my_val = (uint32_t)((flat / my_stride) % dim);
             if (my_val < NUM_BASIS_STATES)
-                snap.marginal_probs[my_val] += cnorm2(g->amplitudes[e]);
+                snap.marginal_probs[my_val] += cnorm2(g->amplitudes[flat]);
         }
 
-        /* ── Reduced density matrix via partial trace ──
-         * ρ_A[j][k] = Σ_β ⟨j,β|Ψ⟩⟨Ψ|k,β⟩
-         * where β ranges over ALL other members' indices.
-         * Two entries contribute when all non-inspected indices match. */
-        for (uint32_t e1 = 0; e1 < g->num_nonzero; e1++) {
-            uint32_t j = g->basis_indices[e1 * nm + my_idx];
-            Complex a1 = g->amplitudes[e1];
+        /* ── Reduced density matrix via partial trace (dense) ──
+         * ρ_A[j][k] = Σ_{β} ⟨j,β|Ψ⟩⟨Ψ|k,β⟩
+         * For each pair of flat indices that differ ONLY in member my_idx,
+         * accumulate: ρ[j][k] += α[flat_j] × conj(α[flat_k]) */
+        for (uint64_t flat1 = 0; flat1 < g->total_dim; flat1++) {
+            Complex a1 = g->amplitudes[flat1];
+            if (cnorm2(a1) < 1e-28) continue;
+            uint32_t j = (uint32_t)((flat1 / my_stride) % dim);
+            uint64_t base1 = flat1 - (uint64_t)j * my_stride;
 
-            for (uint32_t e2 = 0; e2 < g->num_nonzero; e2++) {
-                uint32_t k = g->basis_indices[e2 * nm + my_idx];
+            for (uint32_t k = 0; k < dim && k < NUM_BASIS_STATES; k++) {
+                uint64_t flat2 = base1 + (uint64_t)k * my_stride;
+                Complex a2 = g->amplitudes[flat2];
+                if (cnorm2(a2) < 1e-28) continue;
 
-                /* Check: all OTHER members must have matching indices */
-                int others_match = 1;
-                for (uint32_t m = 0; m < nm; m++) {
-                    if (m == my_idx) continue;
-                    if (g->basis_indices[e1 * nm + m] !=
-                        g->basis_indices[e2 * nm + m]) {
-                        others_match = 0;
-                        break;
-                    }
-                }
-                if (!others_match) continue;
-
-                /* ρ_A[j][k] += α_{e1} × conj(α_{e2}) */
-                Complex a2 = g->amplitudes[e2];
                 if (j < NUM_BASIS_STATES && k < NUM_BASIS_STATES) {
                     snap.rho[j * dim + k].real += a1.real * a2.real + a1.imag * a2.imag;
                     snap.rho[j * dim + k].imag += a1.imag * a2.real - a1.real * a2.imag;
@@ -4425,7 +4225,7 @@ static void get_register_amplitudes(HexStateEngine *eng, uint64_t chunk_id,
     Chunk *c = &eng->chunks[chunk_id];
     HilbertGroup *g = c->hilbert.group;
 
-    if (!g || g->num_nonzero == 0) {
+    if (!g || g->total_dim == 0) {
         /* No group — assume |0⟩ */
         amps[0] = (Complex){1.0, 0.0};
         return;
@@ -4434,11 +4234,13 @@ static void get_register_amplitudes(HexStateEngine *eng, uint64_t chunk_id,
     uint32_t my_idx = c->hilbert.group_index;
     uint32_t nm = g->num_members;
 
-    /* Collect base amplitudes for this register's index */
-    for (uint32_t e = 0; e < g->num_nonzero; e++) {
-        uint32_t k = g->basis_indices[e * nm + my_idx];
+    /* Dense: compute marginal amplitudes via stride extraction */
+    uint64_t my_stride = 1;
+    for (uint32_t i = my_idx + 1; i < nm; i++) my_stride *= dim;
+    for (uint64_t flat = 0; flat < g->total_dim; flat++) {
+        uint32_t k = (uint32_t)((flat / my_stride) % dim);
         if (k < dim) {
-            amps[k] = cadd(amps[k], g->amplitudes[e]);
+            amps[k] = cadd(amps[k], g->amplitudes[flat]);
         }
     }
 
@@ -4681,15 +4483,17 @@ double partial_transpose_negativity(HexStateEngine *eng, uint64_t chunk_id,
     /* Find partner index (first other member) */
     uint32_t partner_idx = (my_idx == 0) ? 1 : 0;
 
-    for (uint32_t e = 0; e < g->num_nonzero; e++) {
-        uint32_t ie = g->basis_indices[e * nm + my_idx];
-        uint32_t je = g->basis_indices[e * nm + partner_idx];
-        Complex ae = g->amplitudes[e];
+    for (uint64_t flat_e = 0; flat_e < g->total_dim; flat_e++) {
+        Complex ae = g->amplitudes[flat_e];
+        if (cnorm2(ae) < 1e-30) continue;
+        uint32_t ie = hilbert_extract_index(g, flat_e, my_idx);
+        uint32_t je = hilbert_extract_index(g, flat_e, partner_idx);
 
-        for (uint32_t f = 0; f < g->num_nonzero; f++) {
-            uint32_t if_ = g->basis_indices[f * nm + my_idx];
-            uint32_t jf = g->basis_indices[f * nm + partner_idx];
-            Complex af = g->amplitudes[f];
+        for (uint64_t flat_f = 0; flat_f < g->total_dim; flat_f++) {
+            Complex af = g->amplitudes[flat_f];
+            if (cnorm2(af) < 1e-30) continue;
+            uint32_t if_ = hilbert_extract_index(g, flat_f, my_idx);
+            uint32_t jf = hilbert_extract_index(g, flat_f, partner_idx);
 
             /* ρ[(ie,je),(if,jf)] += ae · af* */
             uint32_t row = ie * dim + je;
@@ -4761,15 +4565,25 @@ double partial_transpose_negativity(HexStateEngine *eng, uint64_t chunk_id,
     Complex rho_A[36]; /* dim×dim */
     memset(rho_A, 0, sizeof(rho_A));
 
-    for (uint32_t e = 0; e < g->num_nonzero; e++) {
-        uint32_t ie = g->basis_indices[e * nm + my_idx];
-        Complex ae = g->amplitudes[e];
-        for (uint32_t f = 0; f < g->num_nonzero; f++) {
-            uint32_t if_ = g->basis_indices[f * nm + my_idx];
-            uint32_t je = g->basis_indices[e * nm + partner_idx];
-            uint32_t jf = g->basis_indices[f * nm + partner_idx];
+    /* Dense: partial trace to get rho_A */
+    uint64_t stride_my = 1;
+    for (uint32_t i = my_idx + 1; i < nm; i++) stride_my *= dim;
+    uint64_t stride_partner = 1;
+    for (uint32_t i = partner_idx + 1; i < nm; i++) stride_partner *= dim;
+
+    for (uint64_t flat_e = 0; flat_e < g->total_dim; flat_e++) {
+        Complex ae = g->amplitudes[flat_e];
+        if (cnorm2(ae) < 1e-30) continue;
+        uint32_t ie = (uint32_t)((flat_e / stride_my) % dim);
+        uint32_t je = (uint32_t)((flat_e / stride_partner) % dim);
+
+        for (uint64_t flat_f = 0; flat_f < g->total_dim; flat_f++) {
+            Complex af = g->amplitudes[flat_f];
+            if (cnorm2(af) < 1e-30) continue;
+            uint32_t if_ = (uint32_t)((flat_f / stride_my) % dim);
+            uint32_t jf = (uint32_t)((flat_f / stride_partner) % dim);
             if (je != jf) continue; /* Trace condition: same B index */
-            Complex prod = cmul(ae, cconj(g->amplitudes[f]));
+            Complex prod = cmul(ae, cconj(af));
             rho_A[ie * dim + if_] = cadd(rho_A[ie * dim + if_], prod);
         }
     }
@@ -5712,11 +5526,11 @@ int state_iter_begin(HexStateEngine *eng, uint64_t chunk_id, StateIterator *it)
     /* ── Priority 2: HilbertGroup (braided multi-party state) ── */
     if (chunk_id < eng->num_chunks) {
         Chunk *c = &eng->chunks[chunk_id];
-        if (c->hilbert.group && c->hilbert.group->num_nonzero > 0) {
+        if (c->hilbert.group && c->hilbert.group->total_dim > 0) {
             const HilbertGroup *g = c->hilbert.group;
             it->mode          = 3;
             it->group         = g;
-            it->total_entries = g->num_nonzero;
+            it->total_entries = (uint32_t)g->total_dim;
             it->dim           = g->dim;
             it->n_quhits      = g->num_members;
             it->entry_index   = (uint32_t)-1;
@@ -5792,14 +5606,14 @@ int state_iter_next(StateIterator *it)
         return 1;
     }
     case 3: {
-        /* HilbertGroup: sparse entries with per-member basis indices */
+        /* HilbertGroup: dense entries with per-member basis indices */
         const HilbertGroup *g = it->group;
         uint32_t ei = it->entry_index;
         it->amplitude   = g->amplitudes[ei];
         it->probability = g->amplitudes[ei].real * g->amplitudes[ei].real +
                           g->amplitudes[ei].imag * g->amplitudes[ei].imag;
-        /* bulk_value = this member's basis index in this entry */
-        it->bulk_value  = g->basis_indices[ei * g->num_members + it->group_member_idx];
+        /* bulk_value = this member's basis index in this entry (dense) */
+        it->bulk_value  = hilbert_extract_index(g, (uint64_t)ei, it->group_member_idx);
         it->num_addr    = 0;
         it->addr        = NULL;
         return 1;
@@ -5823,10 +5637,10 @@ uint32_t state_iter_resolve(const StateIterator *it, uint64_t quhit_idx)
         else                return i % it->local_dim;  /* party B */
     }
     if (it->mode == 3) {
-        /* HilbertGroup: look up any member's basis index */
+        /* HilbertGroup: look up any member's basis index (dense) */
         const HilbertGroup *g = it->group;
         if (quhit_idx < g->num_members) {
-            return g->basis_indices[it->entry_index * g->num_members + (uint32_t)quhit_idx];
+            return hilbert_extract_index(g, (uint64_t)it->entry_index, (uint32_t)quhit_idx);
         }
         return it->bulk_value;  /* fallback */
     }
