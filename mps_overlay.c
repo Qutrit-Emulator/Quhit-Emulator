@@ -19,16 +19,11 @@ int        mps_store_n = 0;
 
 void mps_overlay_init(QuhitEngine *eng, uint32_t *quhits, int n)
 {
-    /* Allocate per-site tensor store */
+    (void)eng; (void)quhits;
+    /* Allocate per-site tensor store (independent of engine pairs) */
     if (mps_store) { free(mps_store); mps_store = NULL; }
     mps_store = (MpsTensor *)calloc((size_t)n, sizeof(MpsTensor));
     mps_store_n = n;
-
-    /* Allocate engine pairs for each quhit (needed for pair_id tracking) */
-    for (int i = 0; i < n; i++) {
-        uint32_t dummy = quhit_init(eng);
-        quhit_entangle_product(eng, quhits[i], dummy);
-    }
 }
 
 void mps_overlay_free(void)
