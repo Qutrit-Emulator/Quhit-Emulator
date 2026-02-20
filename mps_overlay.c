@@ -417,14 +417,15 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     double *Y_re = (double *)calloc(yk_sz, sizeof(double));
     double *Y_im = (double *)calloc(yk_sz, sizeof(double));
     {
-        /* Generate real random Ω on the fly (no need to store) */
-        unsigned svd_seed = 12345u;
+        /* Use a counter-based seed so each SVD call gets a different Ω */
+        static unsigned svd_call_id = 0;
+        unsigned svd_seed = (++svd_call_id) * 2654435761u + 12345u;
         for (int j = 0; j < k; j++)
             for (int i = 0; i < DCHI; i++) {
                 double yi_r = 0, yi_i = 0;
                 for (int r = 0; r < DCHI; r++) {
                     svd_seed = svd_seed * 1103515245u + 12345u;
-                    double omega = (double)(svd_seed >> 16) / 32768.0 - 0.5;
+                    double omega = (double)(svd_seed >> 16) / 65536.0 - 0.5;
                     yi_r += M_re[i*DCHI+r] * omega;
                     yi_i += M_im[i*DCHI+r] * omega;
                 }
