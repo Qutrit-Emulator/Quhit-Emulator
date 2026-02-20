@@ -190,10 +190,18 @@ int main(void)
     printf("  Sweep:  L→R sequential on all adjacent pairs\n");
     printf("══════════════════════════════════════════════════════════════\n");
 
-    run_benchmark(10,   8,   200);
-    run_benchmark(20,  14,   100);
-    run_benchmark(53,  20,    50);
-    run_benchmark(105, 20,    20);
+    /* ── Willow-equivalent scales ── */
+    printf("\n  ▸ WILLOW-EQUIVALENT SCALES\n");
+    run_benchmark(10,    8,   200);
+    run_benchmark(53,   20,    50);
+    run_benchmark(105,  20,    20);
+
+    /* ── Beyond Willow: showboat scales ── */
+    printf("\n  ▸ BEYOND WILLOW — SHOWBOAT SCALES\n");
+    run_benchmark(500,   20,   10);
+    run_benchmark(1000,  20,    5);
+    run_benchmark(5000,  20,    0);
+    run_benchmark(10000, 20,    0);
 
     printf("\n══════════════════════════════════════════════════════════════\n");
     printf("  BENCHMARK COMPLETE\n");
