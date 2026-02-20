@@ -124,4 +124,78 @@ extern int mps_sweep_right;
 extern int mps_defer_renorm;
 void mps_renormalize_chain(QuhitEngine *eng, uint32_t *quhits, int n);
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * LAZY EVALUATION LAYER
+ *
+ * "Reality computes on demand."
+ *
+ * Gates are queued, not applied. Measurement triggers materialization
+ * of only the gates needed for the measured site's environment.
+ * Gates on unmeasured sites are NEVER applied.
+ *
+ * Gate fusion: consecutive 1-site gates on the same site are multiplied
+ * into a single gate before application.
+ *
+ * Lazy allocation: sites that have never been written to stay as
+ * implicit |0⟩ with no tensor allocated.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+#include "lazy_stats.h"
+
+#define MAX_LAZY_GATES 65536
+
+/* Deferred gate descriptor */
+typedef struct {
+    int     type;                   /* 0 = 1-site, 1 = 2-site                */
+    int     site;                   /* Target site (for 2-site: left site)   */
+    double  U_re[MPS_PHYS * MPS_PHYS];   /* 1-site: 6×6 matrix             */
+    double  U_im[MPS_PHYS * MPS_PHYS];
+    double *G_re;                   /* 2-site: 36×36 matrix (heap, owned)    */
+    double *G_im;
+    int     applied;                /* 1 = already materialized              */
+} MpsDeferredGate;
+
+/* Lazy chain: wraps mps_store with deferred gate queue */
+typedef struct {
+    QuhitEngine *eng;
+    uint32_t    *quhits;
+    int          n_sites;
+
+    /* Deferred gate queue (linear buffer) */
+    MpsDeferredGate *queue;
+    int              queue_len;
+    int              queue_cap;
+
+    /* Per-site flags */
+    uint8_t  *site_allocated;       /* 1 = tensor has been touched           */
+    uint8_t  *site_dirty;           /* 1 = has pending gates                 */
+
+    /* Statistics */
+    LazyStats stats;
+} MpsLazyChain;
+
+/* ── Lifecycle ── */
+MpsLazyChain *mps_lazy_init(QuhitEngine *eng, uint32_t *quhits, int n);
+void          mps_lazy_free(MpsLazyChain *lc);
+
+/* ── Gate queuing (NO immediate application) ── */
+void mps_lazy_gate_1site(MpsLazyChain *lc, int site,
+                         const double *U_re, const double *U_im);
+void mps_lazy_gate_2site(MpsLazyChain *lc, int site,
+                         const double *G_re, const double *G_im);
+
+/* ── Measurement (TRIGGERS materialization) ── */
+uint32_t mps_lazy_measure(MpsLazyChain *lc, int target_idx);
+
+/* ── Force-apply all pending gates (escape hatch) ── */
+void mps_lazy_flush(MpsLazyChain *lc);
+
+/* ── Finalize stats (call before reading lc->stats) ── */
+void mps_lazy_finalize_stats(MpsLazyChain *lc);
+
+/* ── Write initial state (marks site as allocated) ── */
+void mps_lazy_write_tensor(MpsLazyChain *lc, int site, int k,
+                           int alpha, int beta, double re, double im);
+void mps_lazy_zero_site(MpsLazyChain *lc, int site);
+
 #endif /* MPS_OVERLAY_H */

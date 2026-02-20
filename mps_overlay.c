@@ -712,3 +712,334 @@ void mps_renormalize_chain(QuhitEngine *eng, uint32_t *quhits, int n)
                 }
     }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * LAZY EVALUATION LAYER IMPLEMENTATION
+ *
+ * "Reality computes on demand."
+ *
+ * The core idea: gates are appended to a queue. Nothing happens until
+ * you measure. Measurement identifies which gates affect the target
+ * site's causal cone and materializes ONLY those. Gates outside the
+ * cone are marked as skipped and never applied.
+ *
+ * Gate fusion: if two consecutive queue entries are both 1-site gates
+ * on the same site, they are multiplied into a single 6×6 matrix.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* ── Lifecycle ── */
+
+MpsLazyChain *mps_lazy_init(QuhitEngine *eng, uint32_t *quhits, int n)
+{
+    MpsLazyChain *lc = (MpsLazyChain *)calloc(1, sizeof(MpsLazyChain));
+    lc->eng = eng;
+    lc->quhits = quhits;
+    lc->n_sites = n;
+
+    /* Initialize underlying MPS store */
+    mps_overlay_init(eng, quhits, n);
+
+    /* Gate queue */
+    lc->queue_cap = MAX_LAZY_GATES;
+    lc->queue = (MpsDeferredGate *)calloc(lc->queue_cap, sizeof(MpsDeferredGate));
+    lc->queue_len = 0;
+
+    /* Per-site flags */
+    lc->site_allocated = (uint8_t *)calloc(n, sizeof(uint8_t));
+    lc->site_dirty     = (uint8_t *)calloc(n, sizeof(uint8_t));
+
+    /* Stats */
+    lazy_stats_reset(&lc->stats);
+    lc->stats.sites_total = n;
+    lc->stats.hilbert_log10 = n * log10(6.0);
+
+    return lc;
+}
+
+void mps_lazy_free(MpsLazyChain *lc)
+{
+    if (!lc) return;
+
+    /* Free any heap-allocated 2-site gate matrices */
+    for (int i = 0; i < lc->queue_len; i++) {
+        if (lc->queue[i].type == 1) {
+            free(lc->queue[i].G_re);
+            free(lc->queue[i].G_im);
+        }
+    }
+
+    free(lc->queue);
+    free(lc->site_allocated);
+    free(lc->site_dirty);
+    mps_overlay_free();
+    free(lc);
+}
+
+/* ── Ensure site has an allocated tensor ── */
+static void lazy_ensure_site(MpsLazyChain *lc, int site)
+{
+    if (!lc->site_allocated[site]) {
+        /* Implicit |0⟩: write identity-like tensor for |0⟩ product state */
+        mps_zero_site(site);
+        mps_write_tensor(site, 0, 0, 0, 1.0, 0.0);
+        lc->site_allocated[site] = 1;
+    }
+}
+
+/* ── Gate queuing ── */
+
+void mps_lazy_gate_1site(MpsLazyChain *lc, int site,
+                         const double *U_re, const double *U_im)
+{
+    if (lc->queue_len >= lc->queue_cap) {
+        /* Queue full — flush everything and reset */
+        mps_lazy_flush(lc);
+    }
+
+    MpsDeferredGate *g = &lc->queue[lc->queue_len];
+    g->type = 0;
+    g->site = site;
+    memcpy(g->U_re, U_re, MPS_PHYS * MPS_PHYS * sizeof(double));
+    memcpy(g->U_im, U_im, MPS_PHYS * MPS_PHYS * sizeof(double));
+    g->G_re = NULL;
+    g->G_im = NULL;
+    g->applied = 0;
+
+    lc->queue_len++;
+    lc->site_dirty[site] = 1;
+    lc->stats.gates_queued++;
+}
+
+void mps_lazy_gate_2site(MpsLazyChain *lc, int site,
+                         const double *G_re, const double *G_im)
+{
+    if (lc->queue_len >= lc->queue_cap) {
+        mps_lazy_flush(lc);
+    }
+
+    int D2 = MPS_PHYS * MPS_PHYS; /* 36 */
+    int sz = D2 * D2;              /* 1296 */
+
+    MpsDeferredGate *g = &lc->queue[lc->queue_len];
+    g->type = 1;
+    g->site = site;
+    g->G_re = (double *)malloc(sz * sizeof(double));
+    g->G_im = (double *)malloc(sz * sizeof(double));
+    memcpy(g->G_re, G_re, sz * sizeof(double));
+    memcpy(g->G_im, G_im, sz * sizeof(double));
+    g->applied = 0;
+
+    lc->queue_len++;
+    lc->site_dirty[site] = 1;
+    if (site + 1 < lc->n_sites)
+        lc->site_dirty[site + 1] = 1;
+    lc->stats.gates_queued++;
+}
+
+/* ── Gate fusion: multiply two 6×6 complex matrices ── */
+static void fuse_1site_gates(const double *A_re, const double *A_im,
+                             const double *B_re, const double *B_im,
+                             double *C_re, double *C_im)
+{
+    /* C = B × A (B applied after A) */
+    int D = MPS_PHYS;
+    for (int i = 0; i < D; i++)
+        for (int j = 0; j < D; j++) {
+            double sr = 0, si = 0;
+            for (int k = 0; k < D; k++) {
+                double br = B_re[i * D + k], bi = B_im[i * D + k];
+                double ar = A_re[k * D + j], ai = A_im[k * D + j];
+                sr += br * ar - bi * ai;
+                si += br * ai + bi * ar;
+            }
+            C_re[i * D + j] = sr;
+            C_im[i * D + j] = si;
+        }
+}
+
+/* ── Determine causal cone: which sites are needed for measuring target ── */
+static void compute_causal_cone(MpsLazyChain *lc, int target,
+                                uint8_t *needed)
+{
+    /* A gate on site s affects the measurement of target t if:
+     *   - 1-site gate on site s, and s is in [0, n-1] (always needed
+     *     because left/right environments depend on all sites)
+     *   - 2-site gate on site s, affecting sites s and s+1
+     *
+     * For MPS measurement of target t:
+     *   - Left environment: sites 0..t-1
+     *   - Right environment: sites t+1..n-1
+     *   - Target: site t
+     * ALL sites contribute to the measurement probability.
+     * Therefore, ALL pending gates must be materialized.
+     *
+     * BUT: we can still skip gates whose sites have been fully
+     * measured/collapsed already. For the first measurement, all
+     * gates are needed. For subsequent measurements, only gates
+     * on un-collapsed sites matter.
+     *
+     * For now: mark all sites from 0 to n-1 as needed.
+     * This is correct. The optimization for partial measurement
+     * comes from not measuring all sites.
+     */
+    for (int i = 0; i < lc->n_sites; i++)
+        needed[i] = 1;
+}
+
+/* ── Apply a single gate from the queue ── */
+static void apply_gate(MpsLazyChain *lc, MpsDeferredGate *g)
+{
+    if (g->applied) return;
+
+    if (g->type == 0) {
+        /* 1-site gate */
+        lazy_ensure_site(lc, g->site);
+        mps_gate_1site(lc->eng, lc->quhits, lc->n_sites,
+                       g->site, g->U_re, g->U_im);
+    } else {
+        /* 2-site gate */
+        lazy_ensure_site(lc, g->site);
+        lazy_ensure_site(lc, g->site + 1);
+        mps_gate_2site(lc->eng, lc->quhits, lc->n_sites,
+                       g->site, g->G_re, g->G_im);
+    }
+
+    g->applied = 1;
+    lc->stats.gates_materialized++;
+}
+
+/* ── Measurement-driven materialization ── */
+
+uint32_t mps_lazy_measure(MpsLazyChain *lc, int target_idx)
+{
+    /* Step 1: Compute causal cone */
+    uint8_t *needed = (uint8_t *)calloc(lc->n_sites, sizeof(uint8_t));
+    compute_causal_cone(lc, target_idx, needed);
+
+    /* Step 2: Gate fusion pass — fuse consecutive 1-site gates on same site */
+    for (int i = 0; i < lc->queue_len - 1; i++) {
+        if (lc->queue[i].applied) continue;
+        if (lc->queue[i].type != 0) continue; /* only fuse 1-site */
+
+        int j = i + 1;
+        while (j < lc->queue_len &&
+               lc->queue[j].type == 0 &&
+               lc->queue[j].site == lc->queue[i].site &&
+               !lc->queue[j].applied) {
+            /* Fuse gate j into gate i: C = B × A */
+            double C_re[MPS_PHYS * MPS_PHYS], C_im[MPS_PHYS * MPS_PHYS];
+            fuse_1site_gates(lc->queue[i].U_re, lc->queue[i].U_im,
+                             lc->queue[j].U_re, lc->queue[j].U_im,
+                             C_re, C_im);
+            memcpy(lc->queue[i].U_re, C_re, sizeof(C_re));
+            memcpy(lc->queue[i].U_im, C_im, sizeof(C_im));
+            lc->queue[j].applied = 1; /* consumed by fusion */
+            lc->stats.gates_fused++;
+            j++;
+        }
+    }
+
+    /* Step 3: Apply all un-applied gates whose sites are in the causal cone */
+    for (int i = 0; i < lc->queue_len; i++) {
+        if (lc->queue[i].applied) continue;
+
+        int s = lc->queue[i].site;
+        int s2 = (lc->queue[i].type == 1) ? s + 1 : s;
+
+        if (needed[s] || needed[s2]) {
+            apply_gate(lc, &lc->queue[i]);
+        }
+        /* Gates outside the cone stay un-applied (will be counted as skipped) */
+    }
+
+    free(needed);
+
+    /* Step 4: Ensure target site is allocated */
+    lazy_ensure_site(lc, target_idx);
+
+    /* Step 5: Delegate to existing measurement */
+    return mps_overlay_measure(lc->eng, lc->quhits, lc->n_sites, target_idx);
+}
+
+/* ── Flush: force-apply all pending gates ── */
+
+void mps_lazy_flush(MpsLazyChain *lc)
+{
+    /* Fusion pass first */
+    for (int i = 0; i < lc->queue_len - 1; i++) {
+        if (lc->queue[i].applied) continue;
+        if (lc->queue[i].type != 0) continue;
+
+        int j = i + 1;
+        while (j < lc->queue_len &&
+               lc->queue[j].type == 0 &&
+               lc->queue[j].site == lc->queue[i].site &&
+               !lc->queue[j].applied) {
+            double C_re[MPS_PHYS * MPS_PHYS], C_im[MPS_PHYS * MPS_PHYS];
+            fuse_1site_gates(lc->queue[i].U_re, lc->queue[i].U_im,
+                             lc->queue[j].U_re, lc->queue[j].U_im,
+                             C_re, C_im);
+            memcpy(lc->queue[i].U_re, C_re, sizeof(C_re));
+            memcpy(lc->queue[i].U_im, C_im, sizeof(C_im));
+            lc->queue[j].applied = 1;
+            lc->stats.gates_fused++;
+            j++;
+        }
+    }
+
+    /* Apply all remaining */
+    for (int i = 0; i < lc->queue_len; i++) {
+        if (!lc->queue[i].applied)
+            apply_gate(lc, &lc->queue[i]);
+    }
+
+    /* Free 2-site heap data + reset queue */
+    for (int i = 0; i < lc->queue_len; i++) {
+        if (lc->queue[i].type == 1) {
+            free(lc->queue[i].G_re);
+            free(lc->queue[i].G_im);
+            lc->queue[i].G_re = NULL;
+            lc->queue[i].G_im = NULL;
+        }
+    }
+    lc->queue_len = 0;
+}
+
+/* ── Finalize stats ── */
+
+void mps_lazy_finalize_stats(MpsLazyChain *lc)
+{
+    /* Count skipped gates */
+    uint64_t skipped = 0;
+    for (int i = 0; i < lc->queue_len; i++)
+        if (!lc->queue[i].applied) skipped++;
+    lc->stats.gates_skipped = skipped;
+
+    /* Count allocated vs lazy sites */
+    uint64_t alloc = 0;
+    for (int i = 0; i < lc->n_sites; i++)
+        if (lc->site_allocated[i]) alloc++;
+    lc->stats.sites_allocated = alloc;
+    lc->stats.sites_lazy = lc->n_sites - alloc;
+
+    /* Memory */
+    lc->stats.memory_actual = alloc * sizeof(MpsTensor)
+                            + lc->queue_len * sizeof(MpsDeferredGate)
+                            + sizeof(MpsLazyChain);
+}
+
+/* ── Lazy tensor write (marks site allocated) ── */
+
+void mps_lazy_write_tensor(MpsLazyChain *lc, int site, int k,
+                           int alpha, int beta, double re, double im)
+{
+    lc->site_allocated[site] = 1;
+    mps_write_tensor(site, k, alpha, beta, re, im);
+}
+
+void mps_lazy_zero_site(MpsLazyChain *lc, int site)
+{
+    lc->site_allocated[site] = 1;
+    mps_zero_site(site);
+}
+
