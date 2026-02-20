@@ -13,6 +13,7 @@
 #include "hexstate_engine.h"
 #include "born_rule.h"
 #include "superposition.h"
+#include "statevector.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -121,19 +122,19 @@ static void bluestein_dft(Complex *x, uint32_t N)
     uint32_t M = next_pow2(2 * N - 1);  /* convolution length */
 
     /* Chirp: chirp[k] = exp(-iπk²/N) */
-    Complex *chirp = calloc(N, sizeof(Complex));
+    Complex *chirp = sv_calloc_aligned(N, sizeof(Complex));
     for (uint32_t k = 0; k < N; k++) {
         double phase = M_PI * (double)k * (double)k / (double)N;
         chirp[k] = cmplx(cos(phase), -sin(phase));
     }
 
     /* a[k] = x[k] · chirp[k],  zero-padded to M */
-    Complex *a = calloc(M, sizeof(Complex));
+    Complex *a = sv_calloc_aligned(M, sizeof(Complex));
     for (uint32_t k = 0; k < N; k++)
         a[k] = cmul(x[k], chirp[k]);
 
     /* b[k] = conj(chirp[k]) with wrap-around for negative indices */
-    Complex *b = calloc(M, sizeof(Complex));
+    Complex *b = sv_calloc_aligned(M, sizeof(Complex));
     b[0] = cconj(chirp[0]);
     for (uint32_t k = 1; k < N; k++) {
         b[k]     = cconj(chirp[k]);
@@ -174,14 +175,11 @@ static int     dft6_initialized = 0;
 static void init_dft6(void)
 {
     if (dft6_initialized) return;
-    double inv_sqrt6 = born_fast_isqrt(6.0);
-    for (int j = 0; j < 6; j++) {
-        for (int k = 0; k < 6; k++) {
-            double angle = 2.0 * M_PI * j * k / 6.0;
-            dft6_matrix[j][k] = cmplx(inv_sqrt6 * cos(angle),
-                                      inv_sqrt6 * sin(angle));
-        }
-    }
+    /* Load from precomputed table (superposition.h) — zero trig calls.
+     * SupComplex{re,im} and Complex{real,imag} are binary-identical (AoS, 16 bytes). */
+    for (int j = 0; j < 6; j++)
+        for (int k = 0; k < 6; k++)
+            dft6_matrix[j][k] = cmplx(DFT6[j][k].re, DFT6[j][k].im);
     dft6_initialized = 1;
 }
 
@@ -456,7 +454,7 @@ int init_chunk(HexStateEngine *eng, uint64_t id, uint64_t num_hexits)
         c->hilbert.q_flags = 0x01;  /* superposed */
         /* Allocate local Hilbert space: |0⟩ (default D=6, overridable) */
         c->hilbert.q_local_dim = 6;
-        c->hilbert.q_local_state = calloc(6, sizeof(Complex));
+        c->hilbert.q_local_state = sv_calloc_aligned(6, sizeof(Complex));
         c->hilbert.q_local_state[0] = cmplx(1.0, 0.0);  /* |0⟩ */
         memset(c->hilbert.partners, 0, sizeof(c->hilbert.partners));
         c->hilbert.num_partners = 0;
@@ -610,7 +608,7 @@ void apply_dna_gate(HexStateEngine *eng, uint64_t id,
     double complement_amp = 1.0 + sigma;  /* strong for complement */
     double mismatch_amp   = 1.0 / (1.0 + sigma); /* weak for mismatch */
 
-    Complex *U = calloc((size_t)dim * dim, sizeof(Complex));
+    Complex *U = sv_calloc_aligned((size_t)dim * dim, sizeof(Complex));
     if (!U) { free(comp); return; }
 
     for (uint32_t i = 0; i < dim; i++) {
@@ -700,7 +698,7 @@ void apply_group_unitary(HexStateEngine *eng, uint64_t id,
         /* No group — apply to local state if present */
         if (c->hilbert.q_local_state && dim <= c->hilbert.q_local_dim) {
             Complex *s = c->hilbert.q_local_state;
-            Complex *tmp = calloc(dim, sizeof(Complex));
+            Complex *tmp = sv_calloc_aligned(dim, sizeof(Complex));
             for (uint32_t i = 0; i < dim; i++)
                 for (uint32_t j = 0; j < dim; j++) {
                     tmp[i].real += U[i * dim + j].real * s[j].real
@@ -765,7 +763,7 @@ void apply_group_unitary(HexStateEngine *eng, uint64_t id,
      * For each nonzero amp_out[k], create entry |k,k,...,k⟩ with that amplitude.
      * The basis indices for ALL members are set to k (shared Hilbert space). */
     uint32_t *new_indices = calloc((size_t)new_count * nm, sizeof(uint32_t));
-    Complex  *new_amps    = calloc(new_count, sizeof(Complex));
+    Complex  *new_amps    = sv_calloc_aligned(new_count, sizeof(Complex));
     uint32_t  w = 0;
     for (uint32_t k = 0; k < dim; k++) {
         if (cnorm2(amp_out[k]) > 1e-28) {
@@ -865,7 +863,7 @@ void apply_local_unitary(HexStateEngine *eng, uint64_t id,
     memset(ht_slots, 0xFF, ht_size * sizeof(uint32_t));  /* fill with UINT32_MAX */
 
     uint32_t *new_indices = calloc((size_t)max_out * nm, sizeof(uint32_t));
-    Complex  *new_amps    = calloc(max_out, sizeof(Complex));
+    Complex  *new_amps    = sv_calloc_aligned(max_out, sizeof(Complex));
     uint32_t  out_count   = 0;
 
     for (uint32_t e = 0; e < ns; e++) {
@@ -967,7 +965,7 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
         if (c->hilbert.group) {
             uint32_t dim = c->hilbert.group->dim;
             double inv_sqrt_d = born_fast_isqrt((double)dim);
-            Complex *dft = calloc((size_t)dim * dim, sizeof(Complex));
+            Complex *dft = sv_calloc_aligned((size_t)dim * dim, sizeof(Complex));
             for (uint32_t j = 0; j < dim; j++)
                 for (uint32_t k = 0; k < dim; k++) {
                     double angle = -2.0 * M_PI * j * k / (double)dim;
@@ -994,7 +992,7 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
 
             if (is_pow2 && dim > 1) {
                 /* ── Cooley-Tukey FFT: O(D·log D) per row/column ── */
-                Complex *buf = calloc(dim, sizeof(Complex));
+                Complex *buf = sv_calloc_aligned(dim, sizeof(Complex));
 
                 if (which == 0) {
                     /* FFT on A side: for each fixed b, FFT the row */
@@ -1068,7 +1066,7 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
                 free(buf);
             } else {
                 /* ── Bluestein DFT: O(D·log D) for any D ── */
-                Complex *tmp = calloc(dim, sizeof(Complex));
+                Complex *tmp = sv_calloc_aligned(dim, sizeof(Complex));
                 if (which == 0) {
                     for (uint32_t b = 0; b < dim; b++) {
                         for (uint32_t j = 0; j < dim; j++)
@@ -1127,7 +1125,7 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
     uint64_t stride = power_of_6(hexit_index);
     double inv_sqrt_d = born_fast_isqrt((double)base_d);
 
-    Complex *temp = calloc(base_d, sizeof(Complex));
+    Complex *temp = sv_calloc_aligned(base_d, sizeof(Complex));
 
     for (uint64_t base = 0; base < ns; base++) {
         if ((base / stride) % base_d != 0) continue;
@@ -1180,7 +1178,7 @@ static void lazy_apply_vec(Complex **ops, uint32_t num_ops,
  * Cost: O(D² × L) instead of O(D³ × L) for matrix-matrix multiply. */
 Complex *lazy_compose(Complex **ops, uint32_t num_ops, uint32_t dim)
 {
-    Complex *composed = calloc((size_t)dim * dim, sizeof(Complex));
+    Complex *composed = sv_calloc_aligned((size_t)dim * dim, sizeof(Complex));
     Complex *col = malloc(dim * sizeof(Complex));
     for (uint32_t k = 0; k < dim; k++) {
         /* Start with basis vector e_k */
@@ -1316,7 +1314,7 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
                 uint32_t nm = g->num_members;
                 uint32_t dim_local = g->dim;
                 /* Allocate tracking arrays */
-                Complex *c_k = calloc(ns, sizeof(Complex));
+                Complex *c_k = sv_calloc_aligned(ns, sizeof(Complex));
                 for (uint32_t e = 0; e < ns; e++)
                     c_k[e] = g->amplitudes[e];
 
@@ -1710,7 +1708,7 @@ void grover_diffusion(HexStateEngine *eng, uint64_t id)
      * This IS a unitary (it's a reflection about the mean). */
     if (c->hilbert.group) {
         uint32_t dim = c->hilbert.group->dim;
-        Complex *G = calloc((size_t)dim * dim, sizeof(Complex));
+        Complex *G = sv_calloc_aligned((size_t)dim * dim, sizeof(Complex));
         double off_diag = 2.0 / (double)dim;
         for (uint32_t j = 0; j < dim; j++)
             for (uint32_t k = 0; k < dim; k++)
@@ -1867,7 +1865,7 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
             if (max_out == 0) max_out = 1;
 
             uint32_t *merged_indices = calloc((size_t)max_out * nm, sizeof(uint32_t));
-            Complex  *merged_amps   = calloc(max_out, sizeof(Complex));
+            Complex  *merged_amps   = sv_calloc_aligned(max_out, sizeof(Complex));
             uint32_t  merged_count  = 0;
 
             /* Build index map: which new slot maps to which old-gb slot */
@@ -2045,7 +2043,7 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
             g->num_nonzero = dim;
             g->sparse_cap = dim;
             g->basis_indices = calloc((size_t)dim * 2, sizeof(uint32_t));
-            g->amplitudes = calloc(dim, sizeof(Complex));
+            g->amplitudes = sv_calloc_aligned(dim, sizeof(Complex));
 
             double amp = born_fast_isqrt((double)dim);
             for (uint32_t k = 0; k < dim; k++) {
@@ -2118,7 +2116,7 @@ void product_state_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
     g->num_nonzero = 1;
     g->sparse_cap  = 1;
     g->basis_indices = calloc(2, sizeof(uint32_t));   /* [0, 0] */
-    g->amplitudes    = calloc(1, sizeof(Complex));
+    g->amplitudes    = sv_calloc_aligned(1, sizeof(Complex));
     g->amplitudes[0] = cmplx(1.0, 0.0);
     /* basis_indices already zeroed by calloc → |0⟩|0⟩ */
 
@@ -2358,7 +2356,7 @@ int op_infinite_resources_dim(HexStateEngine *eng, uint64_t chunk_id,
     c->hilbert.q_flags = 0x01;  /* superposed */
     /* Allocate local D-dimensional Hilbert space: |0⟩ */
     c->hilbert.q_local_dim = dim;
-    c->hilbert.q_local_state = calloc(dim, sizeof(Complex));
+    c->hilbert.q_local_state = sv_calloc_aligned(dim, sizeof(Complex));
     c->hilbert.q_local_state[0] = cmplx(1.0, 0.0);
     memset(c->hilbert.partners, 0, sizeof(c->hilbert.partners));
     c->hilbert.num_partners = 0;
@@ -3801,7 +3799,7 @@ void hilbert_set_deferred(HilbertGroup *g, uint32_t member_idx,
 
     /* Push as a single lazy op */
     g->lazy_U[member_idx] = malloc(sizeof(Complex*));
-    g->lazy_U[member_idx][0] = calloc((size_t)dim * dim, sizeof(Complex));
+    g->lazy_U[member_idx][0] = sv_calloc_aligned((size_t)dim * dim, sizeof(Complex));
     memcpy(g->lazy_U[member_idx][0], U, (size_t)dim * dim * sizeof(Complex));
     g->lazy_count[member_idx] = 1;
     g->lazy_cap[member_idx] = 1;
@@ -4624,7 +4622,7 @@ void generalized_bell_state(HexStateEngine *eng, uint64_t a, uint64_t b,
 
     /* Step 2: Apply Z^m to chunk a (phase gate) */
     if (m > 0) {
-        Complex *Zm = calloc((size_t)dim * dim, sizeof(Complex));
+        Complex *Zm = sv_calloc_aligned((size_t)dim * dim, sizeof(Complex));
         for (uint32_t k = 0; k < dim; k++) {
             double angle = 2.0 * M_PI * m * k / dim;
             Zm[k*dim+k] = (Complex){cos(angle), sin(angle)};
@@ -4635,7 +4633,7 @@ void generalized_bell_state(HexStateEngine *eng, uint64_t a, uint64_t b,
 
     /* Step 3: Apply X^n to chunk b (cyclic shift by n) */
     if (n > 0) {
-        Complex *Xn = calloc((size_t)dim * dim, sizeof(Complex));
+        Complex *Xn = sv_calloc_aligned((size_t)dim * dim, sizeof(Complex));
         for (uint32_t k = 0; k < dim; k++) {
             uint32_t target_k = (k + n) % dim;
             Xn[target_k*dim+k] = (Complex){1.0, 0.0};
@@ -4674,7 +4672,7 @@ double partial_transpose_negativity(HexStateEngine *eng, uint64_t chunk_id,
 
     /* Build the full density matrix ρ of the 2-party state
      * ρ[(a,b),(c,d)] = Σ_e Σ_f α_e α*_f  where indices match */
-    Complex *rho = calloc(dim2 * dim2, sizeof(Complex));
+    Complex *rho = sv_calloc_aligned(dim2 * dim2, sizeof(Complex));
     uint32_t nm = g->num_members;
     uint32_t my_idx = c->hilbert.group_index;
 
@@ -4701,7 +4699,7 @@ double partial_transpose_negativity(HexStateEngine *eng, uint64_t chunk_id,
 
     /* Partial transpose: ρ^(T_B)[(a,b),(c,d)] = ρ[(a,d),(c,b)]
      * Swap b↔d indices on system B */
-    Complex *rho_pt = calloc(dim2 * dim2, sizeof(Complex));
+    Complex *rho_pt = sv_calloc_aligned(dim2 * dim2, sizeof(Complex));
     for (uint32_t a = 0; a < dim; a++)
         for (uint32_t b = 0; b < dim; b++)
             for (uint32_t cc = 0; cc < dim; cc++)
@@ -5490,7 +5488,7 @@ static Complex *build_quhit_dna_unitary(uint32_t dim,
                                          double bond_strength,
                                          double temperature)
 {
-    Complex *U = calloc((size_t)dim * dim, sizeof(Complex));
+    Complex *U = sv_calloc_aligned((size_t)dim * dim, sizeof(Complex));
     if (!U) return NULL;
 
     double kT = 8.617e-5 * temperature;
