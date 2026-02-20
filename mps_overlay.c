@@ -389,73 +389,165 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
 
     free(Tp_re); free(Tp_im);
 
-    /* Step 5: SVD via eigendecomposition of M†M (DCHI×DCHI complex Hermitian)
+    /* Step 5: RANDOMIZED TRUNCATED SVD (Halko-Martinsson-Tropp 2011)
      *
-     * M†M is complex Hermitian, NOT real symmetric.
-     *   (M†M)_re[j][k] = Σ_r M_re[r][j]*M_re[r][k] + M_im[r][j]*M_im[r][k]
-     *   (M†M)_im[j][k] = Σ_r M_re[r][j]*M_im[r][k] - M_im[r][j]*M_re[r][k]
+     * Instead of computing ALL DCHI eigenvalues of M†M and discarding
+     * DCHI-χ of them, we project M onto a (χ+p)-dimensional subspace
+     * via random sketching, then diagonalize the SMALL projected matrix.
      *
-     * We diagonalize the FULL Hermitian matrix with complex Jacobi rotations:
-     *   1. Phase-rotate column q by e^{-iφ} to make H[p][q] real
-     *   2. Apply real Givens rotation to zero the (now-real) off-diagonal
-     *   3. Accumulate complex eigenvectors in V = V_re + i·V_im
+     * Cost: O(DCHI² × k + k³)  where k = χ + oversample
+     *   vs full Jacobi: O(DCHI³ × sweeps)
+     *   Speedup: ~30x for χ=128, DCHI=768
+     *
+     * Algorithm:
+     *   1. Y = M × Ω              (DCHI × k random projection)
+     *   2. Y = M × (M^H × Y)      (one power iteration for accuracy)
+     *   3. Q = qr(Y)               (orthonormal basis for range)
+     *   4. B = Q^H × M             (k × DCHI projected matrix)
+     *   5. S = B × B^H             (k × k Hermitian, Jacobi-diagonalize)
+     *   6. Extract σ, V, U from small SVD + Q
      */
 
-    /* Heap-allocate SVD work arrays */
-    double *Hr = (double *)calloc(m_sz, sizeof(double));
-    double *Hi_a = (double *)calloc(m_sz, sizeof(double));
-    double *Vr = (double *)calloc(m_sz, sizeof(double));
-    double *Vi_a = (double *)calloc(m_sz, sizeof(double));
+    int k = MPS_CHI + 10;
+    if (k > DCHI) k = DCHI;
+    size_t yk_sz = (size_t)DCHI * k;
+    size_t kk_sz = (size_t)k * k;
 
-    /* H = M†M (complex Hermitian) */
-    for (int i = 0; i < DCHI; i++)
-        for (int j = 0; j < DCHI; j++) {
-            double sr = 0, si2 = 0;
-            for (int r = 0; r < DCHI; r++) {
-                sr  += M_re[r*DCHI+i]*M_re[r*DCHI+j] + M_im[r*DCHI+i]*M_im[r*DCHI+j];
-                si2 += M_re[r*DCHI+i]*M_im[r*DCHI+j] - M_im[r*DCHI+i]*M_re[r*DCHI+j];
+    /* ── Step 5a: Random projection Y = M × Ω (DCHI × k) ── */
+    double *Y_re = (double *)calloc(yk_sz, sizeof(double));
+    double *Y_im = (double *)calloc(yk_sz, sizeof(double));
+    {
+        /* Generate real random Ω on the fly (no need to store) */
+        unsigned svd_seed = 12345u;
+        for (int j = 0; j < k; j++)
+            for (int i = 0; i < DCHI; i++) {
+                double yi_r = 0, yi_i = 0;
+                for (int r = 0; r < DCHI; r++) {
+                    svd_seed = svd_seed * 1103515245u + 12345u;
+                    double omega = (double)(svd_seed >> 16) / 32768.0 - 0.5;
+                    yi_r += M_re[i*DCHI+r] * omega;
+                    yi_i += M_im[i*DCHI+r] * omega;
+                }
+                Y_re[i*k+j] = yi_r;
+                Y_im[i*k+j] = yi_i;
             }
-            Hr[i*DCHI+j] = sr;
-            Hi_a[i*DCHI+j] = si2;
+    }
+
+    /* ── Step 5b: Power iteration Y = M × (M^H × Y) ── */
+    {
+        double *Z_re = (double *)calloc(yk_sz, sizeof(double));
+        double *Z_im = (double *)calloc(yk_sz, sizeof(double));
+        /* Z = M^H × Y */
+        for (int i = 0; i < DCHI; i++)
+            for (int j = 0; j < k; j++)
+                for (int r = 0; r < DCHI; r++) {
+                    Z_re[i*k+j] += M_re[r*DCHI+i]*Y_re[r*k+j]
+                                 + M_im[r*DCHI+i]*Y_im[r*k+j];
+                    Z_im[i*k+j] += M_re[r*DCHI+i]*Y_im[r*k+j]
+                                 - M_im[r*DCHI+i]*Y_re[r*k+j];
+                }
+        /* Y = M × Z */
+        memset(Y_re, 0, yk_sz * sizeof(double));
+        memset(Y_im, 0, yk_sz * sizeof(double));
+        for (int i = 0; i < DCHI; i++)
+            for (int j = 0; j < k; j++)
+                for (int r = 0; r < DCHI; r++) {
+                    Y_re[i*k+j] += M_re[i*DCHI+r]*Z_re[r*k+j]
+                                 - M_im[i*DCHI+r]*Z_im[r*k+j];
+                    Y_im[i*k+j] += M_re[i*DCHI+r]*Z_im[r*k+j]
+                                 + M_im[i*DCHI+r]*Z_re[r*k+j];
+                }
+        free(Z_re); free(Z_im);
+    }
+
+    /* ── Step 5c: QR via modified Gram-Schmidt → Q in Y ── */
+    for (int j = 0; j < k; j++) {
+        for (int i = 0; i < j; i++) {
+            double dot_r = 0, dot_i = 0;
+            for (int r = 0; r < DCHI; r++) {
+                dot_r += Y_re[r*k+i]*Y_re[r*k+j] + Y_im[r*k+i]*Y_im[r*k+j];
+                dot_i += Y_re[r*k+i]*Y_im[r*k+j] - Y_im[r*k+i]*Y_re[r*k+j];
+            }
+            for (int r = 0; r < DCHI; r++) {
+                Y_re[r*k+j] -= dot_r*Y_re[r*k+i] - dot_i*Y_im[r*k+i];
+                Y_im[r*k+j] -= dot_r*Y_im[r*k+i] + dot_i*Y_re[r*k+i];
+            }
         }
+        double nrm = 0;
+        for (int r = 0; r < DCHI; r++)
+            nrm += Y_re[r*k+j]*Y_re[r*k+j] + Y_im[r*k+j]*Y_im[r*k+j];
+        nrm = sqrt(nrm);
+        if (nrm > 1e-15)
+            for (int r = 0; r < DCHI; r++) {
+                Y_re[r*k+j] /= nrm;
+                Y_im[r*k+j] /= nrm;
+            }
+    }
+    /* Now Y = Q (DCHI × k orthonormal) */
 
-    /* V = I (complex) */
-    for (int i = 0; i < DCHI; i++) Vr[i*DCHI+i] = 1.0;
+    /* ── Step 5d: B = Q^H × M (k × DCHI) ── */
+    size_t bk_sz = (size_t)k * DCHI;
+    double *B_re = (double *)calloc(bk_sz, sizeof(double));
+    double *B_im = (double *)calloc(bk_sz, sizeof(double));
+    for (int i = 0; i < k; i++)
+        for (int j = 0; j < DCHI; j++)
+            for (int r = 0; r < DCHI; r++) {
+                B_re[i*DCHI+j] += Y_re[r*k+i]*M_re[r*DCHI+j]
+                                + Y_im[r*k+i]*M_im[r*DCHI+j];
+                B_im[i*DCHI+j] += Y_re[r*k+i]*M_im[r*DCHI+j]
+                                - Y_im[r*k+i]*M_re[r*DCHI+j];
+            }
 
-    /* Complex Hermitian Jacobi sweeps */
+    /* ── Step 5e: S = B × B^H (k × k Hermitian) ── */
+    double *Sr = (double *)calloc(kk_sz, sizeof(double));
+    double *Si = (double *)calloc(kk_sz, sizeof(double));
+    for (int i = 0; i < k; i++)
+        for (int j = 0; j < k; j++)
+            for (int r = 0; r < DCHI; r++) {
+                Sr[i*k+j] += B_re[i*DCHI+r]*B_re[j*DCHI+r]
+                           + B_im[i*DCHI+r]*B_im[j*DCHI+r];
+                Si[i*k+j] += B_im[i*DCHI+r]*B_re[j*DCHI+r]
+                           - B_re[i*DCHI+r]*B_im[j*DCHI+r];
+            }
+
+    /* ── Step 5f: Jacobi diag of k×k Hermitian S (SMALL matrix) ── */
+    double *Wr = (double *)calloc(kk_sz, sizeof(double));
+    double *Wi = (double *)calloc(kk_sz, sizeof(double));
+    for (int i = 0; i < k; i++) Wr[i*k+i] = 1.0;
+
     for (int sweep = 0; sweep < 200; sweep++) {
         double off = 0;
-        for (int i = 0; i < DCHI; i++)
-            for (int j = i + 1; j < DCHI; j++)
-                off += Hr[i*DCHI+j]*Hr[i*DCHI+j] + Hi_a[i*DCHI+j]*Hi_a[i*DCHI+j];
+        for (int i = 0; i < k; i++)
+            for (int j = i + 1; j < k; j++)
+                off += Sr[i*k+j]*Sr[i*k+j] + Si[i*k+j]*Si[i*k+j];
         if (off < 1e-28) break;
 
-        for (int p = 0; p < DCHI; p++)
-            for (int q = p + 1; q < DCHI; q++) {
-                double hpq_r = Hr[p*DCHI+q], hpq_i = Hi_a[p*DCHI+q];
+        for (int p = 0; p < k; p++)
+            for (int q = p + 1; q < k; q++) {
+                double hpq_r = Sr[p*k+q], hpq_i = Si[p*k+q];
                 double mag = sqrt(hpq_r*hpq_r + hpq_i*hpq_i);
                 if (mag < 1e-15) continue;
 
                 double eR = hpq_r / mag, eI = -hpq_i / mag;
+                for (int i = 0; i < k; i++) {
+                    double xr = Sr[i*k+q], xi = Si[i*k+q];
+                    Sr[i*k+q] = xr*eR - xi*eI;
+                    Si[i*k+q] = xr*eI + xi*eR;
+                }
+                for (int j = 0; j < k; j++) {
+                    double xr = Sr[q*k+j], xi = Si[q*k+j];
+                    Sr[q*k+j] =  xr*eR + xi*eI;
+                    Si[q*k+j] = -xr*eI + xi*eR;
+                }
+                for (int i = 0; i < k; i++) {
+                    double xr = Wr[i*k+q], xi = Wi[i*k+q];
+                    Wr[i*k+q] = xr*eR - xi*eI;
+                    Wi[i*k+q] = xr*eI + xi*eR;
+                }
 
-                for (int i = 0; i < DCHI; i++) {
-                    double xr = Hr[i*DCHI+q], xi = Hi_a[i*DCHI+q];
-                    Hr[i*DCHI+q] = xr*eR - xi*eI;
-                    Hi_a[i*DCHI+q] = xr*eI + xi*eR;
-                }
-                for (int j = 0; j < DCHI; j++) {
-                    double xr = Hr[q*DCHI+j], xi = Hi_a[q*DCHI+j];
-                    Hr[q*DCHI+j] =  xr*eR + xi*eI;
-                    Hi_a[q*DCHI+j] = -xr*eI + xi*eR;
-                }
-                for (int i = 0; i < DCHI; i++) {
-                    double xr = Vr[i*DCHI+q], xi = Vi_a[i*DCHI+q];
-                    Vr[i*DCHI+q] = xr*eR - xi*eI;
-                    Vi_a[i*DCHI+q] = xr*eI + xi*eR;
-                }
-
-                double hpp = Hr[p*DCHI+p], hqq = Hr[q*DCHI+q];
-                double hpq_real = Hr[p*DCHI+q];
+                double hpp = Sr[p*k+p], hqq = Sr[q*k+q];
+                double hpq_real = Sr[p*k+q];
+                if (fabs(hpq_real) < 1e-15) continue;
 
                 double tau = (hqq - hpp) / (2.0 * hpq_real);
                 double t;
@@ -467,37 +559,37 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                 double c = 1.0 / sqrt(1.0 + t*t);
                 double s = t * c;
 
-                for (int j = 0; j < DCHI; j++) {
-                    double rp = Hr[p*DCHI+j], ip = Hi_a[p*DCHI+j];
-                    double rq = Hr[q*DCHI+j], iq = Hi_a[q*DCHI+j];
-                    Hr[p*DCHI+j] = c*rp - s*rq;  Hi_a[p*DCHI+j] = c*ip - s*iq;
-                    Hr[q*DCHI+j] = s*rp + c*rq;  Hi_a[q*DCHI+j] = s*ip + c*iq;
+                for (int j = 0; j < k; j++) {
+                    double rp = Sr[p*k+j], ip = Si[p*k+j];
+                    double rq = Sr[q*k+j], iq = Si[q*k+j];
+                    Sr[p*k+j] = c*rp - s*rq;  Si[p*k+j] = c*ip - s*iq;
+                    Sr[q*k+j] = s*rp + c*rq;  Si[q*k+j] = s*ip + c*iq;
                 }
-                for (int i = 0; i < DCHI; i++) {
-                    double rp = Hr[i*DCHI+p], ip = Hi_a[i*DCHI+p];
-                    double rq = Hr[i*DCHI+q], iq = Hi_a[i*DCHI+q];
-                    Hr[i*DCHI+p] = c*rp - s*rq;  Hi_a[i*DCHI+p] = c*ip - s*iq;
-                    Hr[i*DCHI+q] = s*rp + c*rq;  Hi_a[i*DCHI+q] = s*ip + c*iq;
+                for (int i = 0; i < k; i++) {
+                    double rp = Sr[i*k+p], ip = Si[i*k+p];
+                    double rq = Sr[i*k+q], iq = Si[i*k+q];
+                    Sr[i*k+p] = c*rp - s*rq;  Si[i*k+p] = c*ip - s*iq;
+                    Sr[i*k+q] = s*rp + c*rq;  Si[i*k+q] = s*ip + c*iq;
                 }
-                for (int i = 0; i < DCHI; i++) {
-                    double rp = Vr[i*DCHI+p], ip = Vi_a[i*DCHI+p];
-                    double rq = Vr[i*DCHI+q], iq = Vi_a[i*DCHI+q];
-                    Vr[i*DCHI+p] = c*rp - s*rq;  Vi_a[i*DCHI+p] = c*ip - s*iq;
-                    Vr[i*DCHI+q] = s*rp + c*rq;  Vi_a[i*DCHI+q] = s*ip + c*iq;
+                for (int i = 0; i < k; i++) {
+                    double rp = Wr[i*k+p], ip = Wi[i*k+p];
+                    double rq = Wr[i*k+q], iq = Wi[i*k+q];
+                    Wr[i*k+p] = c*rp - s*rq;  Wi[i*k+p] = c*ip - s*iq;
+                    Wr[i*k+q] = s*rp + c*rq;  Wi[i*k+q] = s*ip + c*iq;
                 }
             }
     }
 
-    /* Find top-χ eigenvalue indices (selection sort by Hr[i][i] descending) */
+    /* ── Step 5g: Extract top-χ from small eigendecomposition ── */
     int *top = (int *)malloc(MPS_CHI * sizeof(int));
     {
-        int *used = (int *)calloc(DCHI, sizeof(int));
+        int *used = (int *)calloc(k, sizeof(int));
         for (int t = 0; t < MPS_CHI; t++) {
             int best = -1;
             double best_val = -1e30;
-            for (int i = 0; i < DCHI; i++) {
-                if (!used[i] && Hr[i*DCHI+i] > best_val) {
-                    best_val = Hr[i*DCHI+i]; best = i;
+            for (int i = 0; i < k; i++) {
+                if (!used[i] && Sr[i*k+i] > best_val) {
+                    best_val = Sr[i*k+i]; best = i;
                 }
             }
             top[t] = best;
@@ -506,37 +598,56 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
         free(used);
     }
 
-    /* Extract singular values and complex right singular vectors */
     double *sig = (double *)malloc(MPS_CHI * sizeof(double));
     size_t vc_sz = (size_t)MPS_CHI * DCHI;
-    double *vc_re = (double *)calloc(vc_sz, sizeof(double));
-    double *vc_im = (double *)calloc(vc_sz, sizeof(double));
 
-    for (int t = 0; t < MPS_CHI; t++) {
-        sig[t] = (top[t] >= 0) ? sqrt(fabs(Hr[top[t]*DCHI+top[t]])) : 0;
-        for (int i = 0; i < DCHI; i++) {
-            vc_re[t*DCHI+i] = (top[t] >= 0) ? Vr[i*DCHI+top[t]] : 0;
-            vc_im[t*DCHI+i] = (top[t] >= 0) ? Vi_a[i*DCHI+top[t]] : 0;
-        }
-    }
+    /* σ_t = sqrt(eigenvalue_t of S = B B^H) */
+    for (int t = 0; t < MPS_CHI; t++)
+        sig[t] = (top[t] >= 0) ? sqrt(fabs(Sr[top[t]*k+top[t]])) : 0;
 
-    free(Hr); free(Hi_a);
-    free(Vr); free(Vi_a);
-    free(top);
+    free(Sr); free(Si);
 
-    /* U columns: u_t = M × v_t / σ_t  (complex M × complex v) */
+    /* ── Step 5h: Left singular vectors  U = Q × W ── */
     double *u_re = (double *)calloc(vc_sz, sizeof(double));
     double *u_im = (double *)calloc(vc_sz, sizeof(double));
     for (int t = 0; t < MPS_CHI; t++) {
-        if (sig[t] > 1e-30) {
+        if (sig[t] > 1e-30 && top[t] >= 0) {
             for (int i = 0; i < DCHI; i++) {
-                double sr = 0, si2 = 0;
-                for (int j = 0; j < DCHI; j++) {
-                    sr  += M_re[i*DCHI+j]*vc_re[t*DCHI+j] - M_im[i*DCHI+j]*vc_im[t*DCHI+j];
-                    si2 += M_re[i*DCHI+j]*vc_im[t*DCHI+j] + M_im[i*DCHI+j]*vc_re[t*DCHI+j];
+                double ur = 0, ui = 0;
+                for (int j = 0; j < k; j++) {
+                    ur += Y_re[i*k+j]*Wr[j*k+top[t]]
+                        - Y_im[i*k+j]*Wi[j*k+top[t]];
+                    ui += Y_re[i*k+j]*Wi[j*k+top[t]]
+                        + Y_im[i*k+j]*Wr[j*k+top[t]];
                 }
-                u_re[t*DCHI+i] = sr / sig[t];
-                u_im[t*DCHI+i] = si2 / sig[t];
+                u_re[t*DCHI+i] = ur;
+                u_im[t*DCHI+i] = ui;
+            }
+        }
+    }
+
+    free(Y_re); free(Y_im);
+    free(B_re); free(B_im);
+    free(Wr); free(Wi);
+    free(top);
+
+    /* ── Step 5i: Right singular vectors  V = M^H × U / σ ── */
+    double *vc_re = (double *)calloc(vc_sz, sizeof(double));
+    double *vc_im = (double *)calloc(vc_sz, sizeof(double));
+    for (int t = 0; t < MPS_CHI; t++) {
+        if (sig[t] > 1e-30) {
+            double inv_sig = 1.0 / sig[t];
+            for (int i = 0; i < DCHI; i++) {
+                double vr = 0, vi = 0;
+                for (int j = 0; j < DCHI; j++) {
+                    /* conj(M[j][i]) × U[t][j] */
+                    vr += M_re[j*DCHI+i]*u_re[t*DCHI+j]
+                        + M_im[j*DCHI+i]*u_im[t*DCHI+j];
+                    vi += M_re[j*DCHI+i]*u_im[t*DCHI+j]
+                        - M_im[j*DCHI+i]*u_re[t*DCHI+j];
+                }
+                vc_re[t*DCHI+i] = vr * inv_sig;
+                vc_im[t*DCHI+i] = vi * inv_sig;
             }
         }
     }
