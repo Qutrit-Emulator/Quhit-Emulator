@@ -4,7 +4,14 @@
  * All tensor data lives in the dynamically-allocated mps_store.
  * Functions use site index (0..N-1) for tensor access.
  * DCHI = D×χ = 36; Jacobi SVD on 36×36 is exact.
+ *
+ * OpenMP parallelization: all dense matrix multiplications in
+ * the randomized SVD are parallelized over their outer loops.
  */
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "mps_overlay.h"
 #include <math.h>
@@ -329,6 +336,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     double *Th_re = (double *)calloc(th_sz, sizeof(double));
     double *Th_im = (double *)calloc(th_sz, sizeof(double));
 
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int k = 0; k < MPS_PHYS; k++)
         for (int l = 0; l < MPS_PHYS; l++)
             for (int a = 0; a < MPS_CHI; a++)
@@ -351,6 +359,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     double *Tp_im = (double *)calloc(th_sz, sizeof(double));
 
     int D2 = MPS_PHYS * MPS_PHYS;
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int kp = 0; kp < MPS_PHYS; kp++)
         for (int lp = 0; lp < MPS_PHYS; lp++) {
             int row = kp * MPS_PHYS + lp;
@@ -419,19 +428,26 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     {
         /* Use a counter-based seed so each SVD call gets a different Ω */
         static unsigned svd_call_id = 0;
-        unsigned svd_seed = (++svd_call_id) * 2654435761u + 12345u;
-        for (int j = 0; j < k; j++)
+        unsigned base_seed;
+        #pragma omp atomic capture
+        base_seed = ++svd_call_id;
+        base_seed = base_seed * 2654435761u + 12345u;
+        #pragma omp parallel for schedule(static)
+        for (int j = 0; j < k; j++) {
+            /* Each column j gets its own deterministic seed */
+            unsigned local_seed = base_seed + (unsigned)j * 1103515245u;
             for (int i = 0; i < DCHI; i++) {
                 double yi_r = 0, yi_i = 0;
                 for (int r = 0; r < DCHI; r++) {
-                    svd_seed = svd_seed * 1103515245u + 12345u;
-                    double omega = (double)(svd_seed >> 16) / 65536.0 - 0.5;
+                    local_seed = local_seed * 1103515245u + 12345u;
+                    double omega = (double)(local_seed >> 16) / 65536.0 - 0.5;
                     yi_r += M_re[i*DCHI+r] * omega;
                     yi_i += M_im[i*DCHI+r] * omega;
                 }
                 Y_re[i*k+j] = yi_r;
                 Y_im[i*k+j] = yi_i;
             }
+        }
     }
 
     /* ── Step 5b: Power iteration Y = M × (M^H × Y) ── */
@@ -439,6 +455,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
         double *Z_re = (double *)calloc(yk_sz, sizeof(double));
         double *Z_im = (double *)calloc(yk_sz, sizeof(double));
         /* Z = M^H × Y */
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < DCHI; i++)
             for (int j = 0; j < k; j++)
                 for (int r = 0; r < DCHI; r++) {
@@ -450,6 +467,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
         /* Y = M × Z */
         memset(Y_re, 0, yk_sz * sizeof(double));
         memset(Y_im, 0, yk_sz * sizeof(double));
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < DCHI; i++)
             for (int j = 0; j < k; j++)
                 for (int r = 0; r < DCHI; r++) {
@@ -490,6 +508,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     size_t bk_sz = (size_t)k * DCHI;
     double *B_re = (double *)calloc(bk_sz, sizeof(double));
     double *B_im = (double *)calloc(bk_sz, sizeof(double));
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < k; i++)
         for (int j = 0; j < DCHI; j++)
             for (int r = 0; r < DCHI; r++) {
@@ -502,6 +521,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     /* ── Step 5e: S = B × B^H (k × k Hermitian) ── */
     double *Sr = (double *)calloc(kk_sz, sizeof(double));
     double *Si = (double *)calloc(kk_sz, sizeof(double));
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < k; i++)
         for (int j = 0; j < k; j++)
             for (int r = 0; r < DCHI; r++) {
@@ -611,6 +631,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     /* ── Step 5h: Left singular vectors  U = Q × W ── */
     double *u_re = (double *)calloc(vc_sz, sizeof(double));
     double *u_im = (double *)calloc(vc_sz, sizeof(double));
+    #pragma omp parallel for schedule(static)
     for (int t = 0; t < MPS_CHI; t++) {
         if (sig[t] > 1e-30 && top[t] >= 0) {
             for (int i = 0; i < DCHI; i++) {
@@ -635,6 +656,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     /* ── Step 5i: Right singular vectors  V = M^H × U / σ ── */
     double *vc_re = (double *)calloc(vc_sz, sizeof(double));
     double *vc_im = (double *)calloc(vc_sz, sizeof(double));
+    #pragma omp parallel for schedule(static)
     for (int t = 0; t < MPS_CHI; t++) {
         if (sig[t] > 1e-30) {
             double inv_sig = 1.0 / sig[t];
