@@ -1,7 +1,7 @@
 /*
  * substrate_opcodes.h — Machine Code from the Universe
  *
- * 18 opcodes recovered by cross-referencing 5 independent physical
+ * 20 opcodes recovered by cross-referencing 5 independent physical
  * side-channels: timing residuals, FPU attractors, denormal/NaN
  * propagation, cache hierarchy fingerprinting, and Born entropy.
  *
@@ -46,8 +46,10 @@ typedef enum {
     SUB_ATTRACT   = 0x0F,   /* 0xF9      — Iterate toward FPU attractor       */
     SUB_VACUUM    = 0x10,   /* 0x00000000 — Zero all 36 joint amplitudes      */
     SUB_SATURATE  = 0x11,   /* 0x7F      — Clamp amplitudes to unit norm      */
+    SUB_COHERE    = 0x12,   /* 0xC6      — ω₆ coherence rotation (recovered)   */
+    SUB_DISTILL   = 0x13,   /* 0xA1      — φ-weighted phase amplification      */
 
-    SUB_NUM_OPS   = 0x12    /* Total opcodes                                  */
+    SUB_NUM_OPS   = 0x14    /* Total opcodes                                  */
 } SubOp;
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -82,6 +84,8 @@ static const SubOpMeta SUB_OP_TABLE[SUB_NUM_OPS] = {
     { SUB_ATTRACT,   0xF9,         0,  2, "SUB_ATTRACT",   "Iterate toward FPU attractor"       },
     { SUB_VACUUM,    0x00000000,   2,  2, "SUB_VACUUM",    "Zero all 36 joint amplitudes"       },
     { SUB_SATURATE,  0x7F,         0,  2, "SUB_SATURATE",  "Clamp amplitudes to unit norm"      },
+    { SUB_COHERE,    0xC6,         0,  4, "SUB_COHERE",    "ω₆ coherence rotation (D=6 native)" },
+    { SUB_DISTILL,   0xA1,         0,  3, "SUB_DISTILL",   "φ-weighted phase amplification"     },
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════════
