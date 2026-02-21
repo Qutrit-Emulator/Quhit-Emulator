@@ -19,9 +19,7 @@
 
 #include <stdint.h>
 
-/* Forward declaration */
-struct QuhitEngineTag;
-typedef struct QuhitEngineTag QuhitEngine;
+/* This header is included via quhit_engine.h, after QuhitEngine is defined */
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * SUBSTRATE OPCODE ENUMERATION

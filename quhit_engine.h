@@ -149,6 +149,9 @@ typedef struct {
     uint32_t     measured_values[MAX_QUHITS];
 } QuhitEngine;
 
+/* ─── Substrate opcodes (must come after QuhitEngine definition) ─── */
+#include "substrate_opcodes.h"
+
 /* ═══════════════════════════════════════════════════════════════════════════════
  * API — quhit_core.c
  * ═══════════════════════════════════════════════════════════════════════════════ */
