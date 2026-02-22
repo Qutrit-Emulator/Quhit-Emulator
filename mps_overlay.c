@@ -38,8 +38,11 @@ void mps_overlay_init(QuhitEngine *eng, uint32_t *quhits, int n)
     /* Create per-site registers: 3 qudits (k, α, β) */
     for (int i = 0; i < n; i++) {
         mps_store[i].reg_idx = quhit_reg_init(eng, (uint64_t)i, 3, MPS_CHI);
-        if (mps_store[i].reg_idx >= 0)
+        if (mps_store[i].reg_idx >= 0) {
             eng->registers[mps_store[i].reg_idx].bulk_rule = 0;
+            /* Seed product state: |k=0, α=0, β=0⟩ with amplitude 1.0 */
+            quhit_reg_sv_set(eng, mps_store[i].reg_idx, 0, 1.0, 0.0);
+        }
     }
 }
 
@@ -247,9 +250,67 @@ uint32_t mps_overlay_measure(QuhitEngine *eng, uint32_t *quhits, int n, int targ
 void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
                     int site, const double *U_re, const double *U_im)
 {
-    /* Register-based: apply unitary at physical position (pos 0) */
-    if (eng && mps_store && mps_store[site].reg_idx >= 0)
-        quhit_reg_apply_unitary_pos(eng, mps_store[site].reg_idx, 0, U_re, U_im);
+    /* Register-based: manually rotate the physical index k
+     * Register basis: k*χ² + α*χ + β, where k is the physical index (0..D-1)
+     * We can't use quhit_reg_apply_unitary_pos because reg dim=χ, not D */
+    if (eng && mps_store && mps_store[site].reg_idx >= 0) {
+        int reg_idx = mps_store[site].reg_idx;
+        QuhitRegister *reg = &eng->registers[reg_idx];
+        int chi = MPS_CHI, D = MPS_PHYS;
+        int chi2 = chi * chi;
+
+        /* Build output in temporary arrays */
+        uint32_t max_out = reg->num_nonzero * D + 1;
+        if (max_out < 4096) max_out = 4096;
+        struct { uint64_t basis; double re, im; } *tmp =
+            calloc(max_out, sizeof(*tmp));
+        uint32_t nout = 0;
+
+        for (uint32_t e = 0; e < reg->num_nonzero; e++) {
+            uint64_t bs = reg->entries[e].basis_state;
+            double ar = reg->entries[e].amp_re;
+            double ai = reg->entries[e].amp_im;
+            int k = (int)(bs / chi2);           /* physical index */
+            uint64_t bond = bs % chi2;          /* α*χ + β */
+
+            for (int kp = 0; kp < D; kp++) {
+                double ur = U_re[kp * D + k];
+                double ui = U_im[kp * D + k];
+                double nr = ur * ar - ui * ai;
+                double ni = ur * ai + ui * ar;
+                if (nr*nr + ni*ni < 1e-30) continue;
+
+                uint64_t new_bs = (uint64_t)kp * chi2 + bond;
+                /* Find or create */
+                int found = -1;
+                for (uint32_t t = 0; t < nout; t++) {
+                    if (tmp[t].basis == new_bs) { found = (int)t; break; }
+                }
+                if (found >= 0) {
+                    tmp[found].re += nr;
+                    tmp[found].im += ni;
+                } else if (nout < max_out) {
+                    tmp[nout].basis = new_bs;
+                    tmp[nout].re = nr;
+                    tmp[nout].im = ni;
+                    nout++;
+                }
+            }
+        }
+
+        /* Write back */
+        reg->num_nonzero = 0;
+        for (uint32_t t = 0; t < nout; t++) {
+            if (tmp[t].re*tmp[t].re + tmp[t].im*tmp[t].im >= 1e-30 &&
+                reg->num_nonzero < 4096) {
+                reg->entries[reg->num_nonzero].basis_state = tmp[t].basis;
+                reg->entries[reg->num_nonzero].amp_re = tmp[t].re;
+                reg->entries[reg->num_nonzero].amp_im = tmp[t].im;
+                reg->num_nonzero++;
+            }
+        }
+        free(tmp);
+    }
 
     /* Mirror to physical quhit (marginal readout) */
     if (eng && quhits && site < n)
