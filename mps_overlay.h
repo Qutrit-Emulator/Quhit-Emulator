@@ -1,11 +1,9 @@
 /*
  * mps_overlay.h — MPS Side-Channel for N-Body States
  *
- * χ=6 bond dimension, matching physical dimension D=6.
- * Every gate operation is EXACT — no SVD truncation loss.
- *
- * Storage: D×χ² = 216 complex entries = 3456 bytes per site.
- * Tensor store is dynamically allocated per chain.
+ * Pure Magic Pointer implementation — no classical tensor arrays.
+ * Tensors stored as QuhitRegisters (3 qudits: k, α, β).
+ * RAM-agnostic: O(1) per site regardless of χ.
  */
 
 #ifndef MPS_OVERLAY_H
@@ -24,49 +22,49 @@
 #define MPS_PHYS 6
 #endif
 
-/* Total entries per tensor: D × χ² = 216 complex numbers */
+/* Basis encoding: |k, α, β⟩ → k * χ² + α * χ + β */
 #define MPS_TENSOR_SIZE (MPS_PHYS * MPS_CHI * MPS_CHI)
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * TENSOR STORE
- *
- * Dynamically allocated array of MpsTensor, one per MPS site.
- * Indexed by site position (0..N-1), NOT by engine pair_id.
- * mps_overlay_init allocates, mps_overlay_free releases.
+ * TENSOR STORE — Magic Pointer based (register IS the tensor)
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
-    double re[MPS_TENSOR_SIZE];
-    double im[MPS_TENSOR_SIZE];
+    int reg_idx;   /* Index into engine's register array */
 } MpsTensor;
 
-extern MpsTensor *mps_store;
-extern int         mps_store_n;
+extern MpsTensor   *mps_store;
+extern int          mps_store_n;
+extern QuhitEngine *mps_eng;   /* Engine reference for register access */
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * TENSOR ACCESS  (by site index)
+ * TENSOR ACCESS  (via register — O(1))
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 static inline void mps_write_tensor(int site, int k, int alpha, int beta,
                                     double re, double im)
 {
-    int idx = k * (MPS_CHI * MPS_CHI) + alpha * MPS_CHI + beta;
-    mps_store[site].re[idx] = re;
-    mps_store[site].im[idx] = im;
+    uint64_t basis = (uint64_t)k * (MPS_CHI * MPS_CHI) + alpha * MPS_CHI + beta;
+    if (mps_eng && mps_store && mps_store[site].reg_idx >= 0)
+        quhit_reg_sv_set(mps_eng, mps_store[site].reg_idx, basis, re, im);
 }
 
 static inline void mps_read_tensor(int site, int k, int alpha, int beta,
                                    double *re, double *im)
 {
-    int idx = k * (MPS_CHI * MPS_CHI) + alpha * MPS_CHI + beta;
-    *re = mps_store[site].re[idx];
-    *im = mps_store[site].im[idx];
+    uint64_t basis = (uint64_t)k * (MPS_CHI * MPS_CHI) + alpha * MPS_CHI + beta;
+    if (mps_eng && mps_store && mps_store[site].reg_idx >= 0) {
+        SV_Amplitude a = quhit_reg_sv_get(mps_eng, mps_store[site].reg_idx, basis);
+        *re = a.re; *im = a.im;
+    } else {
+        *re = 0; *im = 0;
+    }
 }
 
 static inline void mps_zero_site(int site)
 {
-    memset(mps_store[site].re, 0, sizeof(mps_store[site].re));
-    memset(mps_store[site].im, 0, sizeof(mps_store[site].im));
+    if (mps_eng && mps_store && mps_store[site].reg_idx >= 0)
+        mps_eng->registers[mps_store[site].reg_idx].num_nonzero = 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -107,17 +105,6 @@ double mps_overlay_norm(QuhitEngine *eng, uint32_t *quhits, int n);
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * CANONICAL SWEEP DIRECTION
- *
- * mps_sweep_right = 1 (default): L→R sweep.
- *   Left site  = U  (left-canonical).
- *   Right site = σ·V (gauge center moves right).
- *
- * mps_sweep_right = 0: R→L sweep.
- *   Left site  = U·σ (gauge center moves left).
- *   Right site = V   (right-canonical).
- *
- * O(1) renormalization: σ is rescaled so that Σσ²=1 at each SVD.
- * In canonical form this IS the global norm.  No O(N) trace needed.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 extern int mps_sweep_right;
@@ -128,18 +115,6 @@ void mps_renormalize_chain(QuhitEngine *eng, uint32_t *quhits, int n);
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * LAZY EVALUATION LAYER
- *
- * "Reality computes on demand."
- *
- * Gates are queued, not applied. Measurement triggers materialization
- * of only the gates needed for the measured site's environment.
- * Gates on unmeasured sites are NEVER applied.
- *
- * Gate fusion: consecutive 1-site gates on the same site are multiplied
- * into a single gate before application.
- *
- * Lazy allocation: sites that have never been written to stay as
- * implicit |0⟩ with no tensor allocated.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #include "lazy_stats.h"
@@ -148,13 +123,13 @@ void mps_renormalize_chain(QuhitEngine *eng, uint32_t *quhits, int n);
 
 /* Deferred gate descriptor */
 typedef struct {
-    int     type;                   /* 0 = 1-site, 1 = 2-site                */
-    int     site;                   /* Target site (for 2-site: left site)   */
-    double  U_re[MPS_PHYS * MPS_PHYS];   /* 1-site: 6×6 matrix             */
+    int     type;
+    int     site;
+    double  U_re[MPS_PHYS * MPS_PHYS];
     double  U_im[MPS_PHYS * MPS_PHYS];
-    double *G_re;                   /* 2-site: 36×36 matrix (heap, owned)    */
+    double *G_re;
     double *G_im;
-    int     applied;                /* 1 = already materialized              */
+    int     applied;
 } MpsDeferredGate;
 
 /* Lazy chain: wraps mps_store with deferred gate queue */
@@ -163,16 +138,13 @@ typedef struct {
     uint32_t    *quhits;
     int          n_sites;
 
-    /* Deferred gate queue (linear buffer) */
     MpsDeferredGate *queue;
     int              queue_len;
     int              queue_cap;
 
-    /* Per-site flags */
-    uint8_t  *site_allocated;       /* 1 = tensor has been touched           */
-    uint8_t  *site_dirty;           /* 1 = has pending gates                 */
+    uint8_t  *site_allocated;
+    uint8_t  *site_dirty;
 
-    /* Statistics */
     LazyStats stats;
 } MpsLazyChain;
 
