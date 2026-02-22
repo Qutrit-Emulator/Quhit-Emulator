@@ -201,9 +201,12 @@ void quhit_reg_apply_unitary_pos(QuhitEngine *eng, int reg_idx,
     QuhitRegister *reg = &eng->registers[reg_idx];
     uint32_t D = reg->dim;
 
-    /* Temporary buffer for new entries */
+    /* Temporary buffer — heap allocated to handle large χ */
+    uint32_t max_entries = reg->num_nonzero * D + 1;
+    if (max_entries < 4096) max_entries = 4096;
     uint32_t new_count = 0;
-    struct { uint64_t basis; double re, im; } tmp[4096];
+    struct tmp_entry { uint64_t basis; double re, im; };
+    struct tmp_entry *tmp = (struct tmp_entry *)calloc(max_entries, sizeof(struct tmp_entry));
 
     /* D^pos multiplier for replacing digit at position pos */
     uint64_t pos_mul = 1;
@@ -240,7 +243,7 @@ void quhit_reg_apply_unitary_pos(QuhitEngine *eng, int reg_idx,
             if (found >= 0) {
                 tmp[found].re += nr;
                 tmp[found].im += ni;
-            } else if (new_count < 4096) {
+            } else if (new_count < max_entries) {
                 tmp[new_count].basis = new_basis;
                 tmp[new_count].re = nr;
                 tmp[new_count].im = ni;
@@ -249,16 +252,19 @@ void quhit_reg_apply_unitary_pos(QuhitEngine *eng, int reg_idx,
         }
     }
 
-    /* Write back, dropping near-zero entries */
+    /* Write back, dropping near-zero entries, capped at entries[] capacity */
     reg->num_nonzero = 0;
     for (uint32_t t = 0; t < new_count; t++) {
         if (tmp[t].re * tmp[t].re + tmp[t].im * tmp[t].im >= 1e-30) {
-            reg->entries[reg->num_nonzero].basis_state = tmp[t].basis;
-            reg->entries[reg->num_nonzero].amp_re = tmp[t].re;
-            reg->entries[reg->num_nonzero].amp_im = tmp[t].im;
-            reg->num_nonzero++;
+            if (reg->num_nonzero < 4096) {
+                reg->entries[reg->num_nonzero].basis_state = tmp[t].basis;
+                reg->entries[reg->num_nonzero].amp_re = tmp[t].re;
+                reg->entries[reg->num_nonzero].amp_im = tmp[t].im;
+                reg->num_nonzero++;
+            }
         }
     }
+    free(tmp);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
