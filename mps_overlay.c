@@ -257,26 +257,159 @@ void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * 2-SITE GATE — O(1) via CZ₆ engine pair
+ * 2-SITE GATE — Register-Based SVD Contraction
+ *
+ * 1. Read A[k,α,γ] and B[k,γ,β] from registers → dense
+ * 2. Contract: Θ[(kA,α),(kB,β)] = Σ_γ A[kA,α,γ] × B[kB,γ,β]
+ * 3. Apply gate: Θ' = (G ⊗ I_bond) Θ
+ * 4. SVD: Θ' = U σ V†, truncate to χ
+ * 5. Write A'[kA',α,γ'] = U, B'[kB',γ',β] = σ V† back to registers
+ *
+ * Temporary memory: ~4 × DCHI² × 8 bytes ≈ 37 MB at χ=128
  * ═══════════════════════════════════════════════════════════════════════════════ */
+
+#include "tensor_svd.h"
+
+#define DCHI (MPS_PHYS * MPS_CHI)
 
 void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                     int site, const double *G_re, const double *G_im)
 {
     int sA = site, sB = site + 1;
-    (void)G_re; (void)G_im;
+    int D = MPS_PHYS, chi = MPS_CHI;
+    int dchi = D * chi;  /* DCHI = 768 at χ=128 */
+    size_t dchi2 = (size_t)dchi * dchi;
 
-    /* CZ₆ between physical quhits — O(1) */
+    /* ── Step 1: Read tensors from registers ── */
+    double *Ai_re = (double *)calloc((size_t)D * chi * chi, sizeof(double));
+    double *Ai_im = (double *)calloc((size_t)D * chi * chi, sizeof(double));
+    double *Aj_re = (double *)calloc((size_t)D * chi * chi, sizeof(double));
+    double *Aj_im = (double *)calloc((size_t)D * chi * chi, sizeof(double));
+
+    for (int k = 0; k < D; k++)
+        for (int a = 0; a < chi; a++)
+            for (int b = 0; b < chi; b++) {
+                int idx = k * chi * chi + a * chi + b;
+                mps_read_tensor(sA, k, a, b, &Ai_re[idx], &Ai_im[idx]);
+                mps_read_tensor(sB, k, a, b, &Aj_re[idx], &Aj_im[idx]);
+            }
+
+    /* ── Step 2: Contract Θ[(kA,α),(kB,β)] = Σ_γ A[kA,α,γ] × B[kB,γ,β] ── */
+    double *Th_re = (double *)calloc(dchi2, sizeof(double));
+    double *Th_im = (double *)calloc(dchi2, sizeof(double));
+
+    for (int kA = 0; kA < D; kA++)
+     for (int a = 0; a < chi; a++) {
+         int row = kA * chi + a;
+         for (int kB = 0; kB < D; kB++)
+          for (int b = 0; b < chi; b++) {
+              int col = kB * chi + b;
+              double sr = 0, si = 0;
+              for (int g = 0; g < chi; g++) {
+                  int iA = kA * chi * chi + a * chi + g;
+                  int iB = kB * chi * chi + g * chi + b;
+                  double ar = Ai_re[iA], ai = Ai_im[iA];
+                  double br = Aj_re[iB], bi = Aj_im[iB];
+                  sr += ar*br - ai*bi;
+                  si += ar*bi + ai*br;
+              }
+              Th_re[row * dchi + col] = sr;
+              Th_im[row * dchi + col] = si;
+          }
+     }
+
+    /* ── Step 3: Apply gate G to physical indices ── */
+    /* Θ'[(kA',α),(kB',β)] = Σ_{kA,kB} G[kA'*D+kB', kA*D+kB] × Θ[(kA,α),(kB,β)] */
+    double *Th2_re = (double *)calloc(dchi2, sizeof(double));
+    double *Th2_im = (double *)calloc(dchi2, sizeof(double));
+
+    int D2 = D * D;
+    for (int kAp = 0; kAp < D; kAp++)
+     for (int kBp = 0; kBp < D; kBp++) {
+         int gr = kAp * D + kBp;
+         for (int kA = 0; kA < D; kA++)
+          for (int kB = 0; kB < D; kB++) {
+              int gc = kA * D + kB;
+              double gre = G_re[gr * D2 + gc];
+              double gim = G_im[gr * D2 + gc];
+              if (fabs(gre) < 1e-30 && fabs(gim) < 1e-30) continue;
+
+              for (int a = 0; a < chi; a++) {
+                  int dst_row = kAp * chi + a;
+                  int src_row = kA * chi + a;
+                  for (int b = 0; b < chi; b++) {
+                      int dst_col = kBp * chi + b;
+                      int src_col = kB * chi + b;
+                      double tr = Th_re[src_row * dchi + src_col];
+                      double ti = Th_im[src_row * dchi + src_col];
+                      Th2_re[dst_row * dchi + dst_col] += gre*tr - gim*ti;
+                      Th2_im[dst_row * dchi + dst_col] += gre*ti + gim*tr;
+                  }
+              }
+          }
+     }
+
+    free(Th_re); free(Th_im);
+
+    /* ── Step 4: SVD → truncate to χ ── */
+    double *U_re  = (double *)calloc((size_t)dchi * chi, sizeof(double));
+    double *U_im  = (double *)calloc((size_t)dchi * chi, sizeof(double));
+    double *sig   = (double *)calloc(chi, sizeof(double));
+    double *Vc_re = (double *)calloc((size_t)chi * dchi, sizeof(double));
+    double *Vc_im = (double *)calloc((size_t)chi * dchi, sizeof(double));
+
+    tsvd_truncated(Th2_re, Th2_im, dchi, dchi, chi,
+                   U_re, U_im, sig, Vc_re, Vc_im);
+
+    free(Th2_re); free(Th2_im);
+
+    /* ── Step 5: Write back to registers ── */
+
+    /* Normalize singular values */
+    double sig_norm = 0;
+    for (int i = 0; i < chi; i++) sig_norm += sig[i] * sig[i];
+    if (sig_norm > 1e-30) {
+        double scale = 1.0 / sqrt(sig_norm);
+        for (int i = 0; i < chi; i++) sig[i] *= scale;
+    }
+
+    /* A'[kA', α, γ] = U[(kA'*χ+α), γ]  — left-canonical */
+    mps_zero_site(sA);
+    for (int kA = 0; kA < D; kA++)
+     for (int a = 0; a < chi; a++) {
+         int row = kA * chi + a;
+         for (int g = 0; g < chi; g++) {
+             double re = U_re[row * chi + g];
+             double im = U_im[row * chi + g];
+             if (re*re + im*im > 1e-30)
+                 mps_write_tensor(sA, kA, a, g, re, im);
+         }
+     }
+
+    /* B'[kB', γ, β] = σ[γ] × V†[γ, (kB'*χ+β)]  — gauge on right */
+    mps_zero_site(sB);
+    for (int kB = 0; kB < D; kB++)
+     for (int g = 0; g < chi; g++) {
+         double s = sig[g];
+         if (s < 1e-30) continue;
+         for (int b = 0; b < chi; b++) {
+             int col = kB * chi + b;
+             double re = s * Vc_re[g * dchi + col];
+             double im = s * Vc_im[g * dchi + col];
+             if (re*re + im*im > 1e-30)
+                 mps_write_tensor(sB, kB, g, b, re, im);
+         }
+     }
+
+    free(U_re); free(U_im);
+    free(sig);
+    free(Vc_re); free(Vc_im);
+    free(Ai_re); free(Ai_im);
+    free(Aj_re); free(Aj_im);
+
+    /* ── Mirror to engine quhits ── */
     if (eng && quhits && sB < n)
         quhit_apply_cz(eng, quhits[sA], quhits[sB]);
-
-    /* Register: apply self-CZ at physical position */
-    if (eng && mps_store) {
-        if (mps_store[sA].reg_idx >= 0)
-            quhit_reg_apply_cz(eng, mps_store[sA].reg_idx, 0, 0);
-        if (sB < mps_store_n && mps_store[sB].reg_idx >= 0)
-            quhit_reg_apply_cz(eng, mps_store[sB].reg_idx, 0, 0);
-    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
