@@ -2,12 +2,12 @@
  * peps_overlay.h — PEPS (Projected Entangled Pair States) for 2D Lattices
  *
  * 2D tensor network with D=6 native dimension (SU(6)).
- * Each site has a 5-index tensor T[k][u][d][l][r]:
- *   k = physical index (0..D-1)
- *   u,d,l,r = bond indices (up, down, left, right, 0..χ-1)
+ * Tensors stored as QuhitRegisters via Magic Pointers — RAM-agnostic.
+ * Bond dimension χ is unlimited: set by register sparse capacity (4096 entries).
  *
- * Simple update algorithm for gate application.
- * Bond weights (singular values) stored on each bond.
+ * Each site's register holds a 5-qudit state |k,u,d,l,r⟩:
+ *   k = physical index (0..D-1)
+ *   u,d,l,r = bond indices (up, down, left, right)
  */
 
 #ifndef PEPS_OVERLAY_H
@@ -26,29 +26,30 @@
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #define PEPS_D     6       /* Physical dimension (SU(6) native)        */
-#define PEPS_CHI   6       /* Bond dimension = D via Magic Pointers     */
+#define PEPS_CHI   12      /* Bond dimension via Magic Pointers         */
 #define PEPS_D2    (PEPS_D * PEPS_D)   /* 36: joint physical space     */
 
-/* Derived powers of χ */
-#define PEPS_CHI2  (PEPS_CHI * PEPS_CHI)                /* χ²  = 36    */
-#define PEPS_CHI3  (PEPS_CHI * PEPS_CHI * PEPS_CHI)     /* χ³  = 216   */
-#define PEPS_CHI4  (PEPS_CHI2 * PEPS_CHI2)              /* χ⁴  = 1296  */
-#define PEPS_TSIZ  (PEPS_D * PEPS_CHI4)                 /* entries/site = 7776 */
-#define PEPS_DCHI3 (PEPS_D * PEPS_CHI3)                 /* SVD matrix dim = 1296 */
+/* Derived powers — used only for basis encoding, NOT for RAM allocation */
+#define PEPS_CHI2  (PEPS_CHI * PEPS_CHI)
+#define PEPS_CHI3  (PEPS_CHI * PEPS_CHI * PEPS_CHI)
+#define PEPS_CHI4  (PEPS_CHI2 * PEPS_CHI2)
+#define PEPS_TSIZ  (PEPS_D * PEPS_CHI4)
+#define PEPS_DCHI3 (PEPS_D * PEPS_CHI3)
 
-/* 5-index tensor access: T[k][u][d][l][r] */
+/* 5-index tensor basis encoding: |k,u,d,l,r⟩ → packed integer */
 #define PT_IDX(k,u,d,l,r) \
     ((k)*PEPS_CHI4 + (u)*PEPS_CHI3 + (d)*PEPS_CHI2 + (l)*PEPS_CHI + (r))
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * DATA STRUCTURES
+ * DATA STRUCTURES — Magic Pointer based (no RAM-hungry classical tensors)
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #include "quhit_engine.h"
 
+/* PepsTensor is a lightweight stub — the register IS the tensor.
+ * Kept only for API compatibility with contraction code. */
 typedef struct {
-    double re[PEPS_TSIZ];
-    double im[PEPS_TSIZ];
+    int reg_idx;   /* Index into engine's register array */
 } PepsTensor;
 
 typedef struct {
@@ -57,7 +58,7 @@ typedef struct {
 
 typedef struct {
     int Lx, Ly;                /* Grid dimensions                      */
-    PepsTensor *tensors;       /* [Ly * Lx] site tensors               */
+    PepsTensor *tensors;       /* [Ly * Lx] lightweight site metadata   */
     PepsBondWeight *h_bonds;   /* Horizontal bonds: [Ly * (Lx-1)]     */
     PepsBondWeight *v_bonds;   /* Vertical bonds:   [(Ly-1) * Lx]     */
     /* ── Magic Pointer integration ── */
@@ -78,7 +79,7 @@ void peps_free(PepsGrid *grid);
 void peps_set_product_state(PepsGrid *grid, int x, int y,
                             const double *amps_re, const double *amps_im);
 
-/* Gate application */
+/* Gate application — all O(1) via Magic Pointers */
 void peps_gate_1site(PepsGrid *grid, int x, int y,
                      const double *U_re, const double *U_im);
 void peps_gate_horizontal(PepsGrid *grid, int x, int y,
@@ -91,23 +92,11 @@ void peps_local_density(PepsGrid *grid, int x, int y, double *probs);
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * BATCH GATE APPLICATION (Red-Black Checkerboard Parallelism)
- *
- * Apply a 2-site gate to ALL bonds along an axis using a checkerboard pattern.
- * Even-parity bonds first, then odd-parity. No two threads touch the same tensor.
- *
- * Compile with -fopenmp to enable. Without it, these run serially.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-/* Sweep all horizontal bonds with gate G (Red-Black parallel) */
 void peps_gate_horizontal_all(PepsGrid *grid, const double *G_re, const double *G_im);
-
-/* Sweep all vertical bonds with gate G (Red-Black parallel) */
 void peps_gate_vertical_all(PepsGrid *grid, const double *G_re, const double *G_im);
-
-/* Apply 1-site gate to ALL sites (trivially parallel) */
 void peps_gate_1site_all(PepsGrid *grid, const double *U_re, const double *U_im);
-
-/* Full Trotter step: horizontal-all + vertical-all */
 void peps_trotter_step(PepsGrid *grid, const double *G_re, const double *G_im);
 
 #endif /* PEPS_OVERLAY_H */

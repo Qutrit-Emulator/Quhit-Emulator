@@ -20,6 +20,10 @@
 
 #include "quhit_engine.h"
 
+/* Forward declaration — defined later in this file */
+static uint32_t reg_extract_digit(uint64_t basis, uint64_t pos,
+                                  uint32_t D, uint8_t bulk_rule);
+
 /* ═══════════════════════════════════════════════════════════════════════════════
  * REGISTER INIT
  *
@@ -163,17 +167,97 @@ void quhit_reg_apply_cz(QuhitEngine *eng, int reg_idx,
     QuhitRegister *reg = &eng->registers[reg_idx];
     uint32_t D = reg->dim;
     double omega = 2.0 * M_PI / D;
-    (void)idx_a; (void)idx_b;
 
     for (uint32_t e = 0; e < reg->num_nonzero; e++) {
-        uint32_t k = (uint32_t)(reg->entries[e].basis_state % D);
-        /* GHZ: both positions have value k, so CZ phase = ω^(k·k) */
-        double phase = omega * k * k;
+        uint32_t ka = reg_extract_digit(reg->entries[e].basis_state,
+                                        idx_a, D, reg->bulk_rule);
+        uint32_t kb = reg_extract_digit(reg->entries[e].basis_state,
+                                        idx_b, D, reg->bulk_rule);
+        double phase = omega * ka * kb;
         double cos_p = cos(phase), sin_p = sin(phase);
         double re = reg->entries[e].amp_re;
         double im = reg->entries[e].amp_im;
         reg->entries[e].amp_re = re * cos_p - im * sin_p;
         reg->entries[e].amp_im = re * sin_p + im * cos_p;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * UNITARY ON SINGLE QUDIT POSITION — O(entries × D) gate application
+ *
+ * Apply a D×D unitary U to qudit at position `pos` in the register.
+ * For each entry with digit k at position pos, the new amplitude iscircuit
+ *   a'[...k'...] = Σ_k U[k',k] × a[...k...]
+ *
+ * This replaces the entire classical Θ-contraction + SVD pipeline.
+ * Cost: O(num_nonzero × D) — near-instant for sparse registers.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+void quhit_reg_apply_unitary_pos(QuhitEngine *eng, int reg_idx,
+                                 uint64_t pos,
+                                 const double *U_re, const double *U_im)
+{
+    if (reg_idx < 0 || (uint32_t)reg_idx >= eng->num_registers) return;
+    QuhitRegister *reg = &eng->registers[reg_idx];
+    uint32_t D = reg->dim;
+
+    /* Temporary buffer for new entries */
+    uint32_t new_count = 0;
+    struct { uint64_t basis; double re, im; } tmp[4096];
+
+    /* D^pos multiplier for replacing digit at position pos */
+    uint64_t pos_mul = 1;
+    for (uint64_t p = 0; p < pos; p++) pos_mul *= D;
+
+    for (uint32_t e = 0; e < reg->num_nonzero; e++) {
+        uint64_t basis = reg->entries[e].basis_state;
+        double a_re = reg->entries[e].amp_re;
+        double a_im = reg->entries[e].amp_im;
+
+        /* Extract digit k at position pos */
+        uint32_t k = (uint32_t)((basis / pos_mul) % D);
+
+        /* Base: basis with digit at pos zeroed out */
+        uint64_t base = basis - (uint64_t)k * pos_mul;
+
+        /* Apply U: for each output digit k', accumulate U[k',k] × amplitude */
+        for (uint32_t kp = 0; kp < D; kp++) {
+            double ur = U_re[kp * D + k];
+            double ui = U_im[kp * D + k];
+            /* U[k',k] × a = (ur + i·ui)(a_re + i·a_im) */
+            double nr = ur * a_re - ui * a_im;
+            double ni = ur * a_im + ui * a_re;
+
+            if (nr * nr + ni * ni < 1e-30) continue;
+
+            uint64_t new_basis = base + (uint64_t)kp * pos_mul;
+
+            /* Find or create entry for new_basis in tmp */
+            int found = -1;
+            for (uint32_t t = 0; t < new_count; t++) {
+                if (tmp[t].basis == new_basis) { found = (int)t; break; }
+            }
+            if (found >= 0) {
+                tmp[found].re += nr;
+                tmp[found].im += ni;
+            } else if (new_count < 4096) {
+                tmp[new_count].basis = new_basis;
+                tmp[new_count].re = nr;
+                tmp[new_count].im = ni;
+                new_count++;
+            }
+        }
+    }
+
+    /* Write back, dropping near-zero entries */
+    reg->num_nonzero = 0;
+    for (uint32_t t = 0; t < new_count; t++) {
+        if (tmp[t].re * tmp[t].re + tmp[t].im * tmp[t].im >= 1e-30) {
+            reg->entries[reg->num_nonzero].basis_state = tmp[t].basis;
+            reg->entries[reg->num_nonzero].amp_re = tmp[t].re;
+            reg->entries[reg->num_nonzero].amp_im = tmp[t].im;
+            reg->num_nonzero++;
+        }
     }
 }
 

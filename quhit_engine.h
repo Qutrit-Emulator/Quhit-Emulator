@@ -206,6 +206,9 @@ void     quhit_reg_entangle_all(QuhitEngine *eng, int reg_idx);
 void     quhit_reg_apply_dft(QuhitEngine *eng, int reg_idx, uint64_t quhit_idx);
 void     quhit_reg_apply_cz(QuhitEngine *eng, int reg_idx,
                             uint64_t idx_a, uint64_t idx_b);
+void     quhit_reg_apply_unitary_pos(QuhitEngine *eng, int reg_idx,
+                                     uint64_t pos,
+                                     const double *U_re, const double *U_im);
 uint64_t quhit_reg_measure(QuhitEngine *eng, int reg_idx, uint64_t quhit_idx);
 
 /* ─── Streaming State Vector (statevector.h compatible) ─── */
