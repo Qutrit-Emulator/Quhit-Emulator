@@ -13,6 +13,7 @@
 #include <math.h>
 
 #define TNS3D_SVDDIM (TNS3D_D * TNS3D_CHI * TNS3D_CHI)  /* 54 at χ=3 */
+#define TNS3D_PHYS_POS 6  /* Physical index k is at position 6 (most significant) */
 
 /* ═══════════════ GRID ACCESS ═══════════════ */
 
@@ -145,7 +146,7 @@ void tns3d_gate_1site(Tns3dGrid *g, int x, int y, int z,
 {
     int site = tns3d_flat(g, x, y, z);
     if (g->eng && g->site_reg)
-        quhit_reg_apply_unitary_pos(g->eng, g->site_reg[site], 0, U_re, U_im);
+        quhit_reg_apply_unitary_pos(g->eng, g->site_reg[site], TNS3D_PHYS_POS, U_re, U_im);
     if (g->eng && g->q_phys)
         quhit_apply_unitary(g->eng, g->q_phys[site], U_re, U_im);
 }
@@ -419,9 +420,9 @@ void tns3d_local_density(Tns3dGrid *g, int x, int y, int z, double *probs)
     double total = 0;
 
     for (uint32_t e = 0; e < r->num_nonzero; e++) {
-        /* Physical digit k is at position 0 in basis encoding */
+        /* Physical digit k is at position 6 (most significant) */
         uint64_t bs = r->entries[e].basis_state;
-        int k = (int)(bs / TNS3D_CHI6);  /* k = highest position */
+        int k = (int)(bs / TNS3D_D6);  /* k = highest position */
         if (k >= TNS3D_D) continue;
         double re = r->entries[e].amp_re;
         double im = r->entries[e].amp_im;
