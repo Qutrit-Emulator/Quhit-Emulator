@@ -55,7 +55,7 @@
 
 #define MAX_QUHITS          262144      /* Max quhits in engine (256K)      */
 #define MAX_PAIRS           262144      /* Max entangled pairs (256K)       */
-#define MAX_REGISTERS       256         /* Max quhit registers              */
+#define MAX_REGISTERS       16384       /* Max quhit registers              */
 #define MAX_CZ_DEFERRED     4096        /* Max deferred CZ per pair         */
 
 #define MAGIC_TAG           0xBEEF      /* Magic pointer tag                */
@@ -211,6 +211,8 @@ uint64_t quhit_reg_measure(QuhitEngine *eng, int reg_idx, uint64_t quhit_idx);
 /* ─── Streaming State Vector (statevector.h compatible) ─── */
 SV_Amplitude quhit_reg_sv_get(QuhitEngine *eng, int reg_idx,
                               uint64_t basis_k);
+void         quhit_reg_sv_set(QuhitEngine *eng, int reg_idx,
+                              uint64_t basis_k, double re, double im);
 
 typedef void (*sv_stream_fn)(uint64_t basis_state, SV_Amplitude amp,
                              void *user_data);

@@ -114,6 +114,18 @@ PepsGrid *peps_init(int Lx, int Ly)
     for (int i = 0; i < N; i++)
         g->q_phys[i] = quhit_init_basis(g->eng, 0);  /* each site starts in |0⟩ */
 
+    /* ── Magic Pointer: per-site registers for tensor storage ── */
+    g->site_reg = (int *)calloc(N, sizeof(int));
+    for (int i = 0; i < N; i++) {
+        g->site_reg[i] = quhit_reg_init(g->eng, (uint64_t)i, 5, PEPS_D);
+        if (g->site_reg[i] >= 0) {
+            /* Set bulk_rule to 0 (general mode, not GHZ) */
+            g->eng->registers[g->site_reg[i]].bulk_rule = 0;
+            /* Init to |0,0,0,0,0⟩ with amplitude 1.0 */
+            quhit_reg_sv_set(g->eng, g->site_reg[i], 0, 1.0, 0.0);
+        }
+    }
+
     return g;
 }
 
@@ -129,6 +141,7 @@ void peps_free(PepsGrid *grid)
         free(grid->eng);
     }
     free(grid->q_phys);
+    free(grid->site_reg);
     free(grid);
 }
 

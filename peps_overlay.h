@@ -26,15 +26,15 @@
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #define PEPS_D     6       /* Physical dimension (SU(6) native)        */
-#define PEPS_CHI   4       /* Bond dimension (χ⁵ scaling!)             */
+#define PEPS_CHI   6       /* Bond dimension = D via Magic Pointers     */
 #define PEPS_D2    (PEPS_D * PEPS_D)   /* 36: joint physical space     */
 
 /* Derived powers of χ */
-#define PEPS_CHI2  (PEPS_CHI * PEPS_CHI)                /* χ²  = 16    */
-#define PEPS_CHI3  (PEPS_CHI * PEPS_CHI * PEPS_CHI)     /* χ³  = 64    */
-#define PEPS_CHI4  (PEPS_CHI2 * PEPS_CHI2)              /* χ⁴  = 256   */
-#define PEPS_TSIZ  (PEPS_D * PEPS_CHI4)                 /* entries/site */
-#define PEPS_DCHI3 (PEPS_D * PEPS_CHI3)                 /* SVD matrix dim */
+#define PEPS_CHI2  (PEPS_CHI * PEPS_CHI)                /* χ²  = 36    */
+#define PEPS_CHI3  (PEPS_CHI * PEPS_CHI * PEPS_CHI)     /* χ³  = 216   */
+#define PEPS_CHI4  (PEPS_CHI2 * PEPS_CHI2)              /* χ⁴  = 1296  */
+#define PEPS_TSIZ  (PEPS_D * PEPS_CHI4)                 /* entries/site = 7776 */
+#define PEPS_DCHI3 (PEPS_D * PEPS_CHI3)                 /* SVD matrix dim = 1296 */
 
 /* 5-index tensor access: T[k][u][d][l][r] */
 #define PT_IDX(k,u,d,l,r) \
@@ -63,6 +63,7 @@ typedef struct {
     /* ── Magic Pointer integration ── */
     uint32_t *q_phys;         /* [Ly * Lx] per-site physical quhit IDs */
     QuhitEngine *eng;          /* HexState Engine reference             */
+    int *site_reg;             /* [Ly * Lx] per-site register indices   */
 } PepsGrid;
 
 /* ═══════════════════════════════════════════════════════════════════════════════

@@ -296,6 +296,46 @@ SV_Amplitude quhit_reg_sv_get(QuhitEngine *eng, int reg_idx,
     }
     return amp;
 }
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * SET AMPLITUDE — Insert or update a sparse entry
+ *
+ * If basis_k already exists, update in-place. Otherwise append.
+ * Near-zero amplitudes (|a|² < 1e-30) are dropped to maintain sparsity.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+void quhit_reg_sv_set(QuhitEngine *eng, int reg_idx,
+                      uint64_t basis_k, double re, double im)
+{
+    if (reg_idx < 0 || (uint32_t)reg_idx >= eng->num_registers) return;
+    QuhitRegister *reg = &eng->registers[reg_idx];
+
+    double mag2 = re * re + im * im;
+
+    /* Search for existing entry */
+    for (uint32_t e = 0; e < reg->num_nonzero; e++) {
+        if (reg->entries[e].basis_state == basis_k) {
+            if (mag2 < 1e-30) {
+                /* Remove: swap with last entry */
+                reg->entries[e] = reg->entries[reg->num_nonzero - 1];
+                reg->num_nonzero--;
+            } else {
+                /* Update in-place */
+                reg->entries[e].amp_re = re;
+                reg->entries[e].amp_im = im;
+            }
+            return;
+        }
+    }
+
+    /* Not found — append if nonzero and space available */
+    if (mag2 >= 1e-30 && reg->num_nonzero < 4096) {
+        reg->entries[reg->num_nonzero].basis_state = basis_k;
+        reg->entries[reg->num_nonzero].amp_re = re;
+        reg->entries[reg->num_nonzero].amp_im = im;
+        reg->num_nonzero++;
+    }
+}
+
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * STREAMING SCAN — Iterate over a window of the state vector
