@@ -340,8 +340,12 @@ static void tns3d_truncated_svd(const double *M_re, const double *M_im,
 
     /* γ: Substrate seed accumulation */
     { uint64_t na=0; for (int s=0;s<chi;s++) { uint64_t bits; memcpy(&bits,&sigma[s],8);
-      na ^= bits; } tns3d_substrate_seed ^= na; tns3d_substrate_seed *= 6364136223846793005ULL;
-      tns3d_substrate_seed += 1442695040888963407ULL; }
+      na ^= bits; }
+      #ifdef _OPENMP
+      #pragma omp critical(tns3d_seed_update)
+      #endif
+      { tns3d_substrate_seed ^= na; tns3d_substrate_seed *= 6364136223846793005ULL;
+      tns3d_substrate_seed += 1442695040888963407ULL; } }
 
     /* Steps 8-9: Reconstruct U, Vc */
     for (int i=0;i<m;i++) for (int s=0;s<chi;s++) {

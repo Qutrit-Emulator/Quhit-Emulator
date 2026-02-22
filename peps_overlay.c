@@ -511,9 +511,14 @@ static void peps_truncated_svd(const double *M_re, const double *M_im,
             memcpy(&bits, &sigma[t], 8);
             noise_accum ^= (bits & 0xF) << (t * 4 % 60);
         }
-        peps_substrate_seed ^= noise_accum;
-        peps_substrate_seed = peps_substrate_seed * 6364136223846793005ULL
-                            + 1442695040888963407ULL;
+        #ifdef _OPENMP
+        #pragma omp critical(substrate_seed_update)
+        #endif
+        {
+            peps_substrate_seed ^= noise_accum;
+            peps_substrate_seed = peps_substrate_seed * 6364136223846793005ULL
+                                + 1442695040888963407ULL;
+        }
     }
 
     /* Step 8: Left singular vectors U = Q × W  (m × chi) */
@@ -880,4 +885,83 @@ void peps_local_density(PepsGrid *grid, int x, int y, double *probs)
     }
     if (total > 1e-30)
         for (int k = 0; k < PEPS_D; k++) probs[k] /= total;
+}
+
+/* ═══════════════ BATCH GATE APPLICATION (Red-Black Checkerboard) ═══════════════
+ *
+ * For horizontal gates: bond (x,y)—(x+1,y) touches tensors at x and x+1.
+ * Red-Black: Phase 1 = even x, Phase 2 = odd x.
+ *
+ * For vertical gates: bond (x,y)—(x,y+1) touches tensors at y and y+1.
+ * Red-Black: Phase 1 = even y, Phase 2 = odd y.
+ */
+
+void peps_gate_horizontal_all(PepsGrid *g, const double *G_re, const double *G_im)
+{
+    if (g->Lx < 2) return;
+
+    /* Phase 1: Red bonds (x even) */
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(2) schedule(dynamic)
+    #endif
+    for (int y = 0; y < g->Ly; y++)
+     for (int xh = 0; xh < (g->Lx - 1 + 1) / 2; xh++) {
+         int x = xh * 2;
+         if (x < g->Lx - 1)
+             peps_gate_horizontal(g, x, y, G_re, G_im);
+     }
+
+    /* Phase 2: Black bonds (x odd) */
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(2) schedule(dynamic)
+    #endif
+    for (int y = 0; y < g->Ly; y++)
+     for (int xh = 0; xh < g->Lx / 2; xh++) {
+         int x = xh * 2 + 1;
+         if (x < g->Lx - 1)
+             peps_gate_horizontal(g, x, y, G_re, G_im);
+     }
+}
+
+void peps_gate_vertical_all(PepsGrid *g, const double *G_re, const double *G_im)
+{
+    if (g->Ly < 2) return;
+
+    /* Phase 1: Red bonds (y even) */
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(2) schedule(dynamic)
+    #endif
+    for (int yh = 0; yh < (g->Ly - 1 + 1) / 2; yh++)
+     for (int x = 0; x < g->Lx; x++) {
+         int y = yh * 2;
+         if (y < g->Ly - 1)
+             peps_gate_vertical(g, x, y, G_re, G_im);
+     }
+
+    /* Phase 2: Black bonds (y odd) */
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(2) schedule(dynamic)
+    #endif
+    for (int yh = 0; yh < g->Ly / 2; yh++)
+     for (int x = 0; x < g->Lx; x++) {
+         int y = yh * 2 + 1;
+         if (y < g->Ly - 1)
+             peps_gate_vertical(g, x, y, G_re, G_im);
+     }
+}
+
+void peps_gate_1site_all(PepsGrid *g, const double *U_re, const double *U_im)
+{
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(2) schedule(static)
+    #endif
+    for (int y = 0; y < g->Ly; y++)
+     for (int x = 0; x < g->Lx; x++)
+         peps_gate_1site(g, x, y, U_re, U_im);
+}
+
+void peps_trotter_step(PepsGrid *g, const double *G_re, const double *G_im)
+{
+    peps_gate_horizontal_all(g, G_re, G_im);
+    peps_gate_vertical_all(g, G_re, G_im);
 }
