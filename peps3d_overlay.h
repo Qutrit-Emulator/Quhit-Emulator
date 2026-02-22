@@ -19,12 +19,16 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════════════════
  * CONSTANTS
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #define TNS3D_D     6       /* Physical dimension (SU(6) native)          */
-#define TNS3D_CHI   2       /* Bond dimension (χ⁶ storage per site)       */
+#define TNS3D_CHI   3       /* Bond dimension (χ⁶ storage per site)       */
 #define TNS3D_D2    (TNS3D_D * TNS3D_D)   /* 36: joint physical space   */
 
 /* Derived powers of χ */
@@ -89,5 +93,31 @@ void tns3d_gate_1site(Tns3dGrid *grid, int x, int y, int z,
 
 /* Observables */
 void tns3d_local_density(Tns3dGrid *grid, int x, int y, int z, double *probs);
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * BATCH GATE APPLICATION (Red-Black Checkerboard Parallelism)
+ *
+ * Apply a 2-site gate to ALL bonds along an axis using a checkerboard pattern.
+ * Even-parity bonds (x%2==0) are applied first, then odd-parity (x%2==1).
+ * No two threads ever touch the same tensor.
+ *
+ * Compile with -fopenmp to enable multi-threaded execution.
+ * Without OpenMP, these run serially (still correct, just sequential).
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* Sweep all X-bonds with gate G (Red-Black parallel) */
+void tns3d_gate_x_all(Tns3dGrid *grid, const double *G_re, const double *G_im);
+
+/* Sweep all Y-bonds with gate G (Red-Black parallel) */
+void tns3d_gate_y_all(Tns3dGrid *grid, const double *G_re, const double *G_im);
+
+/* Sweep all Z-bonds with gate G (Red-Black parallel) */
+void tns3d_gate_z_all(Tns3dGrid *grid, const double *G_re, const double *G_im);
+
+/* Apply 1-site gate to ALL sites (trivially parallel — no shared data) */
+void tns3d_gate_1site_all(Tns3dGrid *grid, const double *U_re, const double *U_im);
+
+/* Full Trotter step: X-all + Y-all + Z-all with the same gate */
+void tns3d_trotter_step(Tns3dGrid *grid, const double *G_re, const double *G_im);
 
 #endif /* PEPS3D_OVERLAY_H */

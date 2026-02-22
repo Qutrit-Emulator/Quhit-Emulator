@@ -705,3 +705,121 @@ void tns3d_local_density(Tns3dGrid *g, int x, int y, int z, double *probs)
     }
     if (total > 1e-30) for (int k = 0; k < TNS3D_D; k++) probs[k] /= total;
 }
+
+/* ═══════════════ BATCH GATE APPLICATION (Red-Black Checkerboard) ═══════════════
+ *
+ * For 2-site gates along axis X: bond (x,y,z)—(x+1,y,z) touches tensors at
+ * sites x and x+1.  Two bonds at x₁ and x₂ are disjoint iff |x₁-x₂| ≥ 2.
+ *
+ * Red-Black pattern:
+ *   Phase 1 (Red):  x = 0, 2, 4, ...  (all disjoint — safe to parallelize)
+ *   Phase 2 (Black): x = 1, 3, 5, ...  (all disjoint — safe to parallelize)
+ *
+ * Same logic applies to Y (stride on y) and Z (stride on z).
+ */
+
+void tns3d_gate_x_all(Tns3dGrid *g, const double *G_re, const double *G_im)
+{
+    if (g->Lx < 2) return;
+
+    /* Phase 1: Red bonds (x even) */
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(3) schedule(dynamic)
+    #endif
+    for (int z = 0; z < g->Lz; z++)
+     for (int y = 0; y < g->Ly; y++)
+      for (int xh = 0; xh < (g->Lx - 1 + 1) / 2; xh++) {
+          int x = xh * 2;  /* x = 0, 2, 4, ... */
+          if (x < g->Lx - 1)
+              tns3d_gate_x(g, x, y, z, G_re, G_im);
+      }
+
+    /* Phase 2: Black bonds (x odd) */
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(3) schedule(dynamic)
+    #endif
+    for (int z = 0; z < g->Lz; z++)
+     for (int y = 0; y < g->Ly; y++)
+      for (int xh = 0; xh < g->Lx / 2; xh++) {
+          int x = xh * 2 + 1;  /* x = 1, 3, 5, ... */
+          if (x < g->Lx - 1)
+              tns3d_gate_x(g, x, y, z, G_re, G_im);
+      }
+}
+
+void tns3d_gate_y_all(Tns3dGrid *g, const double *G_re, const double *G_im)
+{
+    if (g->Ly < 2) return;
+
+    /* Phase 1: Red bonds (y even) */
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(3) schedule(dynamic)
+    #endif
+    for (int z = 0; z < g->Lz; z++)
+     for (int yh = 0; yh < (g->Ly - 1 + 1) / 2; yh++)
+      for (int x = 0; x < g->Lx; x++) {
+          int y = yh * 2;
+          if (y < g->Ly - 1)
+              tns3d_gate_y(g, x, y, z, G_re, G_im);
+      }
+
+    /* Phase 2: Black bonds (y odd) */
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(3) schedule(dynamic)
+    #endif
+    for (int z = 0; z < g->Lz; z++)
+     for (int yh = 0; yh < g->Ly / 2; yh++)
+      for (int x = 0; x < g->Lx; x++) {
+          int y = yh * 2 + 1;
+          if (y < g->Ly - 1)
+              tns3d_gate_y(g, x, y, z, G_re, G_im);
+      }
+}
+
+void tns3d_gate_z_all(Tns3dGrid *g, const double *G_re, const double *G_im)
+{
+    if (g->Lz < 2) return;
+
+    /* Phase 1: Red bonds (z even) */
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(3) schedule(dynamic)
+    #endif
+    for (int zh = 0; zh < (g->Lz - 1 + 1) / 2; zh++)
+     for (int y = 0; y < g->Ly; y++)
+      for (int x = 0; x < g->Lx; x++) {
+          int z = zh * 2;
+          if (z < g->Lz - 1)
+              tns3d_gate_z(g, x, y, z, G_re, G_im);
+      }
+
+    /* Phase 2: Black bonds (z odd) */
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(3) schedule(dynamic)
+    #endif
+    for (int zh = 0; zh < g->Lz / 2; zh++)
+     for (int y = 0; y < g->Ly; y++)
+      for (int x = 0; x < g->Lx; x++) {
+          int z = zh * 2 + 1;
+          if (z < g->Lz - 1)
+              tns3d_gate_z(g, x, y, z, G_re, G_im);
+      }
+}
+
+void tns3d_gate_1site_all(Tns3dGrid *g, const double *U_re, const double *U_im)
+{
+    /* 1-site gates are trivially parallel — each touches only one tensor */
+    #ifdef _OPENMP
+    #pragma omp parallel for collapse(3) schedule(static)
+    #endif
+    for (int z = 0; z < g->Lz; z++)
+     for (int y = 0; y < g->Ly; y++)
+      for (int x = 0; x < g->Lx; x++)
+          tns3d_gate_1site(g, x, y, z, U_re, U_im);
+}
+
+void tns3d_trotter_step(Tns3dGrid *g, const double *G_re, const double *G_im)
+{
+    tns3d_gate_x_all(g, G_re, G_im);
+    tns3d_gate_y_all(g, G_re, G_im);
+    tns3d_gate_z_all(g, G_re, G_im);
+}
