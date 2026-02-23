@@ -247,6 +247,14 @@ uint32_t mps_overlay_measure(QuhitEngine *eng, uint32_t *quhits, int n, int targ
  * SINGLE-SITE GATE — O(entries × D) via register
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
+static int mps_cmp_basis(const void *a, const void *b)
+{
+    const struct { uint64_t basis; double re, im; } *ea = a, *eb = b;
+    if (ea->basis < eb->basis) return -1;
+    if (ea->basis > eb->basis) return 1;
+    return 0;
+}
+
 void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
                     int site, const double *U_re, const double *U_im)
 {
@@ -278,19 +286,10 @@ void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
                 double ui = U_im[kp * D + k];
                 double nr = ur * ar - ui * ai;
                 double ni = ur * ai + ui * ar;
-                if (nr*nr + ni*ni < 1e-30) continue;
+                if (nr*nr + ni*ni < 1e-10) continue;
 
-                uint64_t new_bs = (uint64_t)kp * chi2 + bond;
-                /* Find or create */
-                int found = -1;
-                for (uint32_t t = 0; t < nout; t++) {
-                    if (tmp[t].basis == new_bs) { found = (int)t; break; }
-                }
-                if (found >= 0) {
-                    tmp[found].re += nr;
-                    tmp[found].im += ni;
-                } else if (nout < max_out) {
-                    tmp[nout].basis = new_bs;
+                if (nout < max_out) {
+                    tmp[nout].basis = (uint64_t)kp * chi2 + bond;
                     tmp[nout].re = nr;
                     tmp[nout].im = ni;
                     nout++;
@@ -298,14 +297,24 @@ void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
             }
         }
 
-        /* Write back */
+        /* Sort by basis state to accumulate duplicates in O(K log K) */
+        qsort(tmp, nout, sizeof(*tmp), mps_cmp_basis);
+
+        /* Write back with combine */
         reg->num_nonzero = 0;
         for (uint32_t t = 0; t < nout; t++) {
-            if (tmp[t].re*tmp[t].re + tmp[t].im*tmp[t].im >= 1e-30 &&
+            double acc_re = tmp[t].re;
+            double acc_im = tmp[t].im;
+            while (t + 1 < nout && tmp[t+1].basis == tmp[t].basis) {
+                t++;
+                acc_re += tmp[t].re;
+                acc_im += tmp[t].im;
+            }
+            if (acc_re*acc_re + acc_im*acc_im >= 1e-10 &&
                 reg->num_nonzero < 4096) {
                 reg->entries[reg->num_nonzero].basis_state = tmp[t].basis;
-                reg->entries[reg->num_nonzero].amp_re = tmp[t].re;
-                reg->entries[reg->num_nonzero].amp_im = tmp[t].im;
+                reg->entries[reg->num_nonzero].amp_re = acc_re;
+                reg->entries[reg->num_nonzero].amp_im = acc_im;
                 reg->num_nonzero++;
             }
         }
@@ -357,7 +366,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
         uint64_t bsA = regA->entries[eA].basis_state;
         double arA = regA->entries[eA].amp_re;
         double aiA = regA->entries[eA].amp_im;
-        if (arA*arA + aiA*aiA < 1e-30) continue;
+        if (arA*arA + aiA*aiA < 1e-10) continue;
 
         int kA = (int)(bsA / chi2);
         int alpha = (int)((bsA / chi) % chi);
@@ -369,7 +378,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
             uint64_t bsB = regB->entries[eB].basis_state;
             double arB = regB->entries[eB].amp_re;
             double aiB = regB->entries[eB].amp_im;
-            if (arB*arB + aiB*aiB < 1e-30) continue;
+            if (arB*arB + aiB*aiB < 1e-10) continue;
 
             int kB = (int)(bsB / chi2);
             int gamma_B = (int)((bsB / chi) % chi);  /* shared bond */
@@ -396,7 +405,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
               int gc = kA * D + kB;
               double gre = G_re[gr * D2 + gc];
               double gim = G_im[gr * D2 + gc];
-              if (fabs(gre) < 1e-30 && fabs(gim) < 1e-30) continue;
+              if (fabs(gre) < 1e-10 && fabs(gim) < 1e-10) continue;
 
               for (int a = 0; a < chi; a++) {
                   int dst_row = kAp * chi + a;
@@ -430,22 +439,26 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     /* ── Step 5: Write back directly to registers ── */
 
     /* Normalize singular values */
+    int rank = chi < dchi ? chi : dchi;
+
     double sig_norm = 0;
-    for (int i = 0; i < chi; i++) sig_norm += sig[i] * sig[i];
-    if (sig_norm > 1e-30) {
+    for (int i = 0; i < rank; i++) sig_norm += sig[i] * sig[i];
+    if (sig_norm > 1e-10) {
         double scale = 1.0 / sqrt(sig_norm);
-        for (int i = 0; i < chi; i++) sig[i] *= scale;
+        for (int i = 0; i < rank; i++) sig[i] *= scale;
     }
 
-    /* A'[kA', α, γ] = U[(kA'*χ+α), γ] */
+    /* A'[kA', α, γ] = √σ[γ] × U[(kA'*χ+α), γ] */
     regA->num_nonzero = 0;
     for (int kA = 0; kA < D; kA++)
      for (int a = 0; a < chi; a++) {
          int row = kA * chi + a;
-         for (int g = 0; g < chi; g++) {
-             double re = U_re[row * chi + g];
-             double im = U_im[row * chi + g];
-             if (re*re + im*im > 1e-30 && regA->num_nonzero < 4096) {
+         for (int g = 0; g < rank; g++) {
+             double sq = sqrt(sig[g]);
+             if (sq < 1e-10) continue;
+             double re = sq * U_re[row * rank + g];
+             double im = sq * U_im[row * rank + g];
+             if (re*re + im*im > 1e-10 && regA->num_nonzero < 4096) {
                  uint64_t bs = (uint64_t)kA * chi2 + (uint64_t)a * chi + g;
                  regA->entries[regA->num_nonzero].basis_state = bs;
                  regA->entries[regA->num_nonzero].amp_re = re;
@@ -455,17 +468,17 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
          }
      }
 
-    /* B'[kB', γ, β] = σ[γ] × V†[γ, (kB'*χ+β)] */
+    /* B'[kB', γ, β] = √σ[γ] × V†[γ, (kB'*χ+β)] */
     regB->num_nonzero = 0;
     for (int kB = 0; kB < D; kB++)
-     for (int g = 0; g < chi; g++) {
-         double s = sig[g];
-         if (s < 1e-30) continue;
+     for (int g = 0; g < rank; g++) {
+         double sq = sqrt(sig[g]);
+         if (sq < 1e-10) continue;
          for (int b = 0; b < chi; b++) {
              int col = kB * chi + b;
-             double re = s * Vc_re[g * dchi + col];
-             double im = s * Vc_im[g * dchi + col];
-             if (re*re + im*im > 1e-30 && regB->num_nonzero < 4096) {
+             double re = sq * Vc_re[g * dchi + col];
+             double im = sq * Vc_im[g * dchi + col];
+             if (re*re + im*im > 1e-10 && regB->num_nonzero < 4096) {
                  uint64_t bs = (uint64_t)kB * chi2 + (uint64_t)g * chi + b;
                  regB->entries[regB->num_nonzero].basis_state = bs;
                  regB->entries[regB->num_nonzero].amp_re = re;
@@ -474,6 +487,34 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
              }
          }
      }
+
+    /* Normalize each register to Σ|amp|² = 1 for density readout */
+    {
+        double norm2 = 0;
+        for (uint32_t e = 0; e < regA->num_nonzero; e++)
+            norm2 += regA->entries[e].amp_re * regA->entries[e].amp_re +
+                     regA->entries[e].amp_im * regA->entries[e].amp_im;
+        if (norm2 > 1e-20) {
+            double inv = 1.0 / sqrt(norm2);
+            for (uint32_t e = 0; e < regA->num_nonzero; e++) {
+                regA->entries[e].amp_re *= inv;
+                regA->entries[e].amp_im *= inv;
+            }
+        }
+    }
+    {
+        double norm2 = 0;
+        for (uint32_t e = 0; e < regB->num_nonzero; e++)
+            norm2 += regB->entries[e].amp_re * regB->entries[e].amp_re +
+                     regB->entries[e].amp_im * regB->entries[e].amp_im;
+        if (norm2 > 1e-20) {
+            double inv = 1.0 / sqrt(norm2);
+            for (uint32_t e = 0; e < regB->num_nonzero; e++) {
+                regB->entries[e].amp_re *= inv;
+                regB->entries[e].amp_im *= inv;
+            }
+        }
+    }
 
     free(U_re); free(U_im);
     free(sig);
