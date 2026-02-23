@@ -227,20 +227,58 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
                                      const double *G_re, const double *G_im)
 {
     int D = TNS3D_D, chi = TNS3D_CHI;
-    int svddim = D * chi * chi;
-    int chi2 = chi * chi;
-
-    /* ── Build Θ from SPARSE register entries ──
-     * Instead of D^7 dense arrays + χ^12 iteration,
-     * iterate nnzA × nnzB pairs matching on shared bond.
-     * Typical: ~36 entries each → 1296 ops per gate. */
-
-    size_t svd2 = (size_t)svddim * svddim;
-    double *Th_re = (double *)calloc(svd2, sizeof(double));
-    double *Th_im = (double *)calloc(svd2, sizeof(double));
+    uint64_t bp[7] = {1, TNS3D_CHI, TNS3D_C2, TNS3D_C3, TNS3D_C4, TNS3D_C5, TNS3D_C6};
+    int bond_A = -1, bond_B = -1;
+    if (shared_axis == 0)      { bond_A = 2; bond_B = 3; } /* X: rA, lB */
+    else if (shared_axis == 1) { bond_A = 1; bond_B = 0; } /* Y: fA, bB */
+    else                       { bond_A = 4; bond_B = 5; } /* Z: dA, uB */
 
     QuhitRegister *regA = &g->eng->registers[g->site_reg[sA]];
     QuhitRegister *regB = &g->eng->registers[g->site_reg[sB]];
+
+    /* ── 1. Find exact Sparse-Rank Environment ──
+     * Cap at χ² unique environments per side to keep SVD at D×χ² max.
+     * This preserves REAL bond configurations instead of synthetic ones. */
+    int max_E = chi * chi;
+    uint64_t *uniq_envA = (uint64_t*)malloc(max_E * sizeof(uint64_t));
+    uint64_t *uniq_envB = (uint64_t*)malloc(max_E * sizeof(uint64_t));
+    int num_EA = 0, num_EB = 0;
+
+    for (uint32_t eA = 0; eA < regA->num_nonzero; eA++) {
+        uint64_t pure = regA->entries[eA].basis_state % TNS3D_C6;
+        uint64_t env = (pure / bp[bond_A + 1]) * bp[bond_A] + (pure % bp[bond_A]);
+        int found = 0;
+        for (int i = 0; i < num_EA; i++) {
+            if (uniq_envA[i] == env) { found = 1; break; }
+        }
+        if (!found && num_EA < max_E) {
+            uniq_envA[num_EA++] = env;
+        }
+    }
+
+    for (uint32_t eB = 0; eB < regB->num_nonzero; eB++) {
+        uint64_t pure = regB->entries[eB].basis_state % TNS3D_C6;
+        uint64_t env = (pure / bp[bond_B + 1]) * bp[bond_B] + (pure % bp[bond_B]);
+        int found = 0;
+        for (int i = 0; i < num_EB; i++) {
+            if (uniq_envB[i] == env) { found = 1; break; }
+        }
+        if (!found && num_EB < max_E) {
+            uniq_envB[num_EB++] = env;
+        }
+    }
+
+    if (num_EA == 0 || num_EB == 0) {
+        free(uniq_envA); free(uniq_envB);
+        return;
+    }
+
+    /* ── 2. Build Θ ── */
+    int svddim_A = D * num_EA;
+    int svddim_B = D * num_EB;
+    size_t svd2 = (size_t)svddim_A * svddim_B;
+    double *Th_re = (double *)calloc(svd2, sizeof(double));
+    double *Th_im = (double *)calloc(svd2, sizeof(double));
 
     for (uint32_t eA = 0; eA < regA->num_nonzero; eA++) {
         uint64_t bsA = regA->entries[eA].basis_state;
@@ -249,24 +287,13 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
         if (arA*arA + aiA*aiA < 1e-30) continue;
 
         int kA = (int)(bsA / TNS3D_C6);
-        int uA = (int)((bsA / TNS3D_C5) % chi);
-        int dA = (int)((bsA / TNS3D_C4) % chi);
-        int lA = (int)((bsA / TNS3D_C3) % chi);
-        int rA = (int)((bsA / TNS3D_C2) % chi);
-        int fA = (int)((bsA / TNS3D_CHI) % chi);
-        int bA_val = (int)(bsA % chi);
-
-        int shared_valA, row;
-        if (shared_axis == 0) {
-            shared_valA = rA;
-            row = kA * chi2 + uA * chi + fA;
-        } else if (shared_axis == 1) {
-            shared_valA = dA;
-            row = kA * chi2 + lA * chi + fA;
-        } else {
-            shared_valA = bA_val;
-            row = kA * chi2 + uA * chi + lA;
-        }
+        uint64_t pureA = bsA % TNS3D_C6;
+        int shared_valA = (int)((pureA / bp[bond_A]) % chi);
+        uint64_t envA = (pureA / bp[bond_A + 1]) * bp[bond_A] + (pureA % bp[bond_A]);
+        
+        int idx_EA = -1;
+        for (int i = 0; i < num_EA; i++) if (uniq_envA[i] == envA) { idx_EA = i; break; }
+        int row = kA * num_EA + idx_EA;
 
         for (uint32_t eB = 0; eB < regB->num_nonzero; eB++) {
             uint64_t bsB = regB->entries[eB].basis_state;
@@ -274,37 +301,26 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
             double aiB = regB->entries[eB].amp_im;
             if (arB*arB + aiB*aiB < 1e-30) continue;
 
-            int kB = (int)(bsB / TNS3D_C6);
-            int uB = (int)((bsB / TNS3D_C5) % chi);
-            int dB = (int)((bsB / TNS3D_C4) % chi);
-            int lB = (int)((bsB / TNS3D_C3) % chi);
-            int rB = (int)((bsB / TNS3D_C2) % chi);
-            int fB = (int)((bsB / TNS3D_CHI) % chi);
-            int bB_val = (int)(bsB % chi);
-
-            int shared_valB, col;
-            if (shared_axis == 0) {
-                shared_valB = lB;
-                col = kB * chi2 + dB * chi + bB_val;
-            } else if (shared_axis == 1) {
-                shared_valB = uB;
-                col = kB * chi2 + rB * chi + bB_val;
-            } else {
-                shared_valB = fB;
-                col = kB * chi2 + dB * chi + rB;
-            }
-
+            uint64_t pureB = bsB % TNS3D_C6;
+            int shared_valB = (int)((pureB / bp[bond_B]) % chi);
             if (shared_valA != shared_valB) continue;
+
+            int kB = (int)(bsB / TNS3D_C6);
+            uint64_t envB = (pureB / bp[bond_B + 1]) * bp[bond_B] + (pureB % bp[bond_B]);
+            
+            int idx_EB = -1;
+            for (int i = 0; i < num_EB; i++) if (uniq_envB[i] == envB) { idx_EB = i; break; }
+            int col = kB * num_EB + idx_EB;
 
             double sw = shared_bw->w[shared_valA];
             double br = arB * sw, bi = aiB * sw;
 
-            Th_re[row * svddim + col] += arA*br - aiA*bi;
-            Th_im[row * svddim + col] += arA*bi + aiA*br;
+            Th_re[row * svddim_B + col] += arA*br - aiA*bi;
+            Th_im[row * svddim_B + col] += arA*bi + aiA*br;
         }
     }
 
-    /* Apply gate */
+    /* ── 3. Apply Gate ── */
     double *Th2_re = (double *)calloc(svd2, sizeof(double));
     double *Th2_im = (double *)calloc(svd2, sizeof(double));
     int D2 = D * D;
@@ -319,106 +335,89 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
               double gim = G_im[gr * D2 + gc];
               if (fabs(gre) < 1e-30 && fabs(gim) < 1e-30) continue;
 
-              for (int i1 = 0; i1 < chi; i1++)
-               for (int i2 = 0; i2 < chi; i2++) {
-                   int dst_row = kAp * chi2 + i1 * chi + i2;
-                   int src_row = kA * chi2 + i1 * chi + i2;
-                   for (int j1 = 0; j1 < chi; j1++)
-                    for (int j2 = 0; j2 < chi; j2++) {
-                        int dst_col = kBp * chi2 + j1 * chi + j2;
-                        int src_col = kB * chi2 + j1 * chi + j2;
-                        double tr = Th_re[src_row * svddim + src_col];
-                        double ti = Th_im[src_row * svddim + src_col];
-                        Th2_re[dst_row * svddim + dst_col] += gre*tr - gim*ti;
-                        Th2_im[dst_row * svddim + dst_col] += gre*ti + gim*tr;
-                    }
-               }
+              for (int eA = 0; eA < num_EA; eA++) {
+                  int dst_row = kAp * num_EA + eA;
+                  int src_row = kA * num_EA + eA;
+                  for (int eB = 0; eB < num_EB; eB++) {
+                      int dst_col = kBp * num_EB + eB;
+                      int src_col = kB * num_EB + eB;
+                      double tr = Th_re[src_row * svddim_B + src_col];
+                      double ti = Th_im[src_row * svddim_B + src_col];
+                      Th2_re[dst_row * svddim_B + dst_col] += gre*tr - gim*ti;
+                      Th2_im[dst_row * svddim_B + dst_col] += gre*ti + gim*tr;
+                  }
+              }
           }
      }
-
     free(Th_re); free(Th_im);
 
-    /* SVD */
-    double *U_re  = (double *)calloc((size_t)svddim * chi, sizeof(double));
-    double *U_im  = (double *)calloc((size_t)svddim * chi, sizeof(double));
+    /* ── 4. SVD ── */
+    double *U_re  = (double *)calloc((size_t)svddim_A * chi, sizeof(double));
+    double *U_im  = (double *)calloc((size_t)svddim_A * chi, sizeof(double));
     double *sig   = (double *)calloc(chi, sizeof(double));
-    double *Vc_re = (double *)calloc((size_t)chi * svddim, sizeof(double));
-    double *Vc_im = (double *)calloc((size_t)chi * svddim, sizeof(double));
+    double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
+    double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_truncated(Th2_re, Th2_im, svddim, svddim, chi,
+    tsvd_truncated(Th2_re, Th2_im, svddim_A, svddim_B, chi,
                    U_re, U_im, sig, Vc_re, Vc_im);
-
     free(Th2_re); free(Th2_im);
 
-    /* Update shared bond weight */
     double sig_norm = 0;
     for (int s = 0; s < chi; s++) sig_norm += sig[s];
     if (sig_norm > 1e-30)
         for (int s = 0; s < chi; s++) shared_bw->w[s] = sig[s] / sig_norm;
 
-    /* Write back directly to registers (sparse) */
+    /* ── 5. Write back safely ── */
     regA->num_nonzero = 0;
     regB->num_nonzero = 0;
 
     for (int kA = 0; kA < D; kA++)
-     for (int i1 = 0; i1 < chi; i1++)
-      for (int i2 = 0; i2 < chi; i2++) {
-          int row = kA * chi2 + i1 * chi + i2;
-          for (int gv = 0; gv < chi; gv++) {
-              double re = U_re[row * chi + gv];
-              double im = U_im[row * chi + gv];
-              if (re*re + im*im < 1e-30) continue;
+     for (int eA = 0; eA < num_EA; eA++) {
+         int row = kA * num_EA + eA;
+         uint64_t envA = uniq_envA[eA];
+         uint64_t pure = (envA / bp[bond_A]) * bp[bond_A + 1] + (envA % bp[bond_A]);
+         for (int gv = 0; gv < chi; gv++) {
+             double re = U_re[row * chi + gv];
+             double im = U_im[row * chi + gv];
+             if (re*re + im*im < 1e-30) continue;
 
-              uint64_t bs;
-              if (shared_axis == 0)
-                  bs = T3D_IDX(kA, i1, 0, 0, gv, i2, 0);
-              else if (shared_axis == 1)
-                  bs = T3D_IDX(kA, 0, gv, i1, 0, i2, 0);
-              else
-                  bs = T3D_IDX(kA, i1, 0, i2, 0, 0, gv);
-
-              if (regA->num_nonzero < 4096) {
-                  regA->entries[regA->num_nonzero].basis_state = bs;
-                  regA->entries[regA->num_nonzero].amp_re = re;
-                  regA->entries[regA->num_nonzero].amp_im = im;
-                  regA->num_nonzero++;
-              }
-          }
-      }
+             uint64_t bs = kA * TNS3D_C6 + pure + gv * bp[bond_A];
+             if (regA->num_nonzero < 4096) {
+                 regA->entries[regA->num_nonzero].basis_state = bs;
+                 regA->entries[regA->num_nonzero].amp_re = re;
+                 regA->entries[regA->num_nonzero].amp_im = im;
+                 regA->num_nonzero++;
+             }
+         }
+     }
 
     for (int kB = 0; kB < D; kB++)
-     for (int j1 = 0; j1 < chi; j1++)
-      for (int j2 = 0; j2 < chi; j2++) {
-          int col = kB * chi2 + j1 * chi + j2;
-          for (int gv = 0; gv < chi; gv++) {
-              double s = sig[gv];
-              if (s < 1e-30) continue;
-              double re = s * Vc_re[gv * svddim + col];
-              double im = s * Vc_im[gv * svddim + col];
-              if (re*re + im*im < 1e-30) continue;
+     for (int eB = 0; eB < num_EB; eB++) {
+         int col = kB * num_EB + eB;
+         uint64_t envB = uniq_envB[eB];
+         uint64_t pure = (envB / bp[bond_B]) * bp[bond_B + 1] + (envB % bp[bond_B]);
+         for (int gv = 0; gv < chi; gv++) {
+             double s = sig[gv];
+             if (s < 1e-30) continue;
+             double re = s * Vc_re[gv * svddim_B + col];
+             double im = s * Vc_im[gv * svddim_B + col];
+             if (re*re + im*im < 1e-30) continue;
 
-              uint64_t bs;
-              if (shared_axis == 0)
-                  bs = T3D_IDX(kB, 0, j1, gv, 0, 0, j2);
-              else if (shared_axis == 1)
-                  bs = T3D_IDX(kB, gv, j1, 0, j2, 0, 0);
-              else
-                  bs = T3D_IDX(kB, j1, 0, 0, j2, gv, 0);
-
-              if (regB->num_nonzero < 4096) {
-                  regB->entries[regB->num_nonzero].basis_state = bs;
-                  regB->entries[regB->num_nonzero].amp_re = re;
-                  regB->entries[regB->num_nonzero].amp_im = im;
-                  regB->num_nonzero++;
-              }
-          }
-      }
+             uint64_t bs = kB * TNS3D_C6 + pure + gv * bp[bond_B];
+             if (regB->num_nonzero < 4096) {
+                 regB->entries[regB->num_nonzero].basis_state = bs;
+                 regB->entries[regB->num_nonzero].amp_re = re;
+                 regB->entries[regB->num_nonzero].amp_im = im;
+                 regB->num_nonzero++;
+             }
+         }
+     }
 
     free(U_re); free(U_im);
     free(sig);
     free(Vc_re); free(Vc_im);
+    free(uniq_envA); free(uniq_envB);
 
-    /* Mirror to engine quhits */
     if (g->eng && g->q_phys)
         quhit_apply_cz(g->eng, g->q_phys[sA], g->q_phys[sB]);
 }
