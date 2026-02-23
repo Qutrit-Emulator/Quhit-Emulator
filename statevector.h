@@ -53,6 +53,8 @@ typedef struct {
  * ALLOCATE — aligned to cache line boundary
  * ═══════════════════════════════════════════════════════════ */
 
+void *sv_calloc_aligned(size_t num, size_t size);
+
 static inline StateVector sv_alloc(uint64_t dim) {
     StateVector sv;
     sv.dim = dim;

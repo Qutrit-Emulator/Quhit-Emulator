@@ -141,6 +141,17 @@ void tns3d_set_product_state(Tns3dGrid *g, int x, int y, int z,
 
 /* ═══════════════ 1-SITE GATE ═══════════════ */
 
+struct tmp_entry { uint64_t basis; double re, im; };
+
+static int cmp_basis(const void *a, const void *b)
+{
+    const struct tmp_entry *ea = (const struct tmp_entry *)a;
+    const struct tmp_entry *eb = (const struct tmp_entry *)b;
+    if (ea->basis < eb->basis) return -1;
+    if (ea->basis > eb->basis) return 1;
+    return 0;
+}
+
 void tns3d_gate_1site(Tns3dGrid *g, int x, int y, int z,
                       const double *U_re, const double *U_im)
 {
@@ -167,6 +178,11 @@ void tns3d_gate_1site(Tns3dGrid *g, int x, int y, int z,
 
     r->num_nonzero = 0;
 
+    uint32_t max_out = old_n * D + 1;
+    if (max_out < 4096) max_out = 4096;
+    struct tmp_entry *tmp = calloc(max_out, sizeof(*tmp));
+    uint32_t nout = 0;
+
     for (int kp = 0; kp < D; kp++) {
         for (uint32_t e = 0; e < old_n; e++) {
             uint64_t bs = old_bs[e];
@@ -176,37 +192,43 @@ void tns3d_gate_1site(Tns3dGrid *g, int x, int y, int z,
 
             double gre = U_re[kp * D + k];
             double gim = U_im[kp * D + k];
-            if (gre*gre + gim*gim < 1e-30) continue;
+            if (gre*gre + gim*gim < 1e-10) continue;
 
             double are = old_re[e], aim = old_im[e];
             double new_re = gre*are - gim*aim;
             double new_im = gre*aim + gim*are;
 
-            uint64_t new_bs = (uint64_t)kp * TNS3D_C6 + bond_part;
-
-            /* Accumulate — check if this basis already exists */
-            int found = 0;
-            for (uint32_t f = 0; f < r->num_nonzero; f++) {
-                if (r->entries[f].basis_state == new_bs) {
-                    r->entries[f].amp_re += new_re;
-                    r->entries[f].amp_im += new_im;
-                    found = 1;
-                    break;
-                }
-            }
-            if (!found && r->num_nonzero < 4096) {
-                r->entries[r->num_nonzero].basis_state = new_bs;
-                r->entries[r->num_nonzero].amp_re = new_re;
-                r->entries[r->num_nonzero].amp_im = new_im;
-                r->num_nonzero++;
+            if (nout < max_out) {
+                tmp[nout].basis = (uint64_t)kp * TNS3D_C6 + bond_part;
+                tmp[nout].re = new_re;
+                tmp[nout].im = new_im;
+                nout++;
             }
         }
     }
 
-    free(old_bs); free(old_re); free(old_im);
+    qsort(tmp, nout, sizeof(struct tmp_entry), cmp_basis);
 
-    if (g->eng && g->q_phys)
-        quhit_apply_unitary(g->eng, g->q_phys[site], U_re, U_im);
+    r->num_nonzero = 0;
+    for (uint32_t t = 0; t < nout; t++) {
+        double acc_re = tmp[t].re;
+        double acc_im = tmp[t].im;
+        while (t + 1 < nout && tmp[t+1].basis == tmp[t].basis) {
+            t++;
+            acc_re += tmp[t].re;
+            acc_im += tmp[t].im;
+        }
+        if (acc_re*acc_re + acc_im*acc_im >= 1e-10 &&
+            r->num_nonzero < 4096) {
+            r->entries[r->num_nonzero].basis_state = tmp[t].basis;
+            r->entries[r->num_nonzero].amp_re = acc_re;
+            r->entries[r->num_nonzero].amp_im = acc_im;
+            r->num_nonzero++;
+        }
+    }
+
+    free(tmp);
+    free(old_bs); free(old_re); free(old_im);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -284,7 +306,7 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
         uint64_t bsA = regA->entries[eA].basis_state;
         double arA = regA->entries[eA].amp_re;
         double aiA = regA->entries[eA].amp_im;
-        if (arA*arA + aiA*aiA < 1e-30) continue;
+        if (arA*arA + aiA*aiA < 1e-10) continue;
 
         int kA = (int)(bsA / TNS3D_C6);
         uint64_t pureA = bsA % TNS3D_C6;
@@ -293,13 +315,14 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
         
         int idx_EA = -1;
         for (int i = 0; i < num_EA; i++) if (uniq_envA[i] == envA) { idx_EA = i; break; }
+        if (idx_EA < 0) continue;
         int row = kA * num_EA + idx_EA;
 
         for (uint32_t eB = 0; eB < regB->num_nonzero; eB++) {
             uint64_t bsB = regB->entries[eB].basis_state;
             double arB = regB->entries[eB].amp_re;
             double aiB = regB->entries[eB].amp_im;
-            if (arB*arB + aiB*aiB < 1e-30) continue;
+            if (arB*arB + aiB*aiB < 1e-10) continue;
 
             uint64_t pureB = bsB % TNS3D_C6;
             int shared_valB = (int)((pureB / bp[bond_B]) % chi);
@@ -310,6 +333,7 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
             
             int idx_EB = -1;
             for (int i = 0; i < num_EB; i++) if (uniq_envB[i] == envB) { idx_EB = i; break; }
+            if (idx_EB < 0) continue;
             int col = kB * num_EB + idx_EB;
 
             double sw = shared_bw->w[shared_valA];
@@ -333,7 +357,7 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
               int gc = kA * D + kB;
               double gre = G_re[gr * D2 + gc];
               double gim = G_im[gr * D2 + gc];
-              if (fabs(gre) < 1e-30 && fabs(gim) < 1e-30) continue;
+              if (fabs(gre) < 1e-10 && fabs(gim) < 1e-10) continue;
 
               for (int eA = 0; eA < num_EA; eA++) {
                   int dst_row = kAp * num_EA + eA;
@@ -362,10 +386,13 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
                    U_re, U_im, sig, Vc_re, Vc_im);
     free(Th2_re); free(Th2_im);
 
+    int rank = chi < svddim_B ? chi : svddim_B;
+    if (rank > svddim_A) rank = svddim_A;
+
     double sig_norm = 0;
-    for (int s = 0; s < chi; s++) sig_norm += sig[s];
-    if (sig_norm > 1e-30)
-        for (int s = 0; s < chi; s++) shared_bw->w[s] = sig[s] / sig_norm;
+    for (int s = 0; s < rank; s++) sig_norm += sig[s];
+    if (sig_norm > 1e-10)
+        for (int s = 0; s < rank; s++) shared_bw->w[s] = sig[s] / sig_norm;
 
     /* ── 5. Write back safely ── */
     regA->num_nonzero = 0;
@@ -376,10 +403,10 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
          int row = kA * num_EA + eA;
          uint64_t envA = uniq_envA[eA];
          uint64_t pure = (envA / bp[bond_A]) * bp[bond_A + 1] + (envA % bp[bond_A]);
-         for (int gv = 0; gv < chi; gv++) {
-             double re = U_re[row * chi + gv];
-             double im = U_im[row * chi + gv];
-             if (re*re + im*im < 1e-30) continue;
+         for (int gv = 0; gv < rank; gv++) {
+             double re = U_re[row * rank + gv];
+             double im = U_im[row * rank + gv];
+             if (re*re + im*im < 1e-10) continue;
 
              uint64_t bs = kA * TNS3D_C6 + pure + gv * bp[bond_A];
              if (regA->num_nonzero < 4096) {
@@ -396,12 +423,12 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
          int col = kB * num_EB + eB;
          uint64_t envB = uniq_envB[eB];
          uint64_t pure = (envB / bp[bond_B]) * bp[bond_B + 1] + (envB % bp[bond_B]);
-         for (int gv = 0; gv < chi; gv++) {
+         for (int gv = 0; gv < rank; gv++) {
              double s = sig[gv];
-             if (s < 1e-30) continue;
+             if (s < 1e-10) continue;
              double re = s * Vc_re[gv * svddim_B + col];
              double im = s * Vc_im[gv * svddim_B + col];
-             if (re*re + im*im < 1e-30) continue;
+             if (re*re + im*im < 1e-10) continue;
 
              uint64_t bs = kB * TNS3D_C6 + pure + gv * bp[bond_B];
              if (regB->num_nonzero < 4096) {
@@ -417,10 +444,8 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
     free(sig);
     free(Vc_re); free(Vc_im);
     free(uniq_envA); free(uniq_envB);
-
-    if (g->eng && g->q_phys)
-        quhit_apply_cz(g->eng, g->q_phys[sA], g->q_phys[sB]);
 }
+
 
 /* ═══════════════ AXIS WRAPPERS ═══════════════ */
 
