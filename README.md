@@ -111,20 +111,48 @@ Key register capabilities:
 - **Partial trace** to any single quhit position
 - **Inner product** between registers via sparse entry matching
 
-### MPS Engine (χ=128, Randomized SVD, OpenMP)
+### Tensor Network Engines — Register-Based SVD
 
-For circuits requiring N-body entanglement beyond strict pairwise bonds, the engine provides a **Matrix Product State** representation with randomized truncated SVD:
+For circuits requiring N-body entanglement beyond strict pairwise bonds, the engine provides three tensor network representations. All use **Magic Pointer registers** for RAM-agnostic storage with **Jacobi SVD** for proper 2-site gates.
 
-- Bond dimension **χ = 128** → max entanglement S_max = log₂(128) = **7.0 ebits** per bond
-- Storage: **D × χ² = 98,304** complex entries per site (1,536 KB/site)
-- **Lossless** for states with S ≤ 7.0 ebits — SVD reconstruction error at **machine epsilon** (10⁻¹⁶)
-- **Randomized truncated SVD** ([Halko-Martinsson-Tropp 2011](https://arxiv.org/abs/0909.4061)) — 5.5× faster than full SVD
-- **OpenMP parallelization** — 9 matrix multiplications in the SVD pipeline parallelized across all cores
-- Bi-directional sweeps (L→R, R→L) with correct V^H write-back
+#### Architecture: Hybrid Storage + Computation
+
+| Layer | Where | Persistent? |
+|---|---|---|
+| **Tensor data** | Register sparse entries (Magic Pointer) | ✅ RAM-agnostic |
+| **SVD computation** | Heap-allocated dense buffers | ❌ Freed after each gate |
+| **Bond weights** | Classical arrays (λ) | ✅ O(χ) per bond |
+
+Each 2-site gate performs: **Register Read → Dense Contraction → Gate Application → Jacobi SVD → Truncate to χ → Register Writeback**.
+
+#### MPS — Matrix Product State (χ=128)
+
+- 3-index tensor: T[k, α, β] — physical × left bond × right bond
+- SVD dimension: **768 × 768** (D×χ = 6×128)
+- Per-gate SVD time: **~1.7 seconds** (Jacobi eigendecomposition)
 - **Lazy evaluation** engine with deferred gate queue and automatic site allocation
-- Gauge-independent entropy via L×R transfer matrix contraction with **progressive per-site normalization** (prevents numerical overflow at large N)
+- Bi-directional sweeps (L→R, R→L)
 
-> **Gold Standard**: 105 qudits × 25 cycles + **20 substrate opcodes** (6¹⁰⁵ ≈ **10⁸² Hilbert space dimensions** — more than atoms in the universe) simulated in **6.9 minutes** using **165 MB** on a single machine. **S(N/2) = 6.9960 ebits (99.9% of max)**. Full state vector would require 10⁸³ bytes — a **10⁷⁴× compression ratio**.
+#### PEPS 2D — Projected Entangled Pair States (χ=12)
+
+- 5-index tensor: T[k, u, d, l, r] — physical × up × down × left × right
+- SVD dimension: **864 × 864** (D×χ² = 6×144)
+- **Simple update** with environment bond weight absorption
+- Red-black checkerboard parallelism via OpenMP
+- Non-trivial entangled distributions after multi-round Trotter evolution
+
+#### PEPS 3D — 3D Tensor Network State (χ=6)
+
+- 7-index tensor: T[k, u, d, l, r, f, b] — physical × 6 bond directions
+- SVD dimension: **216 × 216** (D×χ² = 6×36)
+- Generic axis gate: handles X, Y, Z bond directions via a single parametric function
+- Bond weights per axis (x, y, z) updated during SVD
+
+#### Shared Jacobi SVD Utility (`tensor_svd.h`)
+
+- **`tsvd_jacobi_hermitian`** — Eigendecomposition of Hermitian M†M via cyclic Jacobi rotations
+- **`tsvd_truncated`** — Full pipeline: M†M → eigendecompose → reconstruct U, σ, V† → truncate to rank k
+- Header-only, zero dependencies, shared across all three tensor networks
 
 ---
 
@@ -245,20 +273,39 @@ The CZ gate is the primary entanglement-creating operation. If the two quhits ar
 
 For entangled quhits, measurement computes marginal probabilities from the joint state, samples via Born rule, performs partial collapse, renormalizes with `born_fast_isqrt`, and extracts the partner's post-measurement state.
 
-### MPS Engine Operations
+### Tensor Network Operations
+
+#### MPS Operations
 
 | Operation | Description | Cost |
 |---|---|---|
-| `mps_gate_1site` | Single-site unitary | O(D² × χ²) |
-| `mps_gate_2site` | Two-site gate + randomized SVD | O(D²χ² × k) |
+| `mps_gate_1site` | Register-based physical index rotation | O(entries × D) |
+| `mps_gate_2site` | Contraction + CZ₆ gate + Jacobi SVD + writeback | O(DCHI³) |
 | `mps_lazy_gate_1site` | Deferred single-site gate | O(1) enqueue |
 | `mps_lazy_gate_2site` | Deferred two-site gate | O(1) enqueue |
 | `mps_lazy_flush` | Materialize all queued gates | O(gates × cost) |
 | `mps_overlay_measure` | Full L-R environment contraction | O(N × χ³ × D) |
 | `mps_overlay_amplitude` | Transfer-matrix ⟨basis\|ψ⟩ | O(N × χ²) |
 | `mps_overlay_norm` | Global norm ⟨ψ\|ψ⟩ via transfer | O(N × χ³ × D) |
-| `mps_build_dft6` | Construct DFT₆ gate matrix | O(D²) |
-| `mps_build_cz` | Construct CZ gate matrix | O(D⁴) |
+
+#### PEPS 2D Operations
+
+| Operation | Description | Cost |
+|---|---|---|
+| `peps_gate_1site` | Register-based unitary at physical position | O(entries × D) |
+| `peps_gate_horizontal` | Horizontal bond SVD with env weight absorption | O(SVDDIM³) |
+| `peps_gate_vertical` | Vertical bond SVD with env weight absorption | O(SVDDIM³) |
+| `peps_local_density` | Marginal probabilities from register sparse entries | O(entries) |
+| `peps_trotter_step` | H-bonds + V-bonds (red-black parallel) | O(sites × SVDDIM³) |
+
+#### PEPS 3D Operations
+
+| Operation | Description | Cost |
+|---|---|---|
+| `tns3d_gate_1site` | Register-based unitary at physical position 6 | O(entries × D) |
+| `tns3d_gate_x/y/z` | Axis-specific 2-site SVD via generic function | O(SVDDIM³) |
+| `tns3d_trotter_step` | X + Y + Z axis gates (red-black parallel) | O(sites × SVDDIM³) |
+| `tns3d_local_density` | Physical index extraction from register | O(entries) |
 
 ---
 
@@ -504,12 +551,17 @@ HexState-main/
 ├── quhit_gates.c         DFT₆, IDFT₆, CZ, unitary, phase, X, Z
 ├── quhit_measure.c       Born-rule measurement, collapse, inspection
 ├── quhit_entangle.c      Bell pairs, product pairs, disentangle
-├── quhit_register.c      Register operations, GHZ, streaming SV access
+├── quhit_register.c      Register ops, GHZ, streaming SV, heap buffers
 │  └────────────────────────────────────────────────────────────┘
 │
-│  ┌─ MPS Engine ───────────────────────────────────────────────┐
-├── mps_overlay.h         MPS tensor network header (χ=128)
-├── mps_overlay.c         Init, 1-site/2-site gates, SVD, measurement
+│  ┌─ Tensor Networks (Register-Based SVD) ─────────────────────┐
+├── tensor_svd.h          Shared Jacobi SVD (eigendecomp + truncation)
+├── mps_overlay.h         MPS header: Magic Pointer tensor (4 B/site)
+├── mps_overlay.c         MPS gates, register-based 768×768 Jacobi SVD
+├── peps_overlay.h        PEPS 2D header: 5-index tensor (χ=12)
+├── peps_overlay.c        PEPS 2D gates, simple-update 864×864 SVD
+├── peps3d_overlay.h      PEPS 3D header: 7-index tensor (χ=6)
+├── peps3d_overlay.c      PEPS 3D gates, generic axis 216×216 SVD
 │  └────────────────────────────────────────────────────────────┘
 │
 │  ┌─ Substrate ISA ─────────────────────────────────────────────┐
@@ -528,8 +580,10 @@ HexState-main/
 ├── tensor_network.h      TN/MPS data structures and API declarations
 │  └────────────────────────────────────────────────────────────┘
 │
-│  ┌─ Benchmarks ────────────────────────────────────────────────┐
-├── willow_substrate.c    Substrate-enriched Willow benchmark (20 opcodes)
+│  ┌─ Benchmarks & Tests ────────────────────────────────────────┐
+├── willow_substrate.c    Substrate-enriched Willow benchmark
+├── test_peps_svd.c       PEPS 2D + 3D verification suite
+├── test_mps_svd.c        MPS χ=128 verification suite
 ├── entropy_diag.c        Minimal entropy diagnostic tool
 │  └────────────────────────────────────────────────────────────┘
 │
@@ -549,7 +603,8 @@ HexState-main/
 | **Quhit storage** | Embedded in chunk shadow cache | Standalone `QuhitState` (96 B) |
 | **Entanglement** | Braid links + shadow resolution | Direct `QuhitJoint` (576 B) |
 | **Gate code** | Mixed into 427-line `measure_chunk` | Dedicated `quhit_gates.c` |
-| **MPS support** | None | Full χ=128 engine with randomized truncated SVD + OpenMP + lazy eval |
+| **Tensor networks** | None | MPS (χ=128) + PEPS 2D (χ=12) + PEPS 3D (χ=6) with register-based SVD |
+| **Tensor storage** | N/A | Magic Pointer registers — 4 bytes per site, RAM-agnostic |
 | **Side channels** | Interleaved with engine logic | 7 independent header-only primitives |
 | **Measurement** | Single monolithic function | Separate local / entangled / register paths |
 | **Constants** | Computed at runtime | Hex-exact, precomputed in headers |
@@ -581,38 +636,30 @@ The engine's strict pairwise monogamy produces GHZ states with a property: regar
 
 ## Benchmarks
 
-### Quantum Supremacy Challenge (χ=128, OpenMP)
+### Tensor Network SVD Verification
 
-#### vs Google Willow — 105 qudits, 25 cycles
+| Network | Grid | χ | SVD Dim | Tests | Result |
+|---|---|---|---|---|---|
+| **MPS** | 8-site chain | 128 | 768×768 | Product, Hadamard, CZ chain, 3 sweeps | **ALL PASSED ✓** |
+| **PEPS 2D** | 2×2 | 12 | 864×864 | Product, Hadamard, CZ horiz/vert, 5 rounds | **ALL PASSED ✓** |
+| **PEPS 3D** | 2×2×2 | 6 | 216×216 | Product, Hadamard, CZ on X/Y/Z, 5 Trotter | **ALL PASSED ✓** |
 
-| | **Google Willow** | **HexState V2 + Substrate ISA** |
-|---|---|---|
-| **Time** | < 5 minutes | **6.9 minutes** |
-| **Qubits/Qudits** | 105 qubits (D=2) | 105 qudits (D=6) |
-| **Hilbert space** | 2¹⁰⁵ ≈ 10³¹ | 6¹⁰⁵ ≈ **10⁸²** |
-| **Entanglement** | XEB ≈ 0.1% | **S(N/2) = 6.9960 ebits (99.9% of max)** |
-| **Cost** | ~$50M quantum processor | `gcc -fopenmp *.c -lm` |
-| **Gate set** | 4 gates {√X, √Y, √W, CZ} | **22 gates** {U(6), CZ₆} + 20 substrate opcodes |
-| **Total gates** | 3,925 | **13,125** (3,925 standard + 9,200 substrate) |
-| **Substrate density** | N/A | **70.1%** of all operations |
-| **Memory** | N/A | **165 MB** |
+#### MPS SVD Timing (χ=128, 768×768 Jacobi)
 
-> **Near-maximal entanglement**: S(N/2) = 6.9960 ebits — **99.9% of the theoretical maximum** — achieved with a 22-gate instruction set that includes 20 substrate opcodes derived from the physical substrate's own machine code. Google's Willow achieves ~0.1% XEB fidelity.
+| Test | Gates | Time | Per Gate |
+|---|---|---|---|
+| Single CZ₆ | 1 | 1.80 s | 1.80 s |
+| CZ chain (8 sites) | 7 | 11.59 s | 1.66 s |
+| 3 full sweeps | 21 | 305.6 s | 14.6 s |
 
-> **10⁸² dimensions — more than atoms in the observable universe (~10⁸⁰)**. Completed in 6.9 minutes on a laptop. Google claimed the equivalent computation "would take 10²⁵ years classically."
+#### PEPS 2D Sample Densities (after 5 rounds H + CZ₆)
+
+```
+Site(0,1): [0.06, 0.09, 0.10, 0.72, 0.01, 0.01]  — peaked at k=3
+Site(1,1): [0.26, 0.21, 0.23, 0.15, 0.06, 0.09]  — spread across levels
+```
 
 ---
-
-### Build & Run
-
-```bash
-
-# Substrate-enriched Willow (105 qudits, 25 cycles, 20 opcodes)
-gcc -O2 -std=gnu99 -fopenmp willow_substrate.c quhit_core.c \
-    quhit_gates.c quhit_measure.c quhit_entangle.c quhit_register.c \
-    quhit_substrate.c mps_overlay.c bigint.c -lm -o willow_substrate
-./willow_substrate
-```
 
 ## License
 
