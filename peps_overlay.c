@@ -230,17 +230,50 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
         for (int s = 0; s < chi; s++) wr_B[s] = hb->w[s];
     } else { for (int s = 0; s < chi; s++) wr_B[s] = 1.0; }
 
-    /* ── 2. Contract Θ from SPARSE entries ──
+    /* ── 2. Sparse-Rank Environment Extraction ──
      * Horizontal: shared = r_A = l_B
-     * Row = (kA, u, l)  Col = (kB, d, r)
-     * Sum over shared γ and env bonds (d_A, u_B) */
-
-    size_t svd2 = (size_t)svddim * svddim;
-    double *Th_re = (double *)calloc(svd2, sizeof(double));
-    double *Th_im = (double *)calloc(svd2, sizeof(double));
+     * A env = (u, d, l) with shared bond r removed
+     * B env = (u, d, r) with shared bond l removed
+     * Preserves ALL bond values — no zeroing */
 
     QuhitRegister *regA = &grid->eng->registers[grid->site_reg[sA]];
     QuhitRegister *regB = &grid->eng->registers[grid->site_reg[sB]];
+
+    int max_E = chi * chi;
+    uint64_t *uniq_envA = (uint64_t*)malloc(max_E * sizeof(uint64_t));
+    uint64_t *uniq_envB = (uint64_t*)malloc(max_E * sizeof(uint64_t));
+    int num_EA = 0, num_EB = 0;
+
+    /* A env = u*chi2 + d*chi + l (drop r which is shared) */
+    for (uint32_t eA = 0; eA < regA->num_nonzero; eA++) {
+        uint64_t bs = regA->entries[eA].basis_state;
+        uint64_t env = (bs / PEPS_CHI) % PEPS_CHI3; /* u*chi2+d*chi+l */
+        int found = 0;
+        for (int i = 0; i < num_EA; i++) if (uniq_envA[i] == env) { found = 1; break; }
+        if (!found && num_EA < max_E) uniq_envA[num_EA++] = env;
+    }
+
+    /* B env = u*chi2 + d*chi + r (drop l which is shared) */
+    for (uint32_t eB = 0; eB < regB->num_nonzero; eB++) {
+        uint64_t bs = regB->entries[eB].basis_state;
+        int uB = (int)((bs / PEPS_CHI3) % chi);
+        int dB = (int)((bs / PEPS_CHI2) % chi);
+        int rB = (int)(bs % chi);
+        uint64_t env = (uint64_t)uB * chi2 + dB * chi + rB;
+        int found = 0;
+        for (int i = 0; i < num_EB; i++) if (uniq_envB[i] == env) { found = 1; break; }
+        if (!found && num_EB < max_E) uniq_envB[num_EB++] = env;
+    }
+
+    if (num_EA == 0 || num_EB == 0) {
+        free(uniq_envA); free(uniq_envB); return;
+    }
+
+    int svddim_A = D * num_EA;
+    int svddim_B = D * num_EB;
+    size_t svd2 = (size_t)svddim_A * svddim_B;
+    double *Th_re = (double *)calloc(svd2, sizeof(double));
+    double *Th_im = (double *)calloc(svd2, sizeof(double));
 
     for (uint32_t eA = 0; eA < regA->num_nonzero; eA++) {
         uint64_t bsA = regA->entries[eA].basis_state;
@@ -252,11 +285,16 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
         int uA = (int)((bsA / PEPS_CHI3) % chi);
         int dA = (int)((bsA / PEPS_CHI2) % chi);
         int lA = (int)((bsA / PEPS_CHI) % chi);
-        int rA = (int)(bsA % chi);  /* shared bond */
+        int rA = (int)(bsA % chi);
+
+        uint64_t envA = (uint64_t)uA * chi2 + dA * chi + lA;
+        int idx_EA = -1;
+        for (int i = 0; i < num_EA; i++) if (uniq_envA[i] == envA) { idx_EA = i; break; }
+        if (idx_EA < 0) continue;
 
         double wA = wu_A[uA] * wd_A[dA] * wl_A[lA];
         double arAw = arA * wA, aiAw = aiA * wA;
-        int row = kA * chi2 + uA * chi + lA;
+        int row = kA * num_EA + idx_EA;
 
         for (uint32_t eB = 0; eB < regB->num_nonzero; eB++) {
             uint64_t bsB = regB->entries[eB].basis_state;
@@ -267,21 +305,26 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
             int kB = (int)(bsB / PEPS_CHI4);
             int uB = (int)((bsB / PEPS_CHI3) % chi);
             int dB = (int)((bsB / PEPS_CHI2) % chi);
-            int lB = (int)((bsB / PEPS_CHI) % chi);  /* shared bond */
+            int lB = (int)((bsB / PEPS_CHI) % chi);
             int rB = (int)(bsB % chi);
 
-            if (rA != lB) continue;  /* shared bond must match */
+            if (rA != lB) continue;
+
+            uint64_t envB = (uint64_t)uB * chi2 + dB * chi + rB;
+            int idx_EB = -1;
+            for (int i = 0; i < num_EB; i++) if (uniq_envB[i] == envB) { idx_EB = i; break; }
+            if (idx_EB < 0) continue;
 
             double wB = wu_B[uB] * wd_B[dB] * wr_B[rB] * wh[rA];
             double br = arB * wB, bi = aiB * wB;
-            int col = kB * chi2 + dB * chi + rB;
+            int col = kB * num_EB + idx_EB;
 
-            Th_re[row * svddim + col] += arAw*br - aiAw*bi;
-            Th_im[row * svddim + col] += arAw*bi + aiAw*br;
+            Th_re[row * svddim_B + col] += arAw*br - aiAw*bi;
+            Th_im[row * svddim_B + col] += arAw*bi + aiAw*br;
         }
     }
 
-    /* ── 3. Apply gate ── */
+    /* ── 3. Apply Gate ── */
     double *Th2_re = (double *)calloc(svd2, sizeof(double));
     double *Th2_im = (double *)calloc(svd2, sizeof(double));
     int D2 = D * D;
@@ -296,35 +339,31 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
               double gim = G_im[gr * D2 + gc];
               if (fabs(gre) < 1e-30 && fabs(gim) < 1e-30) continue;
 
-              for (int u = 0; u < chi; u++)
-               for (int l = 0; l < chi; l++) {
-                   int dst_row = kAp * chi2 + u * chi + l;
-                   int src_row = kA * chi2 + u * chi + l;
-                   for (int d = 0; d < chi; d++)
-                    for (int r = 0; r < chi; r++) {
-                        int dst_col = kBp * chi2 + d * chi + r;
-                        int src_col = kB * chi2 + d * chi + r;
-                        double tr = Th_re[src_row * svddim + src_col];
-                        double ti = Th_im[src_row * svddim + src_col];
-                        Th2_re[dst_row * svddim + dst_col] += gre*tr - gim*ti;
-                        Th2_im[dst_row * svddim + dst_col] += gre*ti + gim*tr;
-                    }
-               }
+              for (int eA = 0; eA < num_EA; eA++) {
+                  int dst_row = kAp * num_EA + eA;
+                  int src_row = kA * num_EA + eA;
+                  for (int eB = 0; eB < num_EB; eB++) {
+                      int dst_col = kBp * num_EB + eB;
+                      int src_col = kB * num_EB + eB;
+                      double tr = Th_re[src_row * svddim_B + src_col];
+                      double ti = Th_im[src_row * svddim_B + src_col];
+                      Th2_re[dst_row * svddim_B + dst_col] += gre*tr - gim*ti;
+                      Th2_im[dst_row * svddim_B + dst_col] += gre*ti + gim*tr;
+                  }
+              }
           }
      }
-
     free(Th_re); free(Th_im);
 
     /* ── 4. SVD ── */
-    double *U_re  = (double *)calloc((size_t)svddim * chi, sizeof(double));
-    double *U_im  = (double *)calloc((size_t)svddim * chi, sizeof(double));
+    double *U_re  = (double *)calloc((size_t)svddim_A * chi, sizeof(double));
+    double *U_im  = (double *)calloc((size_t)svddim_A * chi, sizeof(double));
     double *sig   = (double *)calloc(chi, sizeof(double));
-    double *Vc_re = (double *)calloc((size_t)chi * svddim, sizeof(double));
-    double *Vc_im = (double *)calloc((size_t)chi * svddim, sizeof(double));
+    double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
+    double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_truncated(Th2_re, Th2_im, svddim, svddim, chi,
+    tsvd_truncated(Th2_re, Th2_im, svddim_A, svddim_B, chi,
                    U_re, U_im, sig, Vc_re, Vc_im);
-
     free(Th2_re); free(Th2_im);
 
     /* ── 5. Update bond weight ── */
@@ -333,52 +372,59 @@ void peps_gate_horizontal(PepsGrid *grid, int x, int y,
     if (sig_norm > 1e-30)
         for (int s = 0; s < chi; s++) hb_shared->w[s] = sig[s] / sig_norm;
 
-    /* ── 6. Write back directly to registers ── */
+    /* ── 6. Write back — preserving ALL bond values ── */
     regA->num_nonzero = 0;
     for (int kA = 0; kA < D; kA++)
-     for (int u = 0; u < chi; u++)
-      for (int l = 0; l < chi; l++) {
-          int row = kA * chi2 + u * chi + l;
-          double invw = 1.0;
-          if (wu_A[u] > 1e-30) invw /= wu_A[u];
-          if (wl_A[l] > 1e-30) invw /= wl_A[l];
-          for (int g = 0; g < chi; g++) {
-              double re = U_re[row * chi + g] * invw;
-              double im = U_im[row * chi + g] * invw;
-              if (re*re + im*im > 1e-30 && regA->num_nonzero < 4096) {
-                  uint64_t bs = PT_IDX(kA, u, 0, l, g);
-                  regA->entries[regA->num_nonzero].basis_state = bs;
-                  regA->entries[regA->num_nonzero].amp_re = re;
-                  regA->entries[regA->num_nonzero].amp_im = im;
-                  regA->num_nonzero++;
-              }
-          }
-      }
+     for (int eA = 0; eA < num_EA; eA++) {
+         int row = kA * num_EA + eA;
+         uint64_t env = uniq_envA[eA];
+         int uA = (int)(env / chi2);
+         int dA = (int)((env / chi) % chi);
+         int lA = (int)(env % chi);
+         double invw = 1.0;
+         if (wu_A[uA] > 1e-30) invw /= wu_A[uA];
+         if (wl_A[lA] > 1e-30) invw /= wl_A[lA];
+         for (int g = 0; g < chi; g++) {
+             double re = U_re[row * chi + g] * invw;
+             double im = U_im[row * chi + g] * invw;
+             if (re*re + im*im > 1e-30 && regA->num_nonzero < 4096) {
+                 uint64_t bs = PT_IDX(kA, uA, dA, lA, g);
+                 regA->entries[regA->num_nonzero].basis_state = bs;
+                 regA->entries[regA->num_nonzero].amp_re = re;
+                 regA->entries[regA->num_nonzero].amp_im = im;
+                 regA->num_nonzero++;
+             }
+         }
+     }
 
     regB->num_nonzero = 0;
     for (int kB = 0; kB < D; kB++)
-     for (int d = 0; d < chi; d++)
-      for (int r = 0; r < chi; r++) {
-          int col = kB * chi2 + d * chi + r;
-          double invw = 1.0;
-          if (wd_B[d] > 1e-30) invw /= wd_B[d];
-          if (wr_B[r] > 1e-30) invw /= wr_B[r];
-          for (int g = 0; g < chi; g++) {
-              double re = Vc_re[g * svddim + col] * invw;
-              double im = Vc_im[g * svddim + col] * invw;
-              if (re*re + im*im > 1e-30 && regB->num_nonzero < 4096) {
-                  uint64_t bs = PT_IDX(kB, 0, d, g, r);
-                  regB->entries[regB->num_nonzero].basis_state = bs;
-                  regB->entries[regB->num_nonzero].amp_re = re;
-                  regB->entries[regB->num_nonzero].amp_im = im;
-                  regB->num_nonzero++;
-              }
-          }
-      }
+     for (int eB = 0; eB < num_EB; eB++) {
+         int col = kB * num_EB + eB;
+         uint64_t env = uniq_envB[eB];
+         int uB = (int)(env / chi2);
+         int dB = (int)((env / chi) % chi);
+         int rB = (int)(env % chi);
+         double invw = 1.0;
+         if (wd_B[dB] > 1e-30) invw /= wd_B[dB];
+         if (wr_B[rB] > 1e-30) invw /= wr_B[rB];
+         for (int g = 0; g < chi; g++) {
+             double re = Vc_re[g * svddim_B + col] * invw;
+             double im = Vc_im[g * svddim_B + col] * invw;
+             if (re*re + im*im > 1e-30 && regB->num_nonzero < 4096) {
+                 uint64_t bs = PT_IDX(kB, uB, dB, g, rB);
+                 regB->entries[regB->num_nonzero].basis_state = bs;
+                 regB->entries[regB->num_nonzero].amp_re = re;
+                 regB->entries[regB->num_nonzero].amp_im = im;
+                 regB->num_nonzero++;
+             }
+         }
+     }
 
     free(U_re); free(U_im);
     free(sig);
     free(Vc_re); free(Vc_im);
+    free(uniq_envA); free(uniq_envB);
 
     /* Mirror to engine quhits */
     if (grid->eng && grid->q_phys)
@@ -439,16 +485,53 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
         for (int s = 0; s < chi; s++) wr_B[s] = hb->w[s];
     } else { for (int s = 0; s < chi; s++) wr_B[s] = 1.0; }
 
-    /* ── 2. Contract Θ from SPARSE entries ──
+    /* ── 2. Sparse-Rank Environment Extraction ──
      * Vertical: shared = d_A = u_B
-     * Row = (kA, l, r)  Col = (kB, l, r) */
-
-    size_t svd2 = (size_t)svddim * svddim;
-    double *Th_re = (double *)calloc(svd2, sizeof(double));
-    double *Th_im = (double *)calloc(svd2, sizeof(double));
+     * A env = (u, l, r) without shared d
+     * B env = (d, l, r) without shared u
+     * Preserves ALL bond values */
 
     QuhitRegister *regA = &grid->eng->registers[grid->site_reg[sA]];
     QuhitRegister *regB = &grid->eng->registers[grid->site_reg[sB]];
+
+    int max_E = chi * chi;
+    uint64_t *uniq_envA = (uint64_t*)malloc(max_E * sizeof(uint64_t));
+    uint64_t *uniq_envB = (uint64_t*)malloc(max_E * sizeof(uint64_t));
+    int num_EA = 0, num_EB = 0;
+
+    /* A env = u*chi2 + l*chi + r (drop d which is shared) */
+    for (uint32_t eA = 0; eA < regA->num_nonzero; eA++) {
+        uint64_t bs = regA->entries[eA].basis_state;
+        int uA = (int)((bs / PEPS_CHI3) % chi);
+        int lA = (int)((bs / PEPS_CHI) % chi);
+        int rA = (int)(bs % chi);
+        uint64_t env = (uint64_t)uA * chi2 + lA * chi + rA;
+        int found = 0;
+        for (int i = 0; i < num_EA; i++) if (uniq_envA[i] == env) { found = 1; break; }
+        if (!found && num_EA < max_E) uniq_envA[num_EA++] = env;
+    }
+
+    /* B env = d*chi2 + l*chi + r (drop u which is shared) */
+    for (uint32_t eB = 0; eB < regB->num_nonzero; eB++) {
+        uint64_t bs = regB->entries[eB].basis_state;
+        int dB = (int)((bs / PEPS_CHI2) % chi);
+        int lB = (int)((bs / PEPS_CHI) % chi);
+        int rB = (int)(bs % chi);
+        uint64_t env = (uint64_t)dB * chi2 + lB * chi + rB;
+        int found = 0;
+        for (int i = 0; i < num_EB; i++) if (uniq_envB[i] == env) { found = 1; break; }
+        if (!found && num_EB < max_E) uniq_envB[num_EB++] = env;
+    }
+
+    if (num_EA == 0 || num_EB == 0) {
+        free(uniq_envA); free(uniq_envB); return;
+    }
+
+    int svddim_A = D * num_EA;
+    int svddim_B = D * num_EB;
+    size_t svd2 = (size_t)svddim_A * svddim_B;
+    double *Th_re = (double *)calloc(svd2, sizeof(double));
+    double *Th_im = (double *)calloc(svd2, sizeof(double));
 
     for (uint32_t eA = 0; eA < regA->num_nonzero; eA++) {
         uint64_t bsA = regA->entries[eA].basis_state;
@@ -458,13 +541,18 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
 
         int kA = (int)(bsA / PEPS_CHI4);
         int uA = (int)((bsA / PEPS_CHI3) % chi);
-        int dA = (int)((bsA / PEPS_CHI2) % chi);  /* shared bond */
+        int dA = (int)((bsA / PEPS_CHI2) % chi);
         int lA = (int)((bsA / PEPS_CHI) % chi);
         int rA = (int)(bsA % chi);
 
+        uint64_t envA = (uint64_t)uA * chi2 + lA * chi + rA;
+        int idx_EA = -1;
+        for (int i = 0; i < num_EA; i++) if (uniq_envA[i] == envA) { idx_EA = i; break; }
+        if (idx_EA < 0) continue;
+
         double wA = wu_A[uA] * wl_A[lA] * wr_A[rA];
         double arAw = arA * wA, aiAw = aiA * wA;
-        int row = kA * chi2 + lA * chi + rA;
+        int row = kA * num_EA + idx_EA;
 
         for (uint32_t eB = 0; eB < regB->num_nonzero; eB++) {
             uint64_t bsB = regB->entries[eB].basis_state;
@@ -473,23 +561,28 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
             if (arB*arB + aiB*aiB < 1e-30) continue;
 
             int kB = (int)(bsB / PEPS_CHI4);
-            int uB = (int)((bsB / PEPS_CHI3) % chi);  /* shared bond */
+            int uB = (int)((bsB / PEPS_CHI3) % chi);
             int dB = (int)((bsB / PEPS_CHI2) % chi);
             int lB = (int)((bsB / PEPS_CHI) % chi);
             int rB = (int)(bsB % chi);
 
-            if (dA != uB) continue;  /* shared bond must match */
+            if (dA != uB) continue;
+
+            uint64_t envB = (uint64_t)dB * chi2 + lB * chi + rB;
+            int idx_EB = -1;
+            for (int i = 0; i < num_EB; i++) if (uniq_envB[i] == envB) { idx_EB = i; break; }
+            if (idx_EB < 0) continue;
 
             double wB = wd_B[dB] * wl_B[lB] * wr_B[rB] * wv[dA];
             double br = arB * wB, bi = aiB * wB;
-            int col = kB * chi2 + lB * chi + rB;
+            int col = kB * num_EB + idx_EB;
 
-            Th_re[row * svddim + col] += arAw*br - aiAw*bi;
-            Th_im[row * svddim + col] += arAw*bi + aiAw*br;
+            Th_re[row * svddim_B + col] += arAw*br - aiAw*bi;
+            Th_im[row * svddim_B + col] += arAw*bi + aiAw*br;
         }
     }
 
-    /* ── 3. Apply gate ── */
+    /* ── 3. Apply Gate ── */
     double *Th2_re = (double *)calloc(svd2, sizeof(double));
     double *Th2_im = (double *)calloc(svd2, sizeof(double));
     int D2 = D * D;
@@ -504,35 +597,31 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
               double gim = G_im[gr * D2 + gc];
               if (fabs(gre) < 1e-30 && fabs(gim) < 1e-30) continue;
 
-              for (int l = 0; l < chi; l++)
-               for (int r = 0; r < chi; r++) {
-                   int dst_row = kAp * chi2 + l * chi + r;
-                   int src_row = kA * chi2 + l * chi + r;
-                   for (int lB = 0; lB < chi; lB++)
-                    for (int rB = 0; rB < chi; rB++) {
-                        int dst_col = kBp * chi2 + lB * chi + rB;
-                        int src_col = kB * chi2 + lB * chi + rB;
-                        double tr = Th_re[src_row * svddim + src_col];
-                        double ti = Th_im[src_row * svddim + src_col];
-                        Th2_re[dst_row * svddim + dst_col] += gre*tr - gim*ti;
-                        Th2_im[dst_row * svddim + dst_col] += gre*ti + gim*tr;
-                    }
-               }
+              for (int eA = 0; eA < num_EA; eA++) {
+                  int dst_row = kAp * num_EA + eA;
+                  int src_row = kA * num_EA + eA;
+                  for (int eB = 0; eB < num_EB; eB++) {
+                      int dst_col = kBp * num_EB + eB;
+                      int src_col = kB * num_EB + eB;
+                      double tr = Th_re[src_row * svddim_B + src_col];
+                      double ti = Th_im[src_row * svddim_B + src_col];
+                      Th2_re[dst_row * svddim_B + dst_col] += gre*tr - gim*ti;
+                      Th2_im[dst_row * svddim_B + dst_col] += gre*ti + gim*tr;
+                  }
+              }
           }
      }
-
     free(Th_re); free(Th_im);
 
     /* ── 4. SVD ── */
-    double *U_re  = (double *)calloc((size_t)svddim * chi, sizeof(double));
-    double *U_im  = (double *)calloc((size_t)svddim * chi, sizeof(double));
+    double *U_re  = (double *)calloc((size_t)svddim_A * chi, sizeof(double));
+    double *U_im  = (double *)calloc((size_t)svddim_A * chi, sizeof(double));
     double *sig   = (double *)calloc(chi, sizeof(double));
-    double *Vc_re = (double *)calloc((size_t)chi * svddim, sizeof(double));
-    double *Vc_im = (double *)calloc((size_t)chi * svddim, sizeof(double));
+    double *Vc_re = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
+    double *Vc_im = (double *)calloc((size_t)chi * svddim_B, sizeof(double));
 
-    tsvd_truncated(Th2_re, Th2_im, svddim, svddim, chi,
+    tsvd_truncated(Th2_re, Th2_im, svddim_A, svddim_B, chi,
                    U_re, U_im, sig, Vc_re, Vc_im);
-
     free(Th2_re); free(Th2_im);
 
     /* ── 5. Update bond weight ── */
@@ -541,52 +630,59 @@ void peps_gate_vertical(PepsGrid *grid, int x, int y,
     if (sig_norm > 1e-30)
         for (int s = 0; s < chi; s++) vb_shared->w[s] = sig[s] / sig_norm;
 
-    /* ── 6. Write back directly to registers ── */
+    /* ── 6. Write back — preserving ALL bond values ── */
     regA->num_nonzero = 0;
     for (int kA = 0; kA < D; kA++)
-     for (int l = 0; l < chi; l++)
-      for (int r = 0; r < chi; r++) {
-          int row = kA * chi2 + l * chi + r;
-          double invw = 1.0;
-          if (wl_A[l] > 1e-30) invw /= wl_A[l];
-          if (wr_A[r] > 1e-30) invw /= wr_A[r];
-          for (int g = 0; g < chi; g++) {
-              double re = U_re[row * chi + g] * invw;
-              double im = U_im[row * chi + g] * invw;
-              if (re*re + im*im > 1e-30 && regA->num_nonzero < 4096) {
-                  uint64_t bs = PT_IDX(kA, 0, g, l, r);
-                  regA->entries[regA->num_nonzero].basis_state = bs;
-                  regA->entries[regA->num_nonzero].amp_re = re;
-                  regA->entries[regA->num_nonzero].amp_im = im;
-                  regA->num_nonzero++;
-              }
-          }
-      }
+     for (int eA = 0; eA < num_EA; eA++) {
+         int row = kA * num_EA + eA;
+         uint64_t env = uniq_envA[eA];
+         int uA = (int)(env / chi2);
+         int lA = (int)((env / chi) % chi);
+         int rA = (int)(env % chi);
+         double invw = 1.0;
+         if (wl_A[lA] > 1e-30) invw /= wl_A[lA];
+         if (wr_A[rA] > 1e-30) invw /= wr_A[rA];
+         for (int g = 0; g < chi; g++) {
+             double re = U_re[row * chi + g] * invw;
+             double im = U_im[row * chi + g] * invw;
+             if (re*re + im*im > 1e-30 && regA->num_nonzero < 4096) {
+                 uint64_t bs = PT_IDX(kA, uA, g, lA, rA);
+                 regA->entries[regA->num_nonzero].basis_state = bs;
+                 regA->entries[regA->num_nonzero].amp_re = re;
+                 regA->entries[regA->num_nonzero].amp_im = im;
+                 regA->num_nonzero++;
+             }
+         }
+     }
 
     regB->num_nonzero = 0;
     for (int kB = 0; kB < D; kB++)
-     for (int l = 0; l < chi; l++)
-      for (int r = 0; r < chi; r++) {
-          int col = kB * chi2 + l * chi + r;
-          double invw = 1.0;
-          if (wl_B[l] > 1e-30) invw /= wl_B[l];
-          if (wr_B[r] > 1e-30) invw /= wr_B[r];
-          for (int g = 0; g < chi; g++) {
-              double re = Vc_re[g * svddim + col] * invw;
-              double im = Vc_im[g * svddim + col] * invw;
-              if (re*re + im*im > 1e-30 && regB->num_nonzero < 4096) {
-                  uint64_t bs = PT_IDX(kB, g, 0, l, r);
-                  regB->entries[regB->num_nonzero].basis_state = bs;
-                  regB->entries[regB->num_nonzero].amp_re = re;
-                  regB->entries[regB->num_nonzero].amp_im = im;
-                  regB->num_nonzero++;
-              }
-          }
-      }
+     for (int eB = 0; eB < num_EB; eB++) {
+         int col = kB * num_EB + eB;
+         uint64_t env = uniq_envB[eB];
+         int dB = (int)(env / chi2);
+         int lB = (int)((env / chi) % chi);
+         int rB = (int)(env % chi);
+         double invw = 1.0;
+         if (wl_B[lB] > 1e-30) invw /= wl_B[lB];
+         if (wr_B[rB] > 1e-30) invw /= wr_B[rB];
+         for (int g = 0; g < chi; g++) {
+             double re = Vc_re[g * svddim_B + col] * invw;
+             double im = Vc_im[g * svddim_B + col] * invw;
+             if (re*re + im*im > 1e-30 && regB->num_nonzero < 4096) {
+                 uint64_t bs = PT_IDX(kB, g, dB, lB, rB);
+                 regB->entries[regB->num_nonzero].basis_state = bs;
+                 regB->entries[regB->num_nonzero].amp_re = re;
+                 regB->entries[regB->num_nonzero].amp_im = im;
+                 regB->num_nonzero++;
+             }
+         }
+     }
 
     free(U_re); free(U_im);
     free(sig);
     free(Vc_re); free(Vc_im);
+    free(uniq_envA); free(uniq_envB);
 
     /* Mirror to engine quhits */
     if (grid->eng && grid->q_phys)
