@@ -28,9 +28,9 @@
 
 /* ═══════════════ Constants ═══════════════ */
 
-#define DT 0.05
+#define DT 0.10
 #define TOTAL_TIME 2.0
-#define COUPLING_J 1.0
+#define COUPLING_J (M_PI / 2.0)   /* Full SWAP per step: sin(dt*J)=sin(π/20)≈0.156 */
 
 /* ═══════════════ Entangling Hamiltonian ═══════════════ */
 
@@ -63,10 +63,9 @@ static void build_xx_coupling(double dt, double J, double *G_re, double *G_im)
             int idx_ba = b * D + a;
             
             if (a == b) {
-                // If a==b, SWAP|a,a> = |a,a>. 
-                // U|a,a> = (cos + i sin)|a,a> = e^{i dt J} |a,a>
-                G_re[idx_ab * D2 + idx_ab] = c;
-                G_im[idx_ab * D2 + idx_ab] = s;
+                // If a==b, leave the vacuum state untouched to prevent dephasing
+                G_re[idx_ab * D2 + idx_ab] = 1.0;
+                G_im[idx_ab * D2 + idx_ab] = 0.0;
             } else {
                 // U|a,b> = cos|a,b> + i sin|b,a>
                 G_re[idx_ab * D2 + idx_ab] = c;
@@ -92,6 +91,7 @@ static void renormalize_all(Tns3dGrid *g)
         for (uint32_t e = 0; e < r->num_nonzero; e++)
             n2 += r->entries[e].amp_re * r->entries[e].amp_re +
                   r->entries[e].amp_im * r->entries[e].amp_im;
+                  
         if (n2 > 1e-20) {
             double inv = 1.0 / sqrt(n2);
             for (uint32_t e = 0; e < r->num_nonzero; e++) {
@@ -100,6 +100,26 @@ static void renormalize_all(Tns3dGrid *g)
             }
         }
     }
+}
+
+static double compute_bath_entropy(Tns3dGrid *g, int cx, int cy, int cz)
+{
+    double total_S = 0.0;
+    for (int z = 0; z < g->Lz; z++) {
+        for (int y = 0; y < g->Ly; y++) {
+            for (int x = 0; x < g->Lx; x++) {
+                if (x == cx && y == cy && z == cz) continue;
+                double p[6];
+                tns3d_local_density(g, x, y, z, p);
+                double s = 0;
+                for (int k = 0; k < 6; k++) {
+                    if (p[k] > 1e-8) s -= p[k] * log(p[k]) / log(2.0);
+                }
+                total_S += s;
+            }
+        }
+    }
+    return total_S;
 }
 
 static void print_slice_entropy(Tns3dGrid *g, int z_slice)
@@ -138,12 +158,14 @@ static double cat_coherence(Tns3dGrid *g, int cx, int cy, int cz)
     v_re[5*6+5] = 1.0;
     
     int reg = g->site_reg[cz * g->Lx * g->Ly + cy * g->Lx + cx];
+    
+    // Target position 6 (physical index k, stride = TNS3D_C6 = D^6)
     quhit_reg_apply_unitary_pos(g->eng, reg, 6, v_re, v_im);
     
     double p[6];
     tns3d_local_density(g, cx, cy, cz, p);
     
-    // V is its own inverse (Hermitian and Unitary)
+    // Restore the physical index
     quhit_reg_apply_unitary_pos(g->eng, reg, 6, v_re, v_im);
     
     double coherence = 2.0 * (p[0] - 0.5);
@@ -174,9 +196,10 @@ int main(void)
 
     Tns3dGrid *g = tns3d_init(Lx, Ly, Lz);
 
-    // Initialize Bath to |0⟩
+    // Initialize Bath to |0⟩ (physical digit k is at position 6, stride TNS3D_C6)
     for (int i = 0; i < Nsites; i++) {
         int reg = g->site_reg[i];
+        g->eng->registers[reg].num_nonzero = 0;
         quhit_reg_sv_set(g->eng, reg, 0 * TNS3D_C6, 1.0, 0);      
     }
 
@@ -187,9 +210,21 @@ int main(void)
     // Clear initial state
     g->eng->registers[center_reg].num_nonzero = 0;
     
-    // Set proper physical amplitude
+    // Set proper physical amplitude on position 6 (k, stride TNS3D_C6)
     quhit_reg_sv_set(g->eng, center_reg, 0 * TNS3D_C6, 1.0/sqrt(2.0), 0);
     quhit_reg_sv_set(g->eng, center_reg, 3 * TNS3D_C6, 1.0/sqrt(2.0), 0);
+    
+    // Deep probe of center to confirm Cat state
+    {
+        QuhitRegister *rc = &g->eng->registers[center_reg];
+        printf("  [CENTER INIT] entries=%d\n", rc->num_nonzero);
+        for (int e=0; e<rc->num_nonzero && e<5; e++) {
+            printf("      basis=%lu  phys_k=%lu  amp=(%.4f, %.4f)\n", 
+                rc->entries[e].basis_state,
+                rc->entries[e].basis_state / TNS3D_C6,
+                rc->entries[e].amp_re, rc->entries[e].amp_im);
+        }
+    }
 
     int steps = (int)(TOTAL_TIME / DT);
     printf("  ══ SPREADING QUANTUM COHERENCE TO THE BATH (%d steps) ══\n\n", steps);
@@ -199,16 +234,10 @@ int main(void)
         
         if (step % 5 == 0) {
             double c = cat_coherence(g, Lx/2, Ly/2, Lz/2);
-            printf("  Time: %4.2fs | Central Cat Coherence: %6.4f | Bath Entangling...\n", t, c);
+            double s_bath = compute_bath_entropy(g, Lx/2, Ly/2, Lz/2);
+            printf("  Time: %4.2fs | Central Cat Coherence: %6.4f | Bath Entropy S_env: %8.4f\n", t, c, s_bath);
             if (step % 20 == 0) {
                 print_slice_entropy(g, Lz/2); 
-                
-                // Diagnostic: exactly check neighbor (x=4, y=3, z=3)
-                double pn[6];
-                tns3d_local_density(g, (Lx/2)+1, Ly/2, Lz/2, pn);
-                double sn = 0;
-                for(int k=0; k<6; k++) if(pn[k]>1e-8) sn -= pn[k]*log(pn[k])/log(2.0);
-                printf("  [Probe] Neighbor(4,3,3) p_0=%.4f p_3=%.4f S_n=%.4f\n", pn[0], pn[3], sn);
             }
         }
 
@@ -216,6 +245,8 @@ int main(void)
             tns3d_gate_x_all(g, hop_re, hop_im);
             tns3d_gate_y_all(g, hop_re, hop_im);
             tns3d_gate_z_all(g, hop_re, hop_im);
+            
+            // Apply unconditional renormalization to prevent bounds blowout
             renormalize_all(g);
             t += DT;
         }
