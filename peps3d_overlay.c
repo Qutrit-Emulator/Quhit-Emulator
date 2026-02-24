@@ -393,8 +393,9 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
 
     double sig_norm = 0;
     for (int s = 0; s < rank; s++) sig_norm += sig[s];
-    if (sig_norm > 1e-10)
-        for (int s = 0; s < rank; s++) shared_bw->w[s] = sig[s] / sig_norm;
+    
+    // Explicitly lock the shared bond array to 1.0 since Schmidt weights are absorbed
+    for (int s = 0; s < TNS3D_CHI; s++) shared_bw->w[s] = 1.0;
 
     /* ── 5. Write back safely ── */
     regA->num_nonzero = 0;
@@ -406,9 +407,11 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
          uint64_t envA = uniq_envA[eA];
          uint64_t pure = (envA / bp[bond_A]) * bp[bond_A + 1] + (envA % bp[bond_A]);
          for (int gv = 0; gv < rank; gv++) {
-             double re = U_re[row * rank + gv];
-             double im = U_im[row * rank + gv];
-             if (re*re + im*im < 1e-10) continue;
+             // Symmetrically inject sqrt of normalized Schmidt weight
+             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30) ? sqrt(sig[gv] / sig_norm) : 0.0;
+             double re = U_re[row * rank + gv] * weight;
+             double im = U_im[row * rank + gv] * weight;
+             if (re*re + im*im < 1e-50) continue;
 
              uint64_t bs = kA * TNS3D_C6 + pure + gv * bp[bond_A];
              if (regA->num_nonzero < 4096) {
@@ -426,11 +429,11 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
          uint64_t envB = uniq_envB[eB];
          uint64_t pure = (envB / bp[bond_B]) * bp[bond_B + 1] + (envB % bp[bond_B]);
          for (int gv = 0; gv < rank; gv++) {
-             double s = sig[gv];
-             if (s < 1e-100) continue;
-             double re = sig_norm * Vc_re[gv * svddim_B + col];
-             double im = sig_norm * Vc_im[gv * svddim_B + col];
-             if (re*re + im*im < 1e-100) continue;
+             // Symmetrically inject sqrt of normalized Schmidt weight
+             double weight = (sig_norm > 1e-30 && sig[gv] > 1e-30) ? sqrt(sig[gv] / sig_norm) : 0.0;
+             double re = weight * Vc_re[gv * svddim_B + col];
+             double im = weight * Vc_im[gv * svddim_B + col];
+             if (re*re + im*im < 1e-50) continue;
 
              uint64_t bs = kB * TNS3D_C6 + pure + gv * bp[bond_B];
              if (regB->num_nonzero < 4096) {
