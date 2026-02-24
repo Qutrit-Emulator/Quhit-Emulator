@@ -152,124 +152,79 @@ static uint64_t total_nnz(Tns4dGrid *g)
     return nnz;
 }
 
-/* ═══════════════ MAIN ═══════════════ */
-
 int main(void)
 {
     srand((unsigned)time(NULL));
 
-    int L = GRID_L;
-    int N = L * L * L * L;
-    int D = TNS4D_D, D2 = D*D, D4 = D2*D2;
+    int D = TNS4D_D, D2 = D * D, D4 = D2 * D2;
 
     printf("\n");
     printf("  ╔══════════════════════════════════════════════════════════════════╗\n");
-    printf("  ║  4D SELF-CORRECTING QUANTUM MEMORY                             ║\n");
+    printf("  ║  4D SELF-CORRECTING QUANTUM MEMORY: FINITE-SIZE SCALING          ║\n");
     printf("  ║  ────────────────────────────────────────────────────────────── ║\n");
-    printf("  ║  The Holy Grail of Quantum Error Correction                    ║\n");
-    printf("  ║  Grid: %dx%dx%dx%d = %d D=6 quhits (6^%d ≈ 10^%d states)         ║\n",
-           L, L, L, L, N, N, (int)(N * log10(6.0)));
-    printf("  ║                                                                ║\n");
-    printf("  ║  Protocol: Encode |0⟩ → Inject errors at rate p → 4D Ising    ║\n");
-    printf("  ║  Hamiltonian healing (8 neighbors per site) → Measure M        ║\n");
-    printf("  ║                                                                ║\n");
-    printf("  ║  Self-correction: Below p_c, M recovers WITHOUT active QEC.    ║\n");
-    printf("  ║  This property exists ONLY in 4D and above.                    ║\n");
+    printf("  ║  Demonstrating the sharpening of critical threshold p_c          ║\n");
     printf("  ╚══════════════════════════════════════════════════════════════════╝\n");
-    printf("\n");
 
-    /* Pre-generate gate matrices */
     double *X_re = (double *)calloc(D2, sizeof(double));
     double *X_im = (double *)calloc(D2, sizeof(double));
     make_clock_shift(X_re, X_im);
 
-    /* Recovery gate: neighbor-assisted correction.
-     * strength=0.3 → moderate correction per step.
-     * In 4D, each site has 8 neighbors, so total correction pressure is massive. */
     double *G_re = (double *)calloc(D4, sizeof(double));
     double *G_im = (double *)calloc(D4, sizeof(double));
     make_recovery_gate(G_re, G_im, 0.3);
 
-    printf("  Error Rate |  Errors  | M (before) | M (after heal) |  ΔM     | NNZ     | Time (s)\n");
-    printf("  ──────────┼──────────┼────────────┼────────────────┼─────────┼─────────┼─────────\n");
-    fflush(stdout);
-
-    /* Sweep error rate from p=0.0 to p=1.0 */
-    double p_values[] = {0.00, 0.02, 0.05, 0.08, 0.10, 0.15, 0.20, 0.25,
-                         0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00};
+    double p_values[] = {0.00, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.80, 1.00};
     int num_p = sizeof(p_values) / sizeof(p_values[0]);
 
-    for (int pi = 0; pi < num_p; pi++) {
-        double p = p_values[pi];
+    int L_values[] = {2, 3, 4};
+    int num_L = sizeof(L_values) / sizeof(L_values[0]);
 
-        struct timespec t0, t1;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-
-        /* Fresh grid for each error rate */
-        Tns4dGrid *g = tns4d_init(L, L, L, L);
-
-        /* Step 1: Encode logical |0⟩ state (already set by init) */
-
-        /* Step 2: Inject random errors */
-        int nerr = inject_errors(g, p, X_re, X_im);
-
-        /* Measure magnetization BEFORE healing */
-        double M_before = measure_magnetization(g);
-
-        /* Step 3: 4D Hamiltonian healing — neighbor-assisted recovery.
-         * In 4D, each site has 8 nearest neighbors (2 per axis × 4 axes).
-         * The recovery gate propagates correction pressure from correct
-         * neighbors to errored sites. The 4D geometry creates an L³
-         * energy barrier that confines error domains — this is the
-         * self-correction mechanism unique to ≥4 dimensions. */
-        for (int step = 0; step < HEALING_STEPS; step++) {
-            /* Apply 4D recovery gate along all axes */
-            tns4d_trotter_step(g, G_re, G_im);
-
-            /* Sparsity maintenance */
-            compress_all(g);
-
-            /* Normalize all sites */
-            for (int w = 0; w < L; w++)
-             for (int z = 0; z < L; z++)
-              for (int y = 0; y < L; y++)
-               for (int x = 0; x < L; x++)
-                   tns4d_normalize_site(g, x, y, z, w);
-        }
-
-        /* Step 4: Measure magnetization AFTER healing */
-        double M_after = measure_magnetization(g);
-        double delta_M = M_after - M_before;
-        uint64_t nnz = total_nnz(g);
-
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
-
-        printf("    %.2f    |    %3d   |   %.4f   |     %.4f     | %+.4f | %7lu | %.2f\n",
-               p, nerr, M_before, M_after, delta_M, (unsigned long)nnz, dt);
+    for (int li = 0; li < num_L; li++) {
+        int L = L_values[li];
+        int N = L * L * L * L;
+        
+        printf("\n  === VOLUME: %dx%dx%dx%d = %d QUHITS (6^%d STATES) ===\n", L, L, L, L, N, N);
+        printf("  Error Rate |  Errors  | M (before) | M (after heal) |  ΔM     | NNZ     | Time (s)\n");
+        printf("  ──────────┼──────────┼────────────┼────────────────┼─────────┼─────────┼─────────\n");
         fflush(stdout);
 
-        tns4d_free(g);
+        for (int pi = 0; pi < num_p; pi++) {
+            double p = p_values[pi];
+
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+
+            Tns4dGrid *g = tns4d_init(L, L, L, L);
+            int nerr = inject_errors(g, p, X_re, X_im);
+            double M_before = measure_magnetization(g);
+
+            for (int step = 0; step < HEALING_STEPS; step++) {
+                tns4d_trotter_step(g, G_re, G_im);
+                compress_all(g);
+                for (int w = 0; w < L; w++)
+                 for (int z = 0; z < L; z++)
+                  for (int y = 0; y < L; y++)
+                   for (int x = 0; x < L; x++)
+                       tns4d_normalize_site(g, x, y, z, w);
+            }
+
+            double M_after = measure_magnetization(g);
+            double delta_M = M_after - M_before;
+            uint64_t nnz = total_nnz(g);
+
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double dt = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
+
+            printf("    %.2f    |    %3d   |   %.4f   |     %.4f     | %+.4f | %7lu | %.2f\n",
+                   p, nerr, M_before, M_after, delta_M, (unsigned long)nnz, dt);
+            fflush(stdout);
+
+            tns4d_free(g);
+        }
     }
 
     free(X_re); free(X_im);
     free(G_re); free(G_im);
-
-    printf("\n  ════════════════════════════════════════════════════════════════════\n");
-    printf("  INTERPRETATION:\n");
-    printf("    ΔM > 0  → Self-correction: 4D geometry healed errors\n");
-    printf("    ΔM ≈ 0  → Critical threshold: errors and correction balanced\n");
-    printf("    ΔM → 0 for large p → Errors overwhelm correction\n");
-    printf("    The critical p_c is where ΔM changes from positive to negligible.\n");
-    printf("  ════════════════════════════════════════════════════════════════════\n");
-    printf("  Key physics: In 4D, each site has 8 neighbors providing\n");
-    printf("  correction pressure. Error domains are confined by L³ energy\n");
-    printf("  barriers (3D surface of 4D domain walls). Below p_c, isolated\n");
-    printf("  errors are surrounded by correct neighbors and healed.\n");
-    printf("  Above p_c, errors percolate and correction fails.\n");
-    printf("  ════════════════════════════════════════════════════════════════════\n");
-    printf("  WORLD FIRST: 4D Self-Correcting Quantum Memory demonstrated.\n");
-    printf("  No quantum hardware. No active error correction. Just geometry.\n\n");
-
     return 0;
 }
+
