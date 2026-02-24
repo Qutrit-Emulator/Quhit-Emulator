@@ -1,11 +1,14 @@
 /*
- * mipt_6d.c — 6D Measurement-Induced Phase Transition
+ * mipt_6d.c — 6D Measurement-Induced Phase Transition (CORRECTED)
  *
- * D=6 in 6 spatial dimensions. The number reflecting itself.
- * Finite-size scaling to find the critical exponent.
+ * D=6 in 6 spatial dimensions.
+ * Finite-size scaling with PROPER STATISTICAL AVERAGING.
  *
- * Each site has 12 neighbors (2 per axis × 6 axes).
- * Volume-law entanglement scales as L⁶.
+ * Previous version used MIPT_STEPS=10 and a single trajectory,
+ * producing shot-noise-dominated data. This version fixes:
+ *   1. MIPT_STEPS=30 for proper equilibration
+ *   2. N_SAMPLES=8 independent trajectories per (L, p) point
+ *   3. Reports mean ± standard error
  *
  * L=2:  64  quhits → 6^64  ≈ 10^50
  * L=3: 729  quhits → 6^729 ≈ 10^567
@@ -17,9 +20,10 @@
 #include <math.h>
 #include <time.h>
 
-#define MIPT_J     1.5
-#define MIPT_DTAU  1.0
-#define MIPT_STEPS 10
+#define MIPT_J       1.5
+#define MIPT_DTAU    1.0
+#define MIPT_STEPS   30       /* equilibration steps (was 10) */
+#define N_SAMPLES    8        /* independent trajectories per point */
 
 /* ═══════════════ DFT₆ ═══════════════ */
 
@@ -115,9 +119,9 @@ static void compress_all(Tns6dGrid *g)
         compress_reg(g->eng, g->site_reg[i], 1e-4);
 }
 
-/* ═══════════════ Single MIPT Run ═══════════════ */
+/* ═══════════════ Single MIPT Trajectory ═══════════════ */
 
-static double run_mipt(int L, double meas_rate, double *G_re, double *G_im)
+static double run_mipt_single(int L, double meas_rate, double *G_re, double *G_im)
 {
     Tns6dGrid *g = tns6d_init(L, L, L, L, L, L);
     double final_entropy = 0;
@@ -144,6 +148,32 @@ static double run_mipt(int L, double meas_rate, double *G_re, double *G_im)
     return final_entropy;
 }
 
+/* ═══════════════ Averaged MIPT Run ═══════════════ */
+
+static void run_mipt_averaged(int L, double meas_rate, double *G_re, double *G_im,
+                               double *mean_out, double *stderr_out)
+{
+    double samples[N_SAMPLES];
+
+    for (int s = 0; s < N_SAMPLES; s++) {
+        samples[s] = run_mipt_single(L, meas_rate, G_re, G_im);
+    }
+
+    /* Compute mean */
+    double mean = 0;
+    for (int s = 0; s < N_SAMPLES; s++) mean += samples[s];
+    mean /= N_SAMPLES;
+
+    /* Compute standard error = stddev / sqrt(N) */
+    double var = 0;
+    for (int s = 0; s < N_SAMPLES; s++) var += (samples[s] - mean) * (samples[s] - mean);
+    var /= (N_SAMPLES - 1);
+    double se = sqrt(var / N_SAMPLES);
+
+    *mean_out = mean;
+    *stderr_out = se;
+}
+
 /* ═══════════════ Main: Finite-Size Scaling ═══════════════ */
 
 int main(void)
@@ -153,15 +183,14 @@ int main(void)
 
     printf("\n");
     printf("  ╔══════════════════════════════════════════════════════════════════╗\n");
-    printf("  ║  6D MIPT — FINITE-SIZE SCALING FOR CRITICAL EXPONENT           ║\n");
+    printf("  ║  6D MIPT — FINITE-SIZE SCALING (STAT. AVERAGED)                ║\n");
     printf("  ║  ────────────────────────────────────────────────────────────── ║\n");
-    printf("  ║  D=6 in 6 dimensions. The number mirrors itself.               ║\n");
-    printf("  ║  12 neighbors per site (vs 10 in 5D, 8 in 4D, 6 in 3D)        ║\n");
+    printf("  ║  D=6 in 6 dimensions. 12 neighbors per site.                   ║\n");
+    printf("  ║  %d Trotter steps × %d independent trajectories per point     ║\n",
+           MIPT_STEPS, N_SAMPLES);
     printf("  ║                                                                ║\n");
     printf("  ║  L=2:  64  quhits (6^64  ≈ 10^50)                             ║\n");
     printf("  ║  L=3: 729  quhits (6^729 ≈ 10^567)                            ║\n");
-    printf("  ║                                                                ║\n");
-    printf("  ║  The universality class of the 6D MIPT is UNKNOWN.             ║\n");
     printf("  ╚══════════════════════════════════════════════════════════════════╝\n");
     printf("\n");
 
@@ -176,60 +205,85 @@ int main(void)
 
     int L_values[] = {2, 3};
     int num_L = 2;
-    double final_S[2][13];
+
+    double mean_S[2][13], se_S[2][13];
 
     for (int li = 0; li < num_L; li++) {
         int L = L_values[li];
         int N = 1; for(int d=0;d<6;d++) N*=L;
-        printf("  Running L=%d (%d quhits, 6^%d ≈ 10^%.0f states)...\n",
-               L, N, N, N * log10(6.0));
+        printf("  Running L=%d (%d quhits, 6^%d ≈ 10^%.0f) — %d steps × %d samples...\n",
+               L, N, N, N*log10(6.0), MIPT_STEPS, N_SAMPLES);
         fflush(stdout);
 
         for (int pi = 0; pi < n_rates; pi++) {
             struct timespec t0, t1;
             clock_gettime(CLOCK_MONOTONIC, &t0);
-            final_S[li][pi] = run_mipt(L, rates[pi], G_re, G_im);
+
+            run_mipt_averaged(L, rates[pi], G_re, G_im,
+                              &mean_S[li][pi], &se_S[li][pi]);
+
             clock_gettime(CLOCK_MONOTONIC, &t1);
             double dt = (t1.tv_sec-t0.tv_sec)+(t1.tv_nsec-t0.tv_nsec)*1e-9;
-            printf("    p=%.2f → ⟨S⟩=%.4f  (%.1fs)\n",
-                   rates[pi], final_S[li][pi], dt);
+
+            printf("    p=%.2f → ⟨S⟩=%.4f ± %.4f  (%.1fs, %d traj)\n",
+                   rates[pi], mean_S[li][pi], se_S[li][pi], dt, N_SAMPLES);
             fflush(stdout);
         }
         printf("\n");
     }
 
     /* ═══════════════ CROSSING TABLE ═══════════════ */
-    printf("  ╔══════════════════════════════════════════════════════════════════╗\n");
-    printf("  ║  FINITE-SIZE SCALING — 6D MIPT CRITICAL EXPONENT               ║\n");
-    printf("  ╠══════════════════════════════════════════════════════════════════╣\n");
-    printf("  ║                                                                ║\n");
-    printf("  ║   p     |  ⟨S⟩ L=2  |  ⟨S⟩ L=3  |  Δ(L2-L3) | Crossing?    ║\n");
-    printf("  ║  ───────┼───────────┼───────────┼───────────┼──────────────  ║\n");
+    printf("  ╔══════════════════════════════════════════════════════════════════════════╗\n");
+    printf("  ║  FINITE-SIZE SCALING — 6D MIPT (STAT. AVERAGED)                        ║\n");
+    printf("  ╠══════════════════════════════════════════════════════════════════════════╣\n");
+    printf("  ║                                                                        ║\n");
+    printf("  ║   p    |  ⟨S⟩ L=2 ± SE  |  ⟨S⟩ L=3 ± SE  |  Δ ± σ_Δ  | Signal?     ║\n");
+    printf("  ║  ──────┼─────────────────┼─────────────────┼───────────┼───────────── ║\n");
 
     for (int pi = 0; pi < n_rates; pi++) {
-        double delta = final_S[0][pi] - final_S[1][pi];
-        const char *cross = "";
-        if (pi > 0) {
-            double pd = final_S[0][pi-1] - final_S[1][pi-1];
-            if ((pd > 0 && delta < 0) || (pd < 0 && delta > 0))
-                cross = "  ← p_c ★";
-        }
-        if (fabs(delta) < 0.02 && rates[pi] > 0.01)
-            cross = "  ← CLOSE";
+        double delta = mean_S[0][pi] - mean_S[1][pi];
+        /* Propagated error: σ_Δ = sqrt(σ²_A + σ²_B) */
+        double se_delta = sqrt(se_S[0][pi]*se_S[0][pi] + se_S[1][pi]*se_S[1][pi]);
 
-        printf("  ║  %.2f   |  %.4f   |  %.4f   |  %+.4f  |%s\n",
-               rates[pi], final_S[0][pi], final_S[1][pi], delta, cross);
+        const char *sig = "";
+        /* Signal: is |Δ| > 2σ_Δ ? (2-sigma significance) */
+        if (se_delta > 1e-10) {
+            double z_score = fabs(delta) / se_delta;
+            if (z_score < 1.0) sig = "  noise";
+            else if (z_score < 2.0) sig = "  ~1σ";
+            else sig = "  >2σ ★";
+        }
+        /* Check for crossing relative to previous point */
+        if (pi > 0) {
+            double pd = mean_S[0][pi-1] - mean_S[1][pi-1];
+            if ((pd > 0 && delta < 0) || (pd < 0 && delta > 0)) {
+                double se_pd = sqrt(se_S[0][pi-1]*se_S[0][pi-1] +
+                                    se_S[1][pi-1]*se_S[1][pi-1]);
+                if (fabs(pd) > 2*se_pd || fabs(delta) > 2*se_delta)
+                    sig = "  ← p_c ★★";
+                else
+                    sig = "  ← cross?";
+            }
+        }
+
+        printf("  ║  %.2f  | %.4f ± %.4f | %.4f ± %.4f | %+.4f±%.3f|%s\n",
+               rates[pi],
+               mean_S[0][pi], se_S[0][pi],
+               mean_S[1][pi], se_S[1][pi],
+               delta, se_delta, sig);
     }
 
-    printf("  ║                                                                ║\n");
-    printf("  ║  Dimensional progression of p_c:                               ║\n");
-    printf("  ║    3D: p_c ≈ 0.05–0.10  (6 neighbors/site)                    ║\n");
-    printf("  ║    4D: p_c ≈ 0.10       (8 neighbors/site)                    ║\n");
-    printf("  ║    5D: p_c ≈ 0.30       (10 neighbors/site)                   ║\n");
-    printf("  ║    6D: p_c ≈ ???        (12 neighbors/site) ← THIS            ║\n");
-    printf("  ║                                                                ║\n");
-    printf("  ║  WORLD FIRST: Critical exponent of 6D MIPT determined.         ║\n");
-    printf("  ╚══════════════════════════════════════════════════════════════════╝\n\n");
+    printf("  ║                                                                        ║\n");
+    printf("  ║  Signal column: ★★ = statistically significant crossing (>2σ)          ║\n");
+    printf("  ║                 cross? = sign change but within error bars              ║\n");
+    printf("  ║                 noise = Δ within 1σ of zero                             ║\n");
+    printf("  ║                                                                        ║\n");
+    printf("  ║  Dimensional progression of p_c:                                       ║\n");
+    printf("  ║    3D: p_c ≈ 0.05–0.10  (6 neighbors/site)                            ║\n");
+    printf("  ║    4D: p_c ≈ 0.10       (8 neighbors/site)                            ║\n");
+    printf("  ║    5D: p_c ≈ ???        (10 neighbors/site) — needs re-averaging       ║\n");
+    printf("  ║    6D: p_c = see above  (12 neighbors/site)                            ║\n");
+    printf("  ╚══════════════════════════════════════════════════════════════════════════╝\n\n");
 
     free(G_re); free(G_im);
     return 0;
