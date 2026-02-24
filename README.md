@@ -26,7 +26,7 @@ This utility will NOT function on ARM CPUs, for now.. because they use a somewha
 ---
 
 <p align="center">
-An Open Letter to QDX (and others)
+An Open Letter to others
 </p>
 On the off-chance you didn't already incorporate my code in some form in your project, feel free to take whatever you need from it if it can improve your software. 
 
