@@ -107,7 +107,7 @@ void tns6d_free(Tns6dGrid *g)
 
 /* ═══════════════ 1-SITE GATE ═══════════════ */
 
-struct tmp6d { uint64_t basis; double re, im; };
+struct tmp6d { basis_t basis; double re, im; };
 
 void tns6d_gate_1site(Tns6dGrid *g, int x, int y, int z, int w, int v, int u,
                       const double *U_re, const double *U_im)
@@ -120,7 +120,7 @@ void tns6d_gate_1site(Tns6dGrid *g, int x, int y, int z, int w, int v, int u,
     uint32_t old_nnz = r->num_nonzero;
     if (old_nnz == 0) return;
 
-    uint64_t *obs = (uint64_t*)malloc(old_nnz*sizeof(uint64_t));
+    basis_t *obs = (basis_t*)malloc(old_nnz*sizeof(basis_t));
     double *ore = (double*)malloc(old_nnz*sizeof(double));
     double *oim = (double*)malloc(old_nnz*sizeof(double));
     for (uint32_t e=0; e<old_nnz; e++) {
@@ -133,12 +133,12 @@ void tns6d_gate_1site(Tns6dGrid *g, int x, int y, int z, int w, int v, int u,
 
     for (uint32_t e=0; e<old_nnz; e++) {
         int k_old = (int)(obs[e] / TNS6D_C12);
-        uint64_t bond = obs[e] % TNS6D_C12;
+        basis_t bond = obs[e] % TNS6D_C12;
         for (int k_new=0; k_new<D; k_new++) {
             double ure=U_re[k_new*D+k_old], uim=U_im[k_new*D+k_old];
             if (ure*ure+uim*uim < 1e-30) continue;
             double tr = ure*ore[e]-uim*oim[e], ti = ure*oim[e]+uim*ore[e];
-            uint64_t nbs = (uint64_t)k_new*TNS6D_C12 + bond;
+            basis_t nbs = (basis_t)k_new*TNS6D_C12 + bond;
             int found=0;
             for (size_t i=0; i<ntmp; i++) {
                 if (tmp[i].basis==nbs) { tmp[i].re+=tr; tmp[i].im+=ti; found=1; break; }
@@ -168,7 +168,7 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
                                      const double *G_re, const double *G_im)
 {
     int D=TNS6D_D, chi=(int)TNS6D_CHI;
-    uint64_t bp[13]={1,TNS6D_CHI,TNS6D_C2,TNS6D_C3,TNS6D_C4,TNS6D_C5,TNS6D_C6,
+    basis_t bp[13]={1,TNS6D_CHI,TNS6D_C2,TNS6D_C3,TNS6D_C4,TNS6D_C5,TNS6D_C6,
                      TNS6D_C7,TNS6D_C8,TNS6D_C9,TNS6D_C10,TNS6D_C11,TNS6D_C12};
 
     int bond_A=-1, bond_B=-1;
@@ -185,20 +185,20 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
     QuhitRegister *regB=&g->eng->registers[g->site_reg[sB]];
 
     int max_E=chi;
-    uint64_t *ueA=(uint64_t*)malloc(max_E*sizeof(uint64_t));
-    uint64_t *ueB=(uint64_t*)malloc(max_E*sizeof(uint64_t));
+    basis_t *ueA=(basis_t*)malloc(max_E*sizeof(basis_t));
+    basis_t *ueB=(basis_t*)malloc(max_E*sizeof(basis_t));
     int nEA=0, nEB=0;
 
     for (uint32_t e=0; e<regA->num_nonzero; e++) {
-        uint64_t pure=regA->entries[e].basis_state % TNS6D_C12;
-        uint64_t env=(pure/bp[bond_A+1])*bp[bond_A]+(pure%bp[bond_A]);
+        basis_t pure=regA->entries[e].basis_state % TNS6D_C12;
+        basis_t env=(pure/bp[bond_A+1])*bp[bond_A]+(pure%bp[bond_A]);
         int found=0;
         for (int i=0;i<nEA;i++) if(ueA[i]==env){found=1;break;}
         if (!found && nEA<max_E) ueA[nEA++]=env;
     }
     for (uint32_t e=0; e<regB->num_nonzero; e++) {
-        uint64_t pure=regB->entries[e].basis_state % TNS6D_C12;
-        uint64_t env=(pure/bp[bond_B+1])*bp[bond_B]+(pure%bp[bond_B]);
+        basis_t pure=regB->entries[e].basis_state % TNS6D_C12;
+        basis_t env=(pure/bp[bond_B+1])*bp[bond_B]+(pure%bp[bond_B]);
         int found=0;
         for (int i=0;i<nEB;i++) if(ueB[i]==env){found=1;break;}
         if (!found && nEB<max_E) ueB[nEB++]=env;
@@ -211,25 +211,25 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
     double *Th_im=(double*)calloc(sd2,sizeof(double));
 
     for (uint32_t eA=0; eA<regA->num_nonzero; eA++) {
-        uint64_t bsA=regA->entries[eA].basis_state;
+        basis_t bsA=regA->entries[eA].basis_state;
         double arA=regA->entries[eA].amp_re, aiA=regA->entries[eA].amp_im;
         if (arA*arA+aiA*aiA<1e-10) continue;
         int kA=(int)(bsA/TNS6D_C12);
-        uint64_t pA=bsA%TNS6D_C12;
+        basis_t pA=bsA%TNS6D_C12;
         int svA=(int)((pA/bp[bond_A])%chi);
-        uint64_t envA=(pA/bp[bond_A+1])*bp[bond_A]+(pA%bp[bond_A]);
+        basis_t envA=(pA/bp[bond_A+1])*bp[bond_A]+(pA%bp[bond_A]);
         int iEA=-1; for(int i=0;i<nEA;i++) if(ueA[i]==envA){iEA=i;break;}
         if (iEA<0) continue;
         int row=kA*nEA+iEA;
         for (uint32_t eB=0; eB<regB->num_nonzero; eB++) {
-            uint64_t bsB=regB->entries[eB].basis_state;
+            basis_t bsB=regB->entries[eB].basis_state;
             double arB=regB->entries[eB].amp_re, aiB=regB->entries[eB].amp_im;
             if (arB*arB+aiB*aiB<1e-10) continue;
-            uint64_t pB=bsB%TNS6D_C12;
+            basis_t pB=bsB%TNS6D_C12;
             int svB=(int)((pB/bp[bond_B])%chi);
             if (svA!=svB) continue;
             int kB=(int)(bsB/TNS6D_C12);
-            uint64_t envB=(pB/bp[bond_B+1])*bp[bond_B]+(pB%bp[bond_B]);
+            basis_t envB=(pB/bp[bond_B+1])*bp[bond_B]+(pB%bp[bond_B]);
             int iEB=-1; for(int i=0;i<nEB;i++) if(ueB[i]==envB){iEB=i;break;}
             if (iEB<0) continue;
             int col=kB*nEB+iEB;
@@ -288,13 +288,13 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
     for (int kA=0;kA<D;kA++)
      for (int eA=0;eA<nEA;eA++) {
          int row=kA*nEA+eA;
-         uint64_t envA=ueA[eA];
-         uint64_t pure=(envA/bp[bond_A])*bp[bond_A+1]+(envA%bp[bond_A]);
+         basis_t envA=ueA[eA];
+         basis_t pure=(envA/bp[bond_A])*bp[bond_A+1]+(envA%bp[bond_A]);
          for (int gv=0;gv<rank;gv++) {
              double wt=(sn>1e-30&&sig[gv]>1e-30)?sqrt(sig[gv]/sn):0.0;
              double re=Ur[row*rank+gv]*wt, im=Ui[row*rank+gv]*wt;
              if (re*re+im*im<1e-50) continue;
-             uint64_t bs=kA*TNS6D_C12+pure+gv*bp[bond_A];
+             basis_t bs=kA*TNS6D_C12+pure+gv*bp[bond_A];
              if (regA->num_nonzero<4096) {
                  regA->entries[regA->num_nonzero].basis_state=bs;
                  regA->entries[regA->num_nonzero].amp_re=re;
@@ -306,13 +306,13 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
     for (int kB=0;kB<D;kB++)
      for (int eB=0;eB<nEB;eB++) {
          int col=kB*nEB+eB;
-         uint64_t envB=ueB[eB];
-         uint64_t pure=(envB/bp[bond_B])*bp[bond_B+1]+(envB%bp[bond_B]);
+         basis_t envB=ueB[eB];
+         basis_t pure=(envB/bp[bond_B])*bp[bond_B+1]+(envB%bp[bond_B]);
          for (int gv=0;gv<rank;gv++) {
              double wt=(sn>1e-30&&sig[gv]>1e-30)?sqrt(sig[gv]/sn):0.0;
              double re=wt*Vr[gv*sdB+col], im=wt*Vi[gv*sdB+col];
              if (re*re+im*im<1e-50) continue;
-             uint64_t bs=kB*TNS6D_C12+pure+gv*bp[bond_B];
+             basis_t bs=kB*TNS6D_C12+pure+gv*bp[bond_B];
              if (regB->num_nonzero<4096) {
                  regB->entries[regB->num_nonzero].basis_state=bs;
                  regB->entries[regB->num_nonzero].amp_re=re;
