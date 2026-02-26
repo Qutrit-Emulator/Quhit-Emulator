@@ -84,6 +84,9 @@ typedef struct {
     uint32_t     num_cz;            /* Deferred CZ count                    */
 } QuhitPair;
 
+/* ─── 128-bit basis state type (GCC/Clang __int128) ─── */
+typedef unsigned __int128 basis_t;
+
 /* ─── Quhit Register (100T-scale, Magic Pointer Hilbert Space) ─── */
 typedef struct {
     uint64_t     chunk_id;          /* Parent chunk ID                      */
@@ -94,7 +97,7 @@ typedef struct {
     /* The Hilbert Space — self-describing sparse entries */
     uint32_t     num_nonzero;       /* Active basis entries                 */
     struct {
-        uint64_t basis_state;       /* Packed basis: Σ q_k × D^k           */
+        basis_t  basis_state;       /* Packed basis: Σ q_k × D^k (128-bit) */
         double   amp_re;            /* Real amplitude                       */
         double   amp_im;            /* Imaginary amplitude                  */
     } entries[4096];                /* Sparse amplitude storage             */
@@ -213,11 +216,11 @@ uint64_t quhit_reg_measure(QuhitEngine *eng, int reg_idx, uint64_t quhit_idx);
 
 /* ─── Streaming State Vector (statevector.h compatible) ─── */
 SV_Amplitude quhit_reg_sv_get(QuhitEngine *eng, int reg_idx,
-                              uint64_t basis_k);
+                              basis_t basis_k);
 void         quhit_reg_sv_set(QuhitEngine *eng, int reg_idx,
-                              uint64_t basis_k, double re, double im);
+                              basis_t basis_k, double re, double im);
 
-typedef void (*sv_stream_fn)(uint64_t basis_state, SV_Amplitude amp,
+typedef void (*sv_stream_fn)(basis_t basis_state, SV_Amplitude amp,
                              void *user_data);
 void         quhit_reg_sv_stream(QuhitEngine *eng, int reg_idx,
                                  sv_stream_fn callback, void *user_data);
