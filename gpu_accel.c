@@ -122,6 +122,8 @@ static struct {
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 static const char *ZGEMM_KERNEL_SRC =
+"#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n"
+"\n"
 "__kernel void zgemm_nn(\n"
 "    int M, int N, int K,\n"
 "    double alpha_re, double alpha_im,\n"
@@ -226,32 +228,64 @@ int gpu_accel_init(void)
     LOAD_FN(GetDeviceInfo);
     LOAD_FN(GetProgramBuildInfo);
 
-    /* Get platform + device (prefer GPU, fall back to CPU compute) */
-    cl_platform_id plat;
+    /* ── Find a device with cl_khr_fp64 support ──
+     * Enumerate ALL platforms × ALL devices.
+     * Prefer GPU with fp64, accept CPU with fp64 (e.g. pocl). */
+    #define MAX_PLATS 8
+    #define MAX_DEVS  8
+    cl_platform_id plats[MAX_PLATS];
     cl_uint n_plat = 0;
-    if (g_gpu.GetPlatformIDs(1, &plat, &n_plat) != CL_SUCCESS || n_plat == 0) {
+    if (g_gpu.GetPlatformIDs(MAX_PLATS, plats, &n_plat) != CL_SUCCESS || n_plat == 0) {
         fprintf(stderr, "[gpu_accel] No OpenCL platforms — CPU fallback\n");
         dlclose(g_gpu.lib); g_gpu.lib = NULL;
         return 0;
     }
 
     cl_int err;
-    cl_uint n_dev = 0;
-    err = g_gpu.GetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 1, &g_gpu.device, &n_dev);
-    if (err != CL_SUCCESS || n_dev == 0) {
-        /* Try CPU compute device as fallback */
-        err = g_gpu.GetDeviceIDs(plat, CL_DEVICE_TYPE_CPU, 1, &g_gpu.device, &n_dev);
-        if (err != CL_SUCCESS || n_dev == 0) {
-            fprintf(stderr, "[gpu_accel] No compute devices — CPU fallback\n");
-            dlclose(g_gpu.lib); g_gpu.lib = NULL;
-            return 0;
+    cl_device_id best_dev = NULL;
+    cl_platform_id best_plat = NULL;
+    int best_is_gpu = 0;
+    char ext_buf[8192];
+
+    for (cl_uint p = 0; p < n_plat; p++) {
+        cl_device_id devs[MAX_DEVS];
+        cl_uint n_dev = 0;
+        /* Get ALL device types */
+        g_gpu.GetDeviceIDs(plats[p], CL_DEVICE_TYPE_ALL, MAX_DEVS, devs, &n_dev);
+        for (cl_uint d = 0; d < n_dev; d++) {
+            /* Check for cl_khr_fp64 */
+            memset(ext_buf, 0, sizeof(ext_buf));
+            g_gpu.GetDeviceInfo(devs[d], 0x1030 /*CL_DEVICE_EXTENSIONS*/,
+                                sizeof(ext_buf), ext_buf, NULL);
+            if (!strstr(ext_buf, "cl_khr_fp64")) continue;
+
+            /* Check device type */
+            cl_ulong dtype = 0;
+            g_gpu.GetDeviceInfo(devs[d], 0x1000 /*CL_DEVICE_TYPE*/,
+                                sizeof(dtype), &dtype, NULL);
+            int is_gpu = (dtype & CL_DEVICE_TYPE_GPU) != 0;
+
+            /* Prefer GPU over CPU, but accept CPU with fp64 */
+            if (!best_dev || (is_gpu && !best_is_gpu)) {
+                best_dev = devs[d];
+                best_plat = plats[p];
+                best_is_gpu = is_gpu;
+            }
         }
     }
+
+    if (!best_dev) {
+        fprintf(stderr, "[gpu_accel] No device with cl_khr_fp64 — CPU fallback\n");
+        dlclose(g_gpu.lib); g_gpu.lib = NULL;
+        return 0;
+    }
+    g_gpu.device = best_dev;
 
     /* Print device name */
     char dev_name[256] = {0};
     g_gpu.GetDeviceInfo(g_gpu.device, CL_DEVICE_NAME, sizeof(dev_name), dev_name, NULL);
-    fprintf(stderr, "[gpu_accel] Using device: %s\n", dev_name);
+    fprintf(stderr, "[gpu_accel] Using device: %s (fp64=%s)\n",
+            dev_name, best_is_gpu ? "GPU" : "CPU-compute");
 
     /* Create context + command queue */
     g_gpu.ctx = g_gpu.CreateContext(NULL, 1, &g_gpu.device, NULL, NULL, &err);
@@ -265,7 +299,7 @@ int gpu_accel_init(void)
     g_gpu.prog = g_gpu.CreateProgramWithSource(g_gpu.ctx, 1, &ZGEMM_KERNEL_SRC, &src_len, &err);
     if (err != CL_SUCCESS) goto fail;
 
-    err = g_gpu.BuildProgram(g_gpu.prog, 1, &g_gpu.device, "-cl-fast-relaxed-math", NULL, NULL);
+    err = g_gpu.BuildProgram(g_gpu.prog, 1, &g_gpu.device, NULL, NULL, NULL);
     if (err != CL_SUCCESS) {
         /* Print build log */
         char log[4096] = {0};
