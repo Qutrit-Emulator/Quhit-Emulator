@@ -257,7 +257,7 @@ uint32_t mps_overlay_measure(QuhitEngine *eng, uint32_t *quhits, int n, int targ
 
 static int mps_cmp_basis(const void *a, const void *b)
 {
-    const struct { uint64_t basis; double re, im; } *ea = a, *eb = b;
+    const struct { basis_t basis; double re, im; } *ea = a, *eb = b;
     if (ea->basis < eb->basis) return -1;
     if (ea->basis > eb->basis) return 1;
     return 0;
@@ -278,16 +278,16 @@ void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
         /* Build output in temporary arrays */
         uint32_t max_out = reg->num_nonzero * D + 1;
         if (max_out < 4096) max_out = 4096;
-        struct { uint64_t basis; double re, im; } *tmp =
+        struct { basis_t basis; double re, im; } *tmp =
             calloc(max_out, sizeof(*tmp));
         uint32_t nout = 0;
 
         for (uint32_t e = 0; e < reg->num_nonzero; e++) {
-            uint64_t bs = reg->entries[e].basis_state;
+            basis_t bs = reg->entries[e].basis_state;
             double ar = reg->entries[e].amp_re;
             double ai = reg->entries[e].amp_im;
             int k = (int)(bs / chi2);           /* physical index */
-            uint64_t bond = bs % chi2;          /* α*χ + β */
+            basis_t bond = bs % chi2;          /* α*χ + β */
 
             for (int kp = 0; kp < D; kp++) {
                 double ur = U_re[kp * D + k];
@@ -297,7 +297,7 @@ void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
                 if (nr*nr + ni*ni < 1e-10) continue;
 
                 if (nout < max_out) {
-                    tmp[nout].basis = (uint64_t)kp * chi2 + bond;
+                    tmp[nout].basis = (basis_t)kp * chi2 + bond;
                     tmp[nout].re = nr;
                     tmp[nout].im = ni;
                     nout++;
@@ -371,7 +371,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     QuhitRegister *regB = &eng->registers[mps_store[sB].reg_idx];
 
     for (uint32_t eA = 0; eA < regA->num_nonzero; eA++) {
-        uint64_t bsA = regA->entries[eA].basis_state;
+        basis_t bsA = regA->entries[eA].basis_state;
         double arA = regA->entries[eA].amp_re;
         double aiA = regA->entries[eA].amp_im;
         /* Side-channel: use mag² directly, skip sqrt for threshold check */
@@ -384,7 +384,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
         int row = kA * chi + alpha;
 
         for (uint32_t eB = 0; eB < regB->num_nonzero; eB++) {
-            uint64_t bsB = regB->entries[eB].basis_state;
+            basis_t bsB = regB->entries[eB].basis_state;
             double arB = regB->entries[eB].amp_re;
             double aiB = regB->entries[eB].amp_im;
             if (arB*arB + aiB*aiB < 1e-10) continue;
@@ -468,7 +468,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
              double re = sq * U_re[row * rank + g];
              double im = sq * U_im[row * rank + g];
              if (re*re + im*im > 1e-10 && regA->num_nonzero < 4096) {
-                 uint64_t bs = (uint64_t)kA * chi2 + (uint64_t)a * chi + g;
+                 basis_t bs = (basis_t)kA * chi2 + (basis_t)a * chi + g;
                  regA->entries[regA->num_nonzero].basis_state = bs;
                  regA->entries[regA->num_nonzero].amp_re = re;
                  regA->entries[regA->num_nonzero].amp_im = im;
@@ -488,7 +488,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
              double re = sq * Vc_re[g * dchi + col];
              double im = sq * Vc_im[g * dchi + col];
              if (re*re + im*im > 1e-10 && regB->num_nonzero < 4096) {
-                 uint64_t bs = (uint64_t)kB * chi2 + (uint64_t)g * chi + b;
+                 basis_t bs = (basis_t)kB * chi2 + (basis_t)g * chi + b;
                  regB->entries[regB->num_nonzero].basis_state = bs;
                  regB->entries[regB->num_nonzero].amp_re = re;
                  regB->entries[regB->num_nonzero].amp_im = im;
