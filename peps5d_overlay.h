@@ -24,23 +24,23 @@
 
 /* ═══════════════ CONSTANTS ═══════════════ */
 
-#define TNS5D_D    6     /* Physical dimension (SU(6)) */
-#define TNS5D_CHI  2     /* Bond dimension per axis    */
+#define TNS5D_D    6       /* Physical dimension (SU(6)) */
+#define TNS5D_CHI  128ULL  /* Bond dimension per axis    */
 
-/* Cumulative products for 11-index encoding:
+/* Cumulative products for 11-index encoding (derived from CHI):
  * basis = k*C10 + b9*C9 + b8*C8 + ... + b1*C1 + b0
  */
-#define TNS5D_C1   2        /* χ^1 */
-#define TNS5D_C2   4        /* χ^2 */
-#define TNS5D_C3   8        /* χ^3 */
-#define TNS5D_C4   16       /* χ^4 */
-#define TNS5D_C5   32       /* χ^5 */
-#define TNS5D_C6   64       /* χ^6 */
-#define TNS5D_C7   128      /* χ^7 */
-#define TNS5D_C8   256      /* χ^8 */
-#define TNS5D_C9   512      /* χ^9 */
-#define TNS5D_C10  1024     /* χ^10 = total bond basis */
-#define TNS5D_TSIZ (TNS5D_D * TNS5D_C10)  /* 6144 */
+#define TNS5D_C1   (TNS5D_CHI)
+#define TNS5D_C2   (TNS5D_CHI * TNS5D_CHI)
+#define TNS5D_C3   (TNS5D_C2 * TNS5D_CHI)
+#define TNS5D_C4   (TNS5D_C2 * TNS5D_C2)
+#define TNS5D_C5   (TNS5D_C3 * TNS5D_C2)
+#define TNS5D_C6   (TNS5D_C3 * TNS5D_C3)
+#define TNS5D_C7   (TNS5D_C4 * TNS5D_C3)
+#define TNS5D_C8   (TNS5D_C4 * TNS5D_C4)
+#define TNS5D_C9   (TNS5D_C5 * TNS5D_C4)
+#define TNS5D_C10  (TNS5D_C5 * TNS5D_C5)
+#define TNS5D_TSIZ (TNS5D_D * TNS5D_C10)
 
 /* ═══════════════ DATA STRUCTURES ═══════════════ */
 
@@ -49,7 +49,7 @@ typedef struct {
 } Tns5dTensor;
 
 typedef struct {
-    double w[TNS5D_CHI];
+    double *w;  /* Heap-allocated: χ singular values */
 } Tns5dBondWeight;
 
 typedef struct {
