@@ -26,7 +26,7 @@
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 #define PEPS_D     6       /* Physical dimension (SU(6) native)        */
-#define PEPS_CHI   12      /* Bond dimension via Magic Pointers         */
+#define PEPS_CHI   512ULL  /* Bond dimension via Magic Pointers         */
 #define PEPS_D2    (PEPS_D * PEPS_D)   /* 36: joint physical space     */
 
 /* Derived powers — used only for basis encoding, NOT for RAM allocation */
@@ -38,7 +38,8 @@
 
 /* 5-index tensor basis encoding: |k,u,d,l,r⟩ → packed integer */
 #define PT_IDX(k,u,d,l,r) \
-    ((k)*PEPS_CHI4 + (u)*PEPS_CHI3 + (d)*PEPS_CHI2 + (l)*PEPS_CHI + (r))
+    ((uint64_t)(k)*PEPS_CHI4 + (uint64_t)(u)*PEPS_CHI3 + \
+     (uint64_t)(d)*PEPS_CHI2 + (uint64_t)(l)*PEPS_CHI + (uint64_t)(r))
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * DATA STRUCTURES — Magic Pointer based (no RAM-hungry classical tensors)
@@ -53,7 +54,7 @@ typedef struct {
 } PepsTensor;
 
 typedef struct {
-    double w[PEPS_CHI];   /* Singular values on this bond */
+    double *w;   /* Heap-allocated: χ singular values on this bond */
 } PepsBondWeight;
 
 typedef struct {
