@@ -265,7 +265,7 @@ static void tns5d_gate_2site_generic(Tns5dGrid *g,
     QuhitRegister *regB = &g->eng->registers[g->site_reg[sB]];
 
     /* ── 1. Find Sparse-Rank Environment ── */
-    int max_E = chi * chi;
+    int max_E = chi;
     uint64_t *uniq_envA = (uint64_t*)malloc(max_E * sizeof(uint64_t));
     uint64_t *uniq_envB = (uint64_t*)malloc(max_E * sizeof(uint64_t));
     int num_EA = 0, num_EB = 0;
