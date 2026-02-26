@@ -258,7 +258,7 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
     double *Vr=(double*)calloc((size_t)chi*sdB,sizeof(double));
     double *Vi=(double*)calloc((size_t)chi*sdB,sizeof(double));
 
-    tsvd_truncated(T2r,T2i,sdA,sdB,chi,Ur,Ui,sig,Vr,Vi);
+    tsvd_truncated_sparse(T2r,T2i,sdA,sdB,chi,Ur,Ui,sig,Vr,Vi);
     free(T2r);free(T2i);
 
     int rank=chi<sdB?chi:sdB; if(rank>sdA) rank=sdA;
