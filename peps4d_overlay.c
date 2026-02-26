@@ -420,6 +420,12 @@ static void tns4d_gate_2site_generic(Tns4dGrid *g,
     int rank = chi < svddim_B ? chi : svddim_B;
     if (rank > svddim_A) rank = svddim_A;
 
+    /* Cap rank so write-back stays within 4096-entry register limit */
+    int max_env = num_EA > num_EB ? num_EA : num_EB;
+    int rank_cap = max_env > 0 ? 4096 / (D * max_env) : rank;
+    if (rank_cap < 1) rank_cap = 1;
+    if (rank > rank_cap) rank = rank_cap;
+
     double sig_norm = 0;
     for (int s = 0; s < rank; s++) sig_norm += sig[s];
 
