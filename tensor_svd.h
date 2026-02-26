@@ -11,6 +11,10 @@
  *   • Zero attractor: 60% of Jacobi angles < 0.01 → aggressive skip
  *   • Early sweep termination via relative off-diagonal check
  *   • 1/6 spectrum awareness: contraction σ → 1/√D
+ *
+ * ── GPU Acceleration (gpu_accel.c) ──
+ *   • H = M†M and U = M·V offloaded to OpenCL ZGEMM
+ *   • Auto-init, auto-fallback to CPU for small matrices or no GPU
  */
 
 #ifndef TENSOR_SVD_H
@@ -19,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "gpu_accel.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * JACOBI HERMITIAN EIGENDECOMPOSITION
@@ -134,6 +139,8 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
  * M (m×n complex) → U (m×chi) × σ (chi) × V† (chi×n)
  * Uses Jacobi eigendecomposition of M†M to find V, σ.
  * U = M V σ⁻¹.
+ *
+ * GPU acceleration: H = M†M and U = M·V offloaded via gpu_zgemm().
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 static void tsvd_truncated(const double *M_re, const double *M_im,
@@ -142,23 +149,18 @@ static void tsvd_truncated(const double *M_re, const double *M_im,
                            double *sigma,
                            double *Vc_re, double *Vc_im)
 {
-    /* Form H = M† M  (n×n Hermitian) */
+    /* Form H = M† M  (n×n Hermitian) via GPU-accelerated ZGEMM */
     size_t hsz = (size_t)n * n;
     double *H_re = (double *)calloc(hsz, sizeof(double));
     double *H_im = (double *)calloc(hsz, sizeof(double));
 
-    for (int i = 0; i < n; i++)
-        for (int j = i; j < n; j++) {
-            double sr = 0, si = 0;
-            for (int k = 0; k < m; k++) {
-                double ar = M_re[k*n+i], ai = -M_im[k*n+i]; /* conj */
-                double br = M_re[k*n+j], bi =  M_im[k*n+j];
-                sr += ar*br - ai*bi;
-                si += ar*bi + ai*br;
-            }
-            H_re[i*n+j] = sr; H_im[i*n+j] = si;
-            H_re[j*n+i] = sr; H_im[j*n+i] = -si; /* Hermitian */
-        }
+    /* H = 1.0 * M† * M + 0.0 * H   (conj-transpose A, normal B) */
+    gpu_zgemm('C', 'N', n, n, m,
+              1.0, 0.0,
+              M_re, M_im, n,    /* A = M (m×n), accessed as M† → n×m */
+              M_re, M_im, n,    /* B = M (m×n) */
+              0.0, 0.0,
+              H_re, H_im, n);   /* C = H (n×n) */
 
     /* Jacobi eigendecomposition: H = V D V† */
     double *eig = (double *)calloc(n, sizeof(double));
@@ -173,25 +175,40 @@ static void tsvd_truncated(const double *M_re, const double *M_im,
     for (int i = 0; i < rank; i++)
         sigma[i] = eig[i] > 0 ? sqrt(eig[i]) : 0;
 
-    /* U = M V σ⁻¹  (m × rank) */
+    /* U = M V σ⁻¹  (m × rank) via GPU-accelerated ZGEMM
+     * First compute U_raw = M × V[:, 0:rank]  (m × rank)
+     * Then scale each column j by 1/σ[j] */
     memset(U_re, 0, (size_t)m * rank * sizeof(double));
     memset(U_im, 0, (size_t)m * rank * sizeof(double));
 
+    /* Extract V_trunc = V[:, 0:rank] (n × rank) — already in column order */
+    double *Vt_re = (double *)calloc((size_t)n * rank, sizeof(double));
+    double *Vt_im = (double *)calloc((size_t)n * rank, sizeof(double));
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < rank; j++) {
+            Vt_re[i * rank + j] = V_re[i * n + j];
+            Vt_im[i * rank + j] = V_im[i * n + j];
+        }
+
+    /* U_raw = M × V_trunc  (m × rank) */
+    gpu_zgemm('N', 'N', m, rank, n,
+              1.0, 0.0,
+              M_re, M_im, n,        /* A = M (m×n) */
+              Vt_re, Vt_im, rank,   /* B = V_trunc (n×rank) */
+              0.0, 0.0,
+              U_re, U_im, rank);    /* C = U_raw (m×rank) */
+
+    /* Scale each column by σ⁻¹ */
     for (int j = 0; j < rank; j++) {
         if (sigma[j] < 1e-100) continue;
         double inv = 1.0 / sigma[j];
         for (int i = 0; i < m; i++) {
-            double sr = 0, si = 0;
-            for (int k = 0; k < n; k++) {
-                double mr = M_re[i*n+k], mi = M_im[i*n+k];
-                double vr = V_re[k*n+j], vi = V_im[k*n+j];
-                sr += mr*vr - mi*vi;
-                si += mr*vi + mi*vr;
-            }
-            U_re[i*rank+j] = sr * inv;
-            U_im[i*rank+j] = si * inv;
+            U_re[i * rank + j] *= inv;
+            U_im[i * rank + j] *= inv;
         }
     }
+
+    free(Vt_re); free(Vt_im);
 
     /* V† = conj(V)^T  (rank × n) */
     for (int i = 0; i < rank; i++)
@@ -206,3 +223,4 @@ static void tsvd_truncated(const double *M_re, const double *M_im,
 }
 
 #endif /* TENSOR_SVD_H */
+
