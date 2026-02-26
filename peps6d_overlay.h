@@ -25,7 +25,7 @@
 #include <math.h>
 
 #define TNS6D_D    6
-#define TNS6D_CHI  128ULL
+#define TNS6D_CHI  8ULL    /* Bond dim per axis (12 bonds → χ^12 must fit uint64) */
 
 /* Cumulative bond powers for 13-index encoding (derived from CHI) */
 #define TNS6D_C1   (TNS6D_CHI)
