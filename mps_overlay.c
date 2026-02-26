@@ -125,58 +125,62 @@ void mps_overlay_amplitude(QuhitEngine *eng, uint32_t *quhits, int n,
 uint32_t mps_overlay_measure(QuhitEngine *eng, uint32_t *quhits, int n, int target_idx)
 {
     (void)quhits;
+    int chi = MPS_CHI;
+    size_t chi2 = (size_t)chi * chi;
 
-    /* Right density environment */
-    double rho_R[MPS_CHI][MPS_CHI];
-    memset(rho_R, 0, sizeof(rho_R));
-    rho_R[0][0] = 1.0;
+    /* Right density environment (heap) */
+    double *rho_R = (double *)calloc(chi2, sizeof(double));
+    rho_R[0] = 1.0;  /* rho_R[0][0] = 1.0 */
 
     for (int j = n - 1; j > target_idx; j--) {
-        double new_rho[MPS_CHI][MPS_CHI] = {{0}};
+        double *new_rho = (double *)calloc(chi2, sizeof(double));
         for (int k = 0; k < MPS_PHYS; k++) {
-            double A[MPS_CHI][MPS_CHI];
-            for (int a = 0; a < MPS_CHI; a++)
-                for (int b = 0; b < MPS_CHI; b++) {
+            double *A = (double *)calloc(chi2, sizeof(double));
+            for (int a = 0; a < chi; a++)
+                for (int b = 0; b < chi; b++) {
                     double re, im;
                     mps_read_tensor(j, k, a, b, &re, &im);
-                    A[a][b] = re;
+                    A[a * chi + b] = re;
                 }
-            double tmp[MPS_CHI][MPS_CHI] = {{0}};
-            for (int a = 0; a < MPS_CHI; a++)
-                for (int b = 0; b < MPS_CHI; b++)
-                    for (int c = 0; c < MPS_CHI; c++)
-                        tmp[a][b] += A[a][c] * rho_R[c][b];
-            for (int a = 0; a < MPS_CHI; a++)
-                for (int b = 0; b < MPS_CHI; b++)
-                    for (int c = 0; c < MPS_CHI; c++)
-                        new_rho[a][b] += tmp[a][c] * A[b][c];
+            double *tmp = (double *)calloc(chi2, sizeof(double));
+            for (int a = 0; a < chi; a++)
+                for (int b = 0; b < chi; b++)
+                    for (int c = 0; c < chi; c++)
+                        tmp[a * chi + b] += A[a * chi + c] * rho_R[c * chi + b];
+            for (int a = 0; a < chi; a++)
+                for (int b = 0; b < chi; b++)
+                    for (int c = 0; c < chi; c++)
+                        new_rho[a * chi + b] += tmp[a * chi + c] * A[b * chi + c];
+            free(A); free(tmp);
         }
-        memcpy(rho_R, new_rho, sizeof(rho_R));
+        memcpy(rho_R, new_rho, chi2 * sizeof(double));
+        free(new_rho);
     }
 
     /* Left environment */
-    double L[MPS_CHI];
-    memset(L, 0, sizeof(L));
+    double *L = (double *)calloc(chi, sizeof(double));
     L[0] = 1.0;
 
     for (int j = 0; j < target_idx; j++) {
-        double new_L[MPS_CHI] = {0};
+        double *new_L = (double *)calloc(chi, sizeof(double));
         for (int k = 0; k < MPS_PHYS; k++) {
-            double Ak[MPS_CHI][MPS_CHI];
+            double *Ak = (double *)calloc(chi2, sizeof(double));
             int nonzero = 0;
-            for (int a = 0; a < MPS_CHI; a++)
-                for (int b = 0; b < MPS_CHI; b++) {
+            for (int a = 0; a < chi; a++)
+                for (int b = 0; b < chi; b++) {
                     double re, im;
                     mps_read_tensor(j, k, a, b, &re, &im);
-                    Ak[a][b] = re;
+                    Ak[a * chi + b] = re;
                     if (re != 0 || im != 0) nonzero = 1;
                 }
-            if (!nonzero) continue;
-            for (int b = 0; b < MPS_CHI; b++)
-                for (int a = 0; a < MPS_CHI; a++)
-                    new_L[b] += L[a] * Ak[a][b];
+            if (!nonzero) { free(Ak); continue; }
+            for (int b = 0; b < chi; b++)
+                for (int a = 0; a < chi; a++)
+                    new_L[b] += L[a] * Ak[a * chi + b];
+            free(Ak);
         }
-        memcpy(L, new_L, sizeof(L));
+        memcpy(L, new_L, chi * sizeof(double));
+        free(new_L);
     }
 
     /* P(k) */
@@ -184,24 +188,28 @@ uint32_t mps_overlay_measure(QuhitEngine *eng, uint32_t *quhits, int n, int targ
     double total_prob = 0;
 
     for (int k = 0; k < MPS_PHYS; k++) {
-        double Ak[MPS_CHI][MPS_CHI];
-        for (int a = 0; a < MPS_CHI; a++)
-            for (int b = 0; b < MPS_CHI; b++) {
+        double *Ak = (double *)calloc(chi2, sizeof(double));
+        for (int a = 0; a < chi; a++)
+            for (int b = 0; b < chi; b++) {
                 double re, im;
                 mps_read_tensor(target_idx, k, a, b, &re, &im);
-                Ak[a][b] = re;
+                Ak[a * chi + b] = re;
             }
-        double mid[MPS_CHI] = {0};
-        for (int b = 0; b < MPS_CHI; b++)
-            for (int a = 0; a < MPS_CHI; a++)
-                mid[b] += L[a] * Ak[a][b];
+        double *mid = (double *)calloc(chi, sizeof(double));
+        for (int b = 0; b < chi; b++)
+            for (int a = 0; a < chi; a++)
+                mid[b] += L[a] * Ak[a * chi + b];
         double pk = 0;
-        for (int a = 0; a < MPS_CHI; a++)
-            for (int b = 0; b < MPS_CHI; b++)
-                pk += mid[a] * rho_R[a][b] * mid[b];
+        for (int a = 0; a < chi; a++)
+            for (int b = 0; b < chi; b++)
+                pk += mid[a] * rho_R[a * chi + b] * mid[b];
         probs[k] = pk > 0 ? pk : 0;
         total_prob += probs[k];
+        free(Ak); free(mid);
     }
+
+    free(L);
+    free(rho_R);
 
     /* Born sample */
     if (total_prob > 1e-30)
@@ -218,22 +226,22 @@ uint32_t mps_overlay_measure(QuhitEngine *eng, uint32_t *quhits, int n, int targ
     /* Project + renormalize */
     for (int k = 0; k < MPS_PHYS; k++) {
         if ((uint32_t)k != outcome) {
-            for (int a = 0; a < MPS_CHI; a++)
-                for (int b = 0; b < MPS_CHI; b++)
+            for (int a = 0; a < chi; a++)
+                for (int b = 0; b < chi; b++)
                     mps_write_tensor(target_idx, k, a, b, 0, 0);
         }
     }
     double slice_norm2 = 0;
-    for (int a = 0; a < MPS_CHI; a++)
-        for (int b = 0; b < MPS_CHI; b++) {
+    for (int a = 0; a < chi; a++)
+        for (int b = 0; b < chi; b++) {
             double re, im;
             mps_read_tensor(target_idx, (int)outcome, a, b, &re, &im);
             slice_norm2 += re*re + im*im;
         }
     if (slice_norm2 > 1e-30) {
         double scale = 1.0 / sqrt(slice_norm2);
-        for (int a = 0; a < MPS_CHI; a++)
-            for (int b = 0; b < MPS_CHI; b++) {
+        for (int a = 0; a < chi; a++)
+            for (int b = 0; b < chi; b++) {
                 double re, im;
                 mps_read_tensor(target_idx, (int)outcome, a, b, &re, &im);
                 mps_write_tensor(target_idx, (int)outcome, a, b, re*scale, im*scale);
@@ -587,44 +595,53 @@ void mps_build_hadamard2(double *U_re, double *U_im)
 double mps_overlay_norm(QuhitEngine *eng, uint32_t *quhits, int n)
 {
     (void)eng; (void)quhits;
+    int chi = MPS_CHI;
+    size_t chi2 = (size_t)chi * chi;
 
-    double rho_re[MPS_CHI][MPS_CHI] = {{0}};
-    double rho_im[MPS_CHI][MPS_CHI] = {{0}};
-    rho_re[0][0] = 1.0;
+    double *rho_re = (double *)calloc(chi2, sizeof(double));
+    double *rho_im = (double *)calloc(chi2, sizeof(double));
+    rho_re[0] = 1.0;  /* [0][0] */
 
     for (int i = 0; i < n; i++) {
-        double nr[MPS_CHI][MPS_CHI] = {{0}};
-        double ni_arr[MPS_CHI][MPS_CHI] = {{0}};
+        double *nr     = (double *)calloc(chi2, sizeof(double));
+        double *ni_arr = (double *)calloc(chi2, sizeof(double));
 
         for (int k = 0; k < MPS_PHYS; k++) {
-            double A_re[MPS_CHI][MPS_CHI], A_im[MPS_CHI][MPS_CHI];
-            for (int a = 0; a < MPS_CHI; a++)
-                for (int b = 0; b < MPS_CHI; b++)
-                    mps_read_tensor(i, k, a, b, &A_re[a][b], &A_im[a][b]);
+            double *A_re = (double *)calloc(chi2, sizeof(double));
+            double *A_im = (double *)calloc(chi2, sizeof(double));
+            for (int a = 0; a < chi; a++)
+                for (int b = 0; b < chi; b++)
+                    mps_read_tensor(i, k, a, b,
+                                    &A_re[a * chi + b], &A_im[a * chi + b]);
 
-            double tr2[MPS_CHI][MPS_CHI] = {{0}};
-            double ti2[MPS_CHI][MPS_CHI] = {{0}};
-            for (int a = 0; a < MPS_CHI; a++)
-                for (int bp = 0; bp < MPS_CHI; bp++)
-                    for (int ap = 0; ap < MPS_CHI; ap++) {
-                        tr2[a][bp] += rho_re[a][ap]*A_re[ap][bp] - rho_im[a][ap]*A_im[ap][bp];
-                        ti2[a][bp] += rho_re[a][ap]*A_im[ap][bp] + rho_im[a][ap]*A_re[ap][bp];
+            double *tr2 = (double *)calloc(chi2, sizeof(double));
+            double *ti2 = (double *)calloc(chi2, sizeof(double));
+            for (int a = 0; a < chi; a++)
+                for (int bp = 0; bp < chi; bp++)
+                    for (int ap = 0; ap < chi; ap++) {
+                        tr2[a*chi+bp] += rho_re[a*chi+ap]*A_re[ap*chi+bp]
+                                       - rho_im[a*chi+ap]*A_im[ap*chi+bp];
+                        ti2[a*chi+bp] += rho_re[a*chi+ap]*A_im[ap*chi+bp]
+                                       + rho_im[a*chi+ap]*A_re[ap*chi+bp];
                     }
 
-            for (int b = 0; b < MPS_CHI; b++)
-                for (int bp = 0; bp < MPS_CHI; bp++)
-                    for (int a = 0; a < MPS_CHI; a++) {
-                        double ar = A_re[a][b], ai = -A_im[a][b];
-                        nr[b][bp]     += ar*tr2[a][bp] - ai*ti2[a][bp];
-                        ni_arr[b][bp] += ar*ti2[a][bp] + ai*tr2[a][bp];
+            for (int b = 0; b < chi; b++)
+                for (int bp = 0; bp < chi; bp++)
+                    for (int a = 0; a < chi; a++) {
+                        double ar = A_re[a*chi+b], ai = -A_im[a*chi+b];
+                        nr[b*chi+bp]     += ar*tr2[a*chi+bp] - ai*ti2[a*chi+bp];
+                        ni_arr[b*chi+bp] += ar*ti2[a*chi+bp] + ai*tr2[a*chi+bp];
                     }
+            free(A_re); free(A_im); free(tr2); free(ti2);
         }
-        memcpy(rho_re, nr, sizeof(rho_re));
-        memcpy(rho_im, ni_arr, sizeof(rho_im));
+        memcpy(rho_re, nr, chi2 * sizeof(double));
+        memcpy(rho_im, ni_arr, chi2 * sizeof(double));
+        free(nr); free(ni_arr);
     }
 
     double trace = 0;
-    for (int i = 0; i < MPS_CHI; i++) trace += rho_re[i][i];
+    for (int i = 0; i < chi; i++) trace += rho_re[i * chi + i];
+    free(rho_re); free(rho_im);
     return trace;
 }
 
