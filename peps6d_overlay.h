@@ -25,21 +25,23 @@
 #include <math.h>
 
 #define TNS6D_D    6
-#define TNS6D_CHI  32ULL   /* Max χ for 12 bonds: 6×32^12 = 6×2^60 fits uint64 */
+#define TNS6D_CHI  128ULL  /* Bond dimension per axis */
 
-/* Cumulative bond powers for 13-index encoding (derived from CHI) */
-#define TNS6D_C1   (TNS6D_CHI)
-#define TNS6D_C2   (TNS6D_CHI * TNS6D_CHI)
+/* Cumulative bond powers for 13-index encoding (derived from CHI)
+ * NOTE: C12 = 128^12 = 2^84, requires basis_t (128-bit)
+ */
+#define TNS6D_C1   ((unsigned __int128)TNS6D_CHI)
+#define TNS6D_C2   (TNS6D_C1 * TNS6D_CHI)
 #define TNS6D_C3   (TNS6D_C2 * TNS6D_CHI)
-#define TNS6D_C4   (TNS6D_C2 * TNS6D_C2)
-#define TNS6D_C5   (TNS6D_C3 * TNS6D_C2)
-#define TNS6D_C6   (TNS6D_C3 * TNS6D_C3)
-#define TNS6D_C7   (TNS6D_C4 * TNS6D_C3)
-#define TNS6D_C8   (TNS6D_C4 * TNS6D_C4)
-#define TNS6D_C9   (TNS6D_C5 * TNS6D_C4)
-#define TNS6D_C10  (TNS6D_C5 * TNS6D_C5)
-#define TNS6D_C11  (TNS6D_C6 * TNS6D_C5)
-#define TNS6D_C12  (TNS6D_C6 * TNS6D_C6)
+#define TNS6D_C4   (TNS6D_C3 * TNS6D_CHI)
+#define TNS6D_C5   (TNS6D_C4 * TNS6D_CHI)
+#define TNS6D_C6   (TNS6D_C5 * TNS6D_CHI)
+#define TNS6D_C7   (TNS6D_C6 * TNS6D_CHI)
+#define TNS6D_C8   (TNS6D_C7 * TNS6D_CHI)
+#define TNS6D_C9   (TNS6D_C8 * TNS6D_CHI)
+#define TNS6D_C10  (TNS6D_C9 * TNS6D_CHI)
+#define TNS6D_C11  (TNS6D_C10 * TNS6D_CHI)
+#define TNS6D_C12  (TNS6D_C11 * TNS6D_CHI)
 #define TNS6D_TSIZ (TNS6D_D * TNS6D_C12)
 
 typedef struct { int reg_idx; } Tns6dTensor;
