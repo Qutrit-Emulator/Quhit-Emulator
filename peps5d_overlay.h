@@ -25,7 +25,7 @@
 /* ═══════════════ CONSTANTS ═══════════════ */
 
 #define TNS5D_D    6       /* Physical dimension (SU(6)) */
-#define TNS5D_CHI  128ULL  /* Bond dimension per axis    */
+#define TNS5D_CHI  32ULL   /* Bond dimension per axis (10 bonds → χ^10 must fit uint64) */
 
 /* Cumulative products for 11-index encoding (derived from CHI):
  * basis = k*C10 + b9*C9 + b8*C8 + ... + b1*C1 + b0
