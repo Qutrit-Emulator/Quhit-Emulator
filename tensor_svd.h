@@ -316,9 +316,20 @@ static void tsvd_mgs(double *Q_re, double *Q_im, int rows, int cols)
 /* ═══════════════════════════════════════════════════════════════════════════════
  * tsvd_sparse_power — Randomized SVD on sparse COO matrix
  *
+ * Magic Pointer coordinate compression:
+ *   nnz ≤ 4096 entries → at most 4096 unique rows, 4096 unique cols.
+ *   ALL arrays use compressed dimensions mr×mc ≤ 4096×4096.
+ *   At χ=512: m=n=1,572,864 but mr,mc ≈ 4096 → fits in ~131KB.
+ *
  * Input:  sp[nnz] = COO Theta (m × n), chi = target rank
  * Output: U (m×chi), sigma(chi), Vc (chi×n) — same as tsvd_truncated
  * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* Integer comparison for qsort */
+static int tsvd_icmp(const void *a, const void *b) {
+    int ia = *(const int *)a, ib = *(const int *)b;
+    return (ia > ib) - (ia < ib);
+}
 
 static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
                                int m, int n, int chi,
@@ -330,25 +341,85 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
     if (rank > m) rank = m;
 
     memset(sigma, 0, rank * sizeof(double));
-    memset(U_re,  0, (size_t)m * rank * sizeof(double));
-    memset(U_im,  0, (size_t)m * rank * sizeof(double));
-    memset(Vc_re, 0, (size_t)rank * n * sizeof(double));
-    memset(Vc_im, 0, (size_t)rank * n * sizeof(double));
 
     if (nnz == 0 || rank == 0) return;
 
-    /* Oversampling parameter — stabilizes flat spectra */
-    int p = rank < 10 ? rank : 10;
-    int ell = rank + p;          /* sketch width */
-    if (ell > n) ell = n;
-    if (ell > m) ell = m;
+    /* ══════════ Magic Pointer Coordinate Compression ══════════
+     * Extract unique row/col indices from sparse entries.
+     * Map m-dimensional rows → mr-dimensional compressed rows (mr ≤ nnz).
+     * Map n-dimensional cols → mc-dimensional compressed cols (mc ≤ nnz).
+     * ALL subsequent arrays use mr, mc instead of m, n.
+     * ═══════════════════════════════════════════════════════════ */
 
-    /* ── Step 1: Draw random Ω (n × ℓ) ── */
+    int *raw_rows = (int *)malloc((size_t)nnz * sizeof(int));
+    int *raw_cols = (int *)malloc((size_t)nnz * sizeof(int));
+    for (int e = 0; e < nnz; e++) {
+        raw_rows[e] = sp[e].row;
+        raw_cols[e] = sp[e].col;
+    }
+
+    /* Sort and deduplicate rows */
+    qsort(raw_rows, (size_t)nnz, sizeof(int), tsvd_icmp);
+    int mr = 0;
+    for (int i = 0; i < nnz; i++)
+        if (i == 0 || raw_rows[i] != raw_rows[i-1])
+            raw_rows[mr++] = raw_rows[i];
+    int *row_map = (int *)malloc((size_t)mr * sizeof(int));  /* compressed → original */
+    for (int i = 0; i < mr; i++) row_map[i] = raw_rows[i];
+
+    /* Sort and deduplicate cols */
+    qsort(raw_cols, (size_t)nnz, sizeof(int), tsvd_icmp);
+    int mc = 0;
+    for (int i = 0; i < nnz; i++)
+        if (i == 0 || raw_cols[i] != raw_cols[i-1])
+            raw_cols[mc++] = raw_cols[i];
+    int *col_map = (int *)malloc((size_t)mc * sizeof(int));  /* compressed → original */
+    for (int i = 0; i < mc; i++) col_map[i] = raw_cols[i];
+
+    free(raw_rows); free(raw_cols);
+
+    /* Build inverse maps via binary search */
+    /* Remap COO entries to compressed coordinates */
+    TsvdSparseEntry *csp = (TsvdSparseEntry *)malloc((size_t)nnz * sizeof(*csp));
+    for (int e = 0; e < nnz; e++) {
+        /* Binary search for compressed row */
+        int lo = 0, hi = mr - 1, cr = 0;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (row_map[mid] == sp[e].row) { cr = mid; break; }
+            else if (row_map[mid] < sp[e].row) lo = mid + 1;
+            else hi = mid - 1;
+        }
+        /* Binary search for compressed col */
+        lo = 0; hi = mc - 1; int cc = 0;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (col_map[mid] == sp[e].col) { cc = mid; break; }
+            else if (col_map[mid] < sp[e].col) lo = mid + 1;
+            else hi = mid - 1;
+        }
+        csp[e].row = cr; csp[e].col = cc;
+        csp[e].re = sp[e].re; csp[e].im = sp[e].im;
+    }
+
+    /* ══════════ Now work entirely in compressed space ══════════
+     * Matrix is mr × mc, where mr, mc ≤ nnz ≤ 4096.
+     * At χ=512: mr,mc ≈ 4096 instead of 1,572,864. */
+
+    int c_rank = rank < mc ? rank : mc;
+    if (c_rank > mr) c_rank = mr;
+
+    int p = c_rank < 10 ? c_rank : 10;
+    int ell = c_rank + p;
+    if (ell > mc) ell = mc;
+    if (ell > mr) ell = mr;
+
+    /* ── Step 1: Draw random Ω (mc × ℓ) — COMPRESSED cols ── */
     uint64_t rng = 0xCAFEBABE13579BDFULL;
     for (int e = 0; e < nnz && e < 8; e++)
         rng ^= (uint64_t)(sp[e].re * 1e9) ^ ((uint64_t)(sp[e].im * 1e9) << 32);
 
-    size_t osz = (size_t)n * ell;
+    size_t osz = (size_t)mc * ell;
     double *Om_re = (double *)malloc(osz * sizeof(double));
     double *Om_im = (double *)malloc(osz * sizeof(double));
     for (int i = 0; i < (int)osz; i++) {
@@ -356,71 +427,56 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
         Om_im[i] = tsvd_lcg(&rng);
     }
 
-    /* ── Step 2: Range sketch with power iteration ──
-     * Y = (A A†)^q A Ω
-     * q = 2 is sufficient for PEPS (1/6 spectrum gap).
-     * Each step: Y = A Ω, then q times: Y = A(A†Y). */
+    /* ── Step 2: Range sketch with power iteration in compressed space ── */
+    size_t ysz = (size_t)mr * ell;
+    size_t tsz = (size_t)mc * ell;
+    double *Y_re = (double *)malloc(ysz * sizeof(double));
+    double *Y_im = (double *)malloc(ysz * sizeof(double));
+    double *T_re = (double *)malloc(tsz * sizeof(double));
+    double *T_im = (double *)malloc(tsz * sizeof(double));
 
-    size_t ysz = (size_t)m * ell;
-    size_t tsz = (size_t)n * ell;
-    double *Y_re  = (double *)malloc(ysz * sizeof(double));
-    double *Y_im  = (double *)malloc(ysz * sizeof(double));
-    double *T_re  = (double *)malloc(tsz * sizeof(double));
-    double *T_im  = (double *)malloc(tsz * sizeof(double));
-
-    /* Y = A Ω */
-    tsvd_sp_ax(sp, nnz, m, ell, Om_re, Om_im, Y_re, Y_im);
+    /* Y = A_c Ω  (mr × ℓ) */
+    tsvd_sp_ax(csp, nnz, mr, ell, Om_re, Om_im, Y_re, Y_im);
     free(Om_re); free(Om_im);
 
-    int q = 3;  /* power iterations — 3 sufficient for 1/6 gap + dense */
+    int q = 3;
     for (int qi = 0; qi < q; qi++) {
-        tsvd_mgs(Y_re, Y_im, m, ell);        /* stabilize */
-        /* T = A† Y  (n × ℓ) */
-        tsvd_sp_ahx(sp, nnz, n, ell, Y_re, Y_im, T_re, T_im);
-        tsvd_mgs(T_re, T_im, n, ell);        /* stabilize */
-        /* Y = A T   (m × ℓ) */
-        tsvd_sp_ax(sp, nnz, m, ell, T_re, T_im, Y_re, Y_im);
+        tsvd_mgs(Y_re, Y_im, mr, ell);
+        tsvd_sp_ahx(csp, nnz, mc, ell, Y_re, Y_im, T_re, T_im);
+        tsvd_mgs(T_re, T_im, mc, ell);
+        tsvd_sp_ax(csp, nnz, mr, ell, T_re, T_im, Y_re, Y_im);
     }
 
-    /* ── Step 3: Q = QR(Y)  — orthonormal basis for range, m × ℓ ── */
-    tsvd_mgs(Y_re, Y_im, m, ell);
-    /* Q is now Y_re, Y_im (in-place) */
+    /* ── Step 3: Q = QR(Y)  (mr × ℓ) ── */
+    tsvd_mgs(Y_re, Y_im, mr, ell);
     double *Q_re = Y_re, *Q_im = Y_im;
 
-    /* ── Step 4: B = Q† A  (ℓ × n) via sparse transpose multiply ──
-     * B[i][j] = sum_k conj(Q[k][i]) * A[k][j]
-     * = sum over sparse entries (r,c,a): conj(Q[r][i]) * a * δ(col=j)
-     */
-    size_t bsz = (size_t)ell * n;
+    /* ── Step 4: B = Q† A_c  (ℓ × mc) ── */
+    size_t bsz = (size_t)ell * mc;
     double *B_re = (double *)calloc(bsz, sizeof(double));
     double *B_im = (double *)calloc(bsz, sizeof(double));
 
     for (int e = 0; e < nnz; e++) {
-        int r = sp[e].row, c = sp[e].col;
-        double ar = sp[e].re, ai = sp[e].im;
+        int r = csp[e].row, c = csp[e].col;
+        double ar = csp[e].re, ai = csp[e].im;
         for (int i = 0; i < ell; i++) {
-            /* conj(Q[r][i]) * A[r][c] */
-            double qr = Q_re[r*ell+i], qi = -Q_im[r*ell+i]; /* conjugate */
-            B_re[i*n+c] += qr*ar - qi*ai;
-            B_im[i*n+c] += qr*ai + qi*ar;
+            double qr = Q_re[r*ell+i], qi = -Q_im[r*ell+i];
+            B_re[i*mc+c] += qr*ar - qi*ai;
+            B_im[i*mc+c] += qr*ai + qi*ar;
         }
     }
 
-    /* ── Step 5: SVD of small B (ℓ × n) via Jacobi on B†B (n × n) ──
-     * For PEPS: ℓ ≈ 22, n ≈ 72 → B†B is 72×72.
-     * But we can do better: form B B† (ℓ × ℓ) instead!
-     * ℓ ≈ 22 → Jacobi on 22×22 = trivially fast. */
+    /* ── Step 5: Jacobi on BB† (ℓ × ℓ) — trivially small ── */
     size_t lsz = (size_t)ell * ell;
     double *BBh_re = (double *)calloc(lsz, sizeof(double));
     double *BBh_im = (double *)calloc(lsz, sizeof(double));
 
-    /* BB† [ℓ×ℓ] = B × B†  where B is ℓ×n */
     for (int i = 0; i < ell; i++)
         for (int j = i; j < ell; j++) {
             double sr = 0, si = 0;
-            for (int k = 0; k < n; k++) {
-                double ar = B_re[i*n+k], ai = B_im[i*n+k];
-                double br = B_re[j*n+k], bi = -B_im[j*n+k]; /* conj(B[j][k]) */
+            for (int k = 0; k < mc; k++) {
+                double ar = B_re[i*mc+k], ai = B_im[i*mc+k];
+                double br = B_re[j*mc+k], bi = -B_im[j*mc+k];
                 sr += ar*br - ai*bi;
                 si += ar*bi + ai*br;
             }
@@ -434,18 +490,17 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
 
     tsvd_jacobi_hermitian(BBh_re, BBh_im, ell, eig, Ub_re, Ub_im);
 
-    /* σ = sqrt(eigenvalues), keep top-rank */
-    for (int i = 0; i < rank; i++)
+    for (int i = 0; i < c_rank && i < rank; i++)
         sigma[i] = (i < ell && eig[i] > 0) ? sqrt(eig[i]) : 0;
 
-    /* ── Step 6: Reconstruct U and V† ──
-     * U_full = Q @ Ub  (m × ℓ → m × rank, truncated)
-     * V = B† Ub σ⁻¹    (n × rank)
-     * Vc = conj(V)^T   (rank × n) */
+    /* ── Step 6: Reconstruct U and V† with coordinate decompression ──
+     * U_compressed = Q × Ub  (mr × c_rank)
+     * V_compressed = B† Ub σ⁻¹ (mc × c_rank)
+     * Then scatter back to original m, n coordinates via row_map, col_map */
 
-    /* U = Q × Ub[:, 0:rank]  (m × rank) */
-    for (int j = 0; j < rank; j++) {
-        for (int i = 0; i < m; i++) {
+    /* U: compute in compressed space, scatter to original rows */
+    for (int j = 0; j < c_rank && j < rank; j++) {
+        for (int i = 0; i < mr; i++) {
             double sr = 0, si = 0;
             for (int k = 0; k < ell; k++) {
                 double qr = Q_re[i*ell+k], qi = Q_im[i*ell+k];
@@ -453,39 +508,36 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
                 sr += qr*ur - qi*ui;
                 si += qr*ui + qi*ur;
             }
-            U_re[i*rank+j] = sr;
-            U_im[i*rank+j] = si;
+            U_re[row_map[i]*rank + j] = sr;
+            U_im[row_map[i]*rank + j] = si;
         }
     }
 
-    /* V† computed as: V[i][j] = (B† Ub σ⁻¹)[i][j]
-     * V[i][j] = sum_k conj(B[k][i]) * Ub[k][j] / σ[j]
-     * Vc[j][i] = conj(V[i][j]) */
-    for (int j = 0; j < rank; j++) {
+    /* V†: compute in compressed space, scatter to original cols */
+    for (int j = 0; j < c_rank && j < rank; j++) {
         if (sigma[j] < 1e-100) continue;
         double inv = 1.0 / sigma[j];
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < mc; i++) {
             double sr = 0, si = 0;
             for (int k = 0; k < ell; k++) {
-                /* conj(B[k][i]) */
-                double br = B_re[k*n+i], bi = -B_im[k*n+i];
+                double br = B_re[k*mc+i], bi = -B_im[k*mc+i];
                 double ur = Ub_re[k*ell+j], ui = Ub_im[k*ell+j];
                 sr += br*ur - bi*ui;
                 si += br*ui + bi*ur;
             }
-            /* V[i][j] = (sr + i*si) * inv */
-            /* Vc[j][i] = conj(V[i][j]) */
-            Vc_re[j*n+i] =  sr * inv;
-            Vc_im[j*n+i] = -si * inv;
+            Vc_re[j*n + col_map[i]] =  sr * inv;
+            Vc_im[j*n + col_map[i]] = -si * inv;
         }
     }
 
-    free(Q_re);   free(Q_im);
-    free(T_re);   free(T_im);
-    free(B_re);   free(B_im);
-    free(BBh_re); free(BBh_im);
+    free(csp);
+    free(row_map); free(col_map);
+    free(Q_re);    free(Q_im);
+    free(T_re);    free(T_im);
+    free(B_re);    free(B_im);
+    free(BBh_re);  free(BBh_im);
     free(eig);
-    free(Ub_re);  free(Ub_im);
+    free(Ub_re);   free(Ub_im);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
