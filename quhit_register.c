@@ -21,7 +21,7 @@
 #include "quhit_engine.h"
 
 /* Forward declaration — defined later in this file */
-static uint32_t reg_extract_digit(uint64_t basis, uint64_t pos,
+static uint32_t reg_extract_digit(basis_t basis, uint64_t pos,
                                   uint32_t D, uint8_t bulk_rule);
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -205,7 +205,7 @@ void quhit_reg_apply_unitary_pos(QuhitEngine *eng, int reg_idx,
     uint32_t max_entries = reg->num_nonzero * D + 1;
     if (max_entries < 4096) max_entries = 4096;
     uint32_t new_count = 0;
-    struct tmp_entry { uint64_t basis; double re, im; };
+    struct tmp_entry { basis_t basis; double re, im; };
     struct tmp_entry *tmp = (struct tmp_entry *)calloc(max_entries, sizeof(struct tmp_entry));
 
     /* D^pos multiplier for replacing digit at position pos */
@@ -213,7 +213,7 @@ void quhit_reg_apply_unitary_pos(QuhitEngine *eng, int reg_idx,
     for (uint64_t p = 0; p < pos; p++) pos_mul *= D;
 
     for (uint32_t e = 0; e < reg->num_nonzero; e++) {
-        uint64_t basis = reg->entries[e].basis_state;
+        basis_t basis = reg->entries[e].basis_state;
         double a_re = reg->entries[e].amp_re;
         double a_im = reg->entries[e].amp_im;
 
@@ -221,7 +221,7 @@ void quhit_reg_apply_unitary_pos(QuhitEngine *eng, int reg_idx,
         uint32_t k = (uint32_t)((basis / pos_mul) % D);
 
         /* Base: basis with digit at pos zeroed out */
-        uint64_t base = basis - (uint64_t)k * pos_mul;
+        basis_t base = basis - (basis_t)k * pos_mul;
 
         /* Apply U: for each output digit k', accumulate U[k',k] × amplitude */
         for (uint32_t kp = 0; kp < D; kp++) {
@@ -233,7 +233,7 @@ void quhit_reg_apply_unitary_pos(QuhitEngine *eng, int reg_idx,
 
             if (nr * nr + ni * ni < 1e-30) continue;
 
-            uint64_t new_basis = base + (uint64_t)kp * pos_mul;
+            basis_t new_basis = base + (basis_t)kp * pos_mul;
 
             /* Find or create entry for new_basis in tmp */
             int found = -1;
@@ -302,7 +302,7 @@ uint64_t quhit_reg_measure(QuhitEngine *eng, int reg_idx,
 
     /* Write back collapsed state */
     reg->num_nonzero = 1;
-    reg->entries[0].basis_state = (uint64_t)outcome;
+    reg->entries[0].basis_state = (basis_t)outcome;
     reg->entries[0].amp_re = 1.0;
     reg->entries[0].amp_im = 0.0;
 
@@ -334,7 +334,7 @@ uint64_t quhit_reg_measure(QuhitEngine *eng, int reg_idx,
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 SV_Amplitude quhit_reg_sv_get(QuhitEngine *eng, int reg_idx,
-                              uint64_t basis_k)
+                              basis_t basis_k)
 {
     SV_Amplitude amp = {0.0, 0.0};
     if (reg_idx < 0 || (uint32_t)reg_idx >= eng->num_registers) return amp;
@@ -349,7 +349,7 @@ SV_Amplitude quhit_reg_sv_get(QuhitEngine *eng, int reg_idx,
          * for pattern detection: just check if k mod D == k/D mod D == ...
          */
         uint32_t first_digit = (uint32_t)(basis_k % D);
-        uint64_t remaining = basis_k;
+        basis_t remaining = basis_k;
         int all_same = 1;
 
         /* Check each digit — early exit on mismatch */
@@ -394,7 +394,7 @@ SV_Amplitude quhit_reg_sv_get(QuhitEngine *eng, int reg_idx,
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
 void quhit_reg_sv_set(QuhitEngine *eng, int reg_idx,
-                      uint64_t basis_k, double re, double im)
+                      basis_t basis_k, double re, double im)
 {
     if (reg_idx < 0 || (uint32_t)reg_idx >= eng->num_registers) return;
     QuhitRegister *reg = &eng->registers[reg_idx];
@@ -534,7 +534,7 @@ SV_Amplitude quhit_reg_sv_inner(QuhitEngine *eng, int reg_a, int reg_b)
  * Memory: O(D) = O(6) per call. No materialization of D^N.
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
-static uint32_t reg_extract_digit(uint64_t basis, uint64_t pos,
+static uint32_t reg_extract_digit(basis_t basis, uint64_t pos,
                                   uint32_t D, uint8_t bulk_rule)
 {
     if (bulk_rule == 1) {
@@ -543,7 +543,7 @@ static uint32_t reg_extract_digit(uint64_t basis, uint64_t pos,
         return (uint32_t)(basis % D);
     }
     /* General: extract digit at position `pos` via base-D decomposition */
-    uint64_t v = basis;
+    basis_t v = basis;
     for (uint64_t i = 0; i < pos; i++) v /= D;
     return (uint32_t)(v % D);
 }
