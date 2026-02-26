@@ -277,9 +277,10 @@ static void tns3d_gate_2site_generic(Tns3dGrid *g,
     QuhitRegister *regB = &g->eng->registers[g->site_reg[sB]];
 
     /* ── 1. Find exact Sparse-Rank Environment ──
-     * Cap at χ² unique environments per side to keep SVD at D×χ² max.
-     * This preserves REAL bond configurations instead of synthetic ones. */
-    int max_E = chi * chi;
+     * Cap at χ unique environments per side to keep SVD manageable.
+     * At χ=256: svddim = D×256 = 1536 → Theta = 1536² × 16 = 36MB (ok).
+     * chi² would give svddim = D×65536 → Theta = 393K² × 16 = 2.3TB (bad). */
+    int max_E = chi;
     uint64_t *uniq_envA = (uint64_t*)malloc(max_E * sizeof(uint64_t));
     uint64_t *uniq_envB = (uint64_t*)malloc(max_E * sizeof(uint64_t));
     int num_EA = 0, num_EB = 0;
