@@ -60,16 +60,26 @@ Tns5dGrid *tns5d_init(int Lx, int Ly, int Lz, int Lw, int Lv)
     g->w_bonds = (Tns5dBondWeight *)calloc(nb_w > 0 ? nb_w : 1, sizeof(Tns5dBondWeight));
     g->v_bonds = (Tns5dBondWeight *)calloc(nb_v > 0 ? nb_v : 1, sizeof(Tns5dBondWeight));
 
-    for (int i = 0; i < nb_x; i++)
-        for (int s = 0; s < TNS5D_CHI; s++) g->x_bonds[i].w[s] = 1.0;
-    for (int i = 0; i < nb_y; i++)
-        for (int s = 0; s < TNS5D_CHI; s++) g->y_bonds[i].w[s] = 1.0;
-    for (int i = 0; i < nb_z; i++)
-        for (int s = 0; s < TNS5D_CHI; s++) g->z_bonds[i].w[s] = 1.0;
-    for (int i = 0; i < nb_w; i++)
-        for (int s = 0; s < TNS5D_CHI; s++) g->w_bonds[i].w[s] = 1.0;
-    for (int i = 0; i < nb_v; i++)
-        for (int s = 0; s < TNS5D_CHI; s++) g->v_bonds[i].w[s] = 1.0;
+    for (int i = 0; i < nb_x; i++) {
+        g->x_bonds[i].w = (double *)calloc((size_t)TNS5D_CHI, sizeof(double));
+        for (int s = 0; s < (int)TNS5D_CHI; s++) g->x_bonds[i].w[s] = 1.0;
+    }
+    for (int i = 0; i < nb_y; i++) {
+        g->y_bonds[i].w = (double *)calloc((size_t)TNS5D_CHI, sizeof(double));
+        for (int s = 0; s < (int)TNS5D_CHI; s++) g->y_bonds[i].w[s] = 1.0;
+    }
+    for (int i = 0; i < nb_z; i++) {
+        g->z_bonds[i].w = (double *)calloc((size_t)TNS5D_CHI, sizeof(double));
+        for (int s = 0; s < (int)TNS5D_CHI; s++) g->z_bonds[i].w[s] = 1.0;
+    }
+    for (int i = 0; i < nb_w; i++) {
+        g->w_bonds[i].w = (double *)calloc((size_t)TNS5D_CHI, sizeof(double));
+        for (int s = 0; s < (int)TNS5D_CHI; s++) g->w_bonds[i].w[s] = 1.0;
+    }
+    for (int i = 0; i < nb_v; i++) {
+        g->v_bonds[i].w = (double *)calloc((size_t)TNS5D_CHI, sizeof(double));
+        for (int s = 0; s < (int)TNS5D_CHI; s++) g->v_bonds[i].w[s] = 1.0;
+    }
 
     g->eng = (QuhitEngine *)calloc(1, sizeof(QuhitEngine));
     quhit_engine_init(g->eng);
@@ -95,6 +105,16 @@ void tns5d_free(Tns5dGrid *g)
 {
     if (!g) return;
     free(g->tensors);
+    int nb_x = g->Lv * g->Lw * g->Lz * g->Ly * (g->Lx - 1);
+    int nb_y = g->Lv * g->Lw * g->Lz * (g->Ly - 1) * g->Lx;
+    int nb_z = g->Lv * g->Lw * (g->Lz - 1) * g->Ly * g->Lx;
+    int nb_w = g->Lv * (g->Lw - 1) * g->Lz * g->Ly * g->Lx;
+    int nb_v = (g->Lv - 1) * g->Lw * g->Lz * g->Ly * g->Lx;
+    for (int i = 0; i < nb_x; i++) free(g->x_bonds[i].w);
+    for (int i = 0; i < nb_y; i++) free(g->y_bonds[i].w);
+    for (int i = 0; i < nb_z; i++) free(g->z_bonds[i].w);
+    for (int i = 0; i < nb_w; i++) free(g->w_bonds[i].w);
+    for (int i = 0; i < nb_v; i++) free(g->v_bonds[i].w);
     free(g->x_bonds);
     free(g->y_bonds);
     free(g->z_bonds);
@@ -230,7 +250,7 @@ static void tns5d_gate_2site_generic(Tns5dGrid *g,
                                      int shared_axis,
                                      const double *G_re, const double *G_im)
 {
-    int D = TNS5D_D, chi = TNS5D_CHI;
+    int D = TNS5D_D, chi = (int)TNS5D_CHI;
     uint64_t bp[11] = {1, TNS5D_CHI, TNS5D_C2, TNS5D_C3, TNS5D_C4,
                        TNS5D_C5, TNS5D_C6, TNS5D_C7, TNS5D_C8, TNS5D_C9, TNS5D_C10};
 
@@ -374,7 +394,7 @@ static void tns5d_gate_2site_generic(Tns5dGrid *g,
     for (int s = 0; s < rank; s++) sig_norm += sig[s];
 
     /* Side-channel: 1.0 attractor CONFIRMED — bond weights lock at 1.0 */
-    for (int s = 0; s < TNS5D_CHI; s++) shared_bw->w[s] = 1.0;
+    for (int s = 0; s < (int)TNS5D_CHI; s++) shared_bw->w[s] = 1.0;
 
     /* ── 5. Write back (sparse) ── */
     regA->num_nonzero = 0;
