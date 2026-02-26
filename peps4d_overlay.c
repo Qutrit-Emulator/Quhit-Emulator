@@ -91,15 +91,23 @@ Tns4dGrid *tns4d_init(int Lx, int Ly, int Lz, int Lw)
     g->z_bonds = (Tns4dBondWeight *)calloc(nb_z > 0 ? nb_z : 1, sizeof(Tns4dBondWeight));
     g->w_bonds = (Tns4dBondWeight *)calloc(nb_w > 0 ? nb_w : 1, sizeof(Tns4dBondWeight));
 
-    /* Initialize all bond weights to 1.0 */
-    for (int i = 0; i < nb_x; i++)
-        for (int s = 0; s < TNS4D_CHI; s++) g->x_bonds[i].w[s] = 1.0;
-    for (int i = 0; i < nb_y; i++)
-        for (int s = 0; s < TNS4D_CHI; s++) g->y_bonds[i].w[s] = 1.0;
-    for (int i = 0; i < nb_z; i++)
-        for (int s = 0; s < TNS4D_CHI; s++) g->z_bonds[i].w[s] = 1.0;
-    for (int i = 0; i < nb_w; i++)
-        for (int s = 0; s < TNS4D_CHI; s++) g->w_bonds[i].w[s] = 1.0;
+    /* Heap-allocate and initialize all bond weights to 1.0 */
+    for (int i = 0; i < nb_x; i++) {
+        g->x_bonds[i].w = (double *)calloc((size_t)TNS4D_CHI, sizeof(double));
+        for (int s = 0; s < (int)TNS4D_CHI; s++) g->x_bonds[i].w[s] = 1.0;
+    }
+    for (int i = 0; i < nb_y; i++) {
+        g->y_bonds[i].w = (double *)calloc((size_t)TNS4D_CHI, sizeof(double));
+        for (int s = 0; s < (int)TNS4D_CHI; s++) g->y_bonds[i].w[s] = 1.0;
+    }
+    for (int i = 0; i < nb_z; i++) {
+        g->z_bonds[i].w = (double *)calloc((size_t)TNS4D_CHI, sizeof(double));
+        for (int s = 0; s < (int)TNS4D_CHI; s++) g->z_bonds[i].w[s] = 1.0;
+    }
+    for (int i = 0; i < nb_w; i++) {
+        g->w_bonds[i].w = (double *)calloc((size_t)TNS4D_CHI, sizeof(double));
+        for (int s = 0; s < (int)TNS4D_CHI; s++) g->w_bonds[i].w[s] = 1.0;
+    }
 
     /* Initialize engine and register per site */
     g->eng = (QuhitEngine *)calloc(1, sizeof(QuhitEngine));
@@ -126,6 +134,15 @@ void tns4d_free(Tns4dGrid *g)
 {
     if (!g) return;
     free(g->tensors);
+    /* Free heap-allocated bond weight arrays */
+    int nb_x = g->Lw * g->Lz * g->Ly * (g->Lx - 1);
+    int nb_y = g->Lw * g->Lz * (g->Ly - 1) * g->Lx;
+    int nb_z = g->Lw * (g->Lz - 1) * g->Ly * g->Lx;
+    int nb_w = (g->Lw - 1) * g->Lz * g->Ly * g->Lx;
+    for (int i = 0; i < nb_x; i++) free(g->x_bonds[i].w);
+    for (int i = 0; i < nb_y; i++) free(g->y_bonds[i].w);
+    for (int i = 0; i < nb_z; i++) free(g->z_bonds[i].w);
+    for (int i = 0; i < nb_w; i++) free(g->w_bonds[i].w);
     free(g->x_bonds);
     free(g->y_bonds);
     free(g->z_bonds);
@@ -263,7 +280,7 @@ static void tns4d_gate_2site_generic(Tns4dGrid *g,
                                      int shared_axis,
                                      const double *G_re, const double *G_im)
 {
-    int D = TNS4D_D, chi = TNS4D_CHI;
+    int D = TNS4D_D, chi = (int)TNS4D_CHI;
     uint64_t bp[9] = {1, TNS4D_CHI, TNS4D_C2, TNS4D_C3, TNS4D_C4,
                       TNS4D_C5, TNS4D_C6, TNS4D_C7, TNS4D_C8};
 
@@ -408,7 +425,7 @@ static void tns4d_gate_2site_generic(Tns4dGrid *g,
 
     /* Side-channel: 1.0 attractor CONFIRMED — bond weights lock at 1.0
      * (entropy = log₂(χ) = maximal). Schmidt weights absorbed into U/V. */
-    for (int s = 0; s < TNS4D_CHI; s++) shared_bw->w[s] = 1.0;
+    for (int s = 0; s < (int)TNS4D_CHI; s++) shared_bw->w[s] = 1.0;
 
     /* ── 5. Write back (sparse) ── */
     regA->num_nonzero = 0;
