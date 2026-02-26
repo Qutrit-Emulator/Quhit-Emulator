@@ -58,7 +58,7 @@ Tns6dGrid *tns6d_init(int Lx, int Ly, int Lz, int Lw, int Lv, int Lu)
     g->v_bonds = (Tns6dBondWeight *)calloc(nb_v, sizeof(Tns6dBondWeight));
     g->u_bonds = (Tns6dBondWeight *)calloc(nb_u, sizeof(Tns6dBondWeight));
 
-    #define INIT_BW6(arr, n) for(int i=0;i<n;i++) for(int s=0;s<TNS6D_CHI;s++) arr[i].w[s]=1.0;
+    #define INIT_BW6(arr, n) for(int i=0;i<n;i++){arr[i].w=(double*)calloc((size_t)TNS6D_CHI,sizeof(double));for(int s=0;s<(int)TNS6D_CHI;s++)arr[i].w[s]=1.0;}
     INIT_BW6(g->x_bonds, nb_x); INIT_BW6(g->y_bonds, nb_y);
     INIT_BW6(g->z_bonds, nb_z); INIT_BW6(g->w_bonds, nb_w);
     INIT_BW6(g->v_bonds, nb_v); INIT_BW6(g->u_bonds, nb_u);
@@ -87,6 +87,18 @@ void tns6d_free(Tns6dGrid *g)
 {
     if (!g) return;
     free(g->tensors);
+    int nb_x = g->Lu*g->Lv*g->Lw*g->Lz*g->Ly*(g->Lx-1); if(nb_x<1) nb_x=0;
+    int nb_y = g->Lu*g->Lv*g->Lw*g->Lz*(g->Ly-1)*g->Lx; if(nb_y<1) nb_y=0;
+    int nb_z = g->Lu*g->Lv*g->Lw*(g->Lz-1)*g->Ly*g->Lx; if(nb_z<1) nb_z=0;
+    int nb_w = g->Lu*g->Lv*(g->Lw-1)*g->Lz*g->Ly*g->Lx; if(nb_w<1) nb_w=0;
+    int nb_v = g->Lu*(g->Lv-1)*g->Lw*g->Lz*g->Ly*g->Lx; if(nb_v<1) nb_v=0;
+    int nb_u = (g->Lu-1)*g->Lv*g->Lw*g->Lz*g->Ly*g->Lx; if(nb_u<1) nb_u=0;
+    for(int i=0;i<nb_x;i++) free(g->x_bonds[i].w);
+    for(int i=0;i<nb_y;i++) free(g->y_bonds[i].w);
+    for(int i=0;i<nb_z;i++) free(g->z_bonds[i].w);
+    for(int i=0;i<nb_w;i++) free(g->w_bonds[i].w);
+    for(int i=0;i<nb_v;i++) free(g->v_bonds[i].w);
+    for(int i=0;i<nb_u;i++) free(g->u_bonds[i].w);
     free(g->x_bonds); free(g->y_bonds); free(g->z_bonds);
     free(g->w_bonds); free(g->v_bonds); free(g->u_bonds);
     if (g->eng) { quhit_engine_destroy(g->eng); free(g->eng); }
@@ -155,7 +167,7 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
                                      Tns6dBondWeight *bw, int axis,
                                      const double *G_re, const double *G_im)
 {
-    int D=TNS6D_D, chi=TNS6D_CHI;
+    int D=TNS6D_D, chi=(int)TNS6D_CHI;
     uint64_t bp[13]={1,TNS6D_CHI,TNS6D_C2,TNS6D_C3,TNS6D_C4,TNS6D_C5,TNS6D_C6,
                      TNS6D_C7,TNS6D_C8,TNS6D_C9,TNS6D_C10,TNS6D_C11,TNS6D_C12};
 
@@ -264,7 +276,7 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
     int rank=chi<sdB?chi:sdB; if(rank>sdA) rank=sdA;
     double sn=0; for(int s=0;s<rank;s++) sn+=sig[s];
     /* Side-channel: 1.0 attractor CONFIRMED — bond weights lock at 1.0 */
-    for(int s=0;s<TNS6D_CHI;s++) bw->w[s]=1.0;
+    for(int s=0;s<(int)TNS6D_CHI;s++) bw->w[s]=1.0;
 
     regA->num_nonzero=0; regB->num_nonzero=0;
 
