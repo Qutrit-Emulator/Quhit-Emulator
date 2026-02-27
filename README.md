@@ -1,4 +1,8 @@
 <p align="center">
+HEAP COMPILE. Otherwise you will get segfault!
+</p>
+
+<p align="center">
 Notice to those cloning this
 </p>
 <p align="center">
