@@ -454,7 +454,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     int rank = chi < dchi ? chi : dchi;
     double sig_norm = 0;
     for (int i = 0; i < rank; i++) sig_norm += sig[i] * sig[i];
-    double sc_scale = (sig_norm > 1e-30) ? 1.0 / sqrt(sig_norm) : 0.0;
+    double sc_scale = (sig_norm > 1e-30) ? born_fast_isqrt(sig_norm) : 0.0;
     for (int i = 0; i < rank; i++) sig[i] *= sc_scale;
 
     /* A'[kA', α, γ] = √σ[γ] × U[(kA'*χ+α), γ] */
@@ -463,7 +463,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
      for (int a = 0; a < chi; a++) {
          int row = kA * chi + a;
          for (int g = 0; g < rank; g++) {
-             double sq = sqrt(sig[g]);
+             double sq = sig[g] > 1e-20 ? sig[g] * born_fast_isqrt(sig[g]) : 0;
              if (sq < 1e-10) continue;
              double re = sq * U_re[row * rank + g];
              double im = sq * U_im[row * rank + g];
@@ -481,8 +481,8 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     regB->num_nonzero = 0;
     for (int kB = 0; kB < D; kB++)
      for (int g = 0; g < rank; g++) {
-         double sq = sqrt(sig[g]);
-         if (sq < 1e-10) continue;
+          double sq = sig[g] > 1e-20 ? sig[g] * born_fast_isqrt(sig[g]) : 0;
+          if (sq < 1e-10) continue;
          for (int b = 0; b < chi; b++) {
              int col = kB * chi + b;
              double re = sq * Vc_re[g * dchi + col];
@@ -504,7 +504,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
             norm2 += regA->entries[e].amp_re * regA->entries[e].amp_re +
                      regA->entries[e].amp_im * regA->entries[e].amp_im;
         if (norm2 > 1e-20) {
-            double inv = 1.0 / sqrt(norm2);
+            double inv = born_fast_isqrt(norm2);
             for (uint32_t e = 0; e < regA->num_nonzero; e++) {
                 regA->entries[e].amp_re *= inv;
                 regA->entries[e].amp_im *= inv;
@@ -517,7 +517,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
             norm2 += regB->entries[e].amp_re * regB->entries[e].amp_re +
                      regB->entries[e].amp_im * regB->entries[e].amp_im;
         if (norm2 > 1e-20) {
-            double inv = 1.0 / sqrt(norm2);
+            double inv = born_fast_isqrt(norm2);
             for (uint32_t e = 0; e < regB->num_nonzero; e++) {
                 regB->entries[e].amp_re *= inv;
                 regB->entries[e].amp_im *= inv;
