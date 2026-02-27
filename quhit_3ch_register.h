@@ -1,32 +1,28 @@
 /*
- * quhit_3ch_register.h — N-Body 3-Square Factored Register
+ * quhit_3ch_register.h — Lazy 3-Square Register (2^N storage)
  *
- * Scales the FQ_Quhit architecture (quhit_factored.h) to N quhits.
+ * Stores ONLY the parity register: 2^N entries of (b, amplitude).
+ * Plane indices (s_i) are NEVER stored — derived on demand.
  *
- * Single quhit: 3 planes × 2 parities = 6 amplitudes
- * N quhits:     3 planes × 2^N basis states per plane
+ * DFT₆ = Hadamard on parity bit (twiddle + DFT₃ are derivation-time ops).
  *
- * k_i = 3 * p_i + s   (quhit i has parity p_i = bit i, plane s shared)
+ * CZ between quhits i,j:
+ *   In the physical basis, phase ω₆^{k_i·k_j} with k = 3p + s.
+ *   Since planes are uniform (all s_i equally probable), the CZ effect
+ *   on the stored parity amplitude is the coherent average:
  *
- * All N quhits in one entry share the SAME plane index s.
- * The plane index is the "outer" degree of freedom.
- * The parity bits are the "inner" N-qubit register.
+ *     F(p_i, p_j) = (1/9) Σ_{s_i,s_j=0}^{2} ω₆^{(3p_i+s_i)(3p_j+s_j)}
  *
- * DFT₆ on quhit i:
- *   Stage 1: Hadamard on bit i (per plane, independently)
- *   Stage 2: Twiddle ω₆^(s · p_i) on plane s, entries where bit i = 1
- *   Stage 3: DFT₃ across planes for each basis state
+ *   This is a known analytical function of (p_i, p_j) — precomputed.
+ *   CZ multiplies each entry by F(p_i, p_j).
  *
- * CZ on quhits i,j:
- *   Diagonal phase ω₆^{k_i · k_j} where k = 3p + s.
- *   Since both quhits share plane s:
- *     phase = ω₆^{(3p_i + s)(3p_j + s)}
+ * Born probabilities:
+ *   P(k_i = 3p+s) = (1/3) × Σ_{b: b_i=p} |amp(b)|²
+ *   (uniform over 3 planes, each contributes 1/3)
  *
- * Lazy derivation:
- *   Before DFT₃, planes 1,2 differ from plane 0 only by twiddle.
- *   Plane s, odd-parity entries: amp_s = amp_0 × ω₆^s
- *   → Store only plane 0, derive 1,2 on demand.
- *   After DFT₃, all planes are authoritative (dirty).
+ * After CZ, the plane uniformity is broken. The CZ factor F already
+ * encodes the plane-dependent phases into the parity amplitudes.
+ * Born probs after CZ use the modified amplitudes directly.
  */
 
 #ifndef QUHIT_3CH_REGISTER_H
@@ -42,319 +38,326 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ── Constants ── */
-
 static const double W6R[6] = {1.0, 0.5, -0.5, -1.0, -0.5, 0.5};
 static const double W6I[6] = {0.0, 0.86602540378443864676,
      0.86602540378443864676, 0.0, -0.86602540378443864676,
     -0.86602540378443864676};
 
-#define H2   0.70710678118654752440   /* 1/√2 */
-#define N3   0.57735026918962576451   /* 1/√3 */
-#define W3R  (-0.5)
-#define W3I  0.86602540378443864676   /* √3/2 */
+#define FQ_H2 0.70710678118654752440
 
-/* ── Sparse Plane: dynamic array of (basis, amplitude) ── */
+/* ═══════════════════════════════════════════════════════════════
+ * CZ gate history — recorded, not executed
+ * At observation time, plane-dependent phases are derived.
+ * ═══════════════════════════════════════════════════════════════ */
 
-typedef struct { uint64_t basis; double re, im; } PlaneEntry;
+#define MAX_CZ_GATES 256
 
-typedef struct {
-    PlaneEntry *e;
-    int         n, cap;
-    uint8_t     dirty;    /* 1 = authoritative, 0 = can be derived */
-} Plane;
+typedef struct { int qi, qj; } CZGate;
 
-static inline void plane_init(Plane *p, int cap) {
-    p->cap = cap;
-    p->e = (PlaneEntry *)calloc(cap, sizeof(PlaneEntry));
-    p->n = 0;
-    p->dirty = 0;
-}
-
-static inline void plane_free(Plane *p) { free(p->e); }
-
-static inline void plane_clear(Plane *p) { p->n = 0; }
-
-static inline void plane_grow(Plane *p) {
-    p->cap = p->cap ? p->cap * 2 : 64;
-    p->e = (PlaneEntry *)realloc(p->e, p->cap * sizeof(PlaneEntry));
-}
-
-static inline void plane_add(Plane *p, uint64_t b, double re, double im) {
-    for (int i = 0; i < p->n; i++)
-        if (p->e[i].basis == b) {
-            p->e[i].re += re; p->e[i].im += im;
-            return;
-        }
-    if (p->n >= p->cap) plane_grow(p);
-    p->e[p->n++] = (PlaneEntry){b, re, im};
-}
-
-static inline void plane_set(Plane *p, uint64_t b, double re, double im) {
-    for (int i = 0; i < p->n; i++)
-        if (p->e[i].basis == b) {
-            p->e[i].re = re; p->e[i].im = im;
-            return;
-        }
-    if (p->n >= p->cap) plane_grow(p);
-    p->e[p->n++] = (PlaneEntry){b, re, im};
-}
-
-static inline void plane_trim(Plane *p, double eps) {
-    double e2 = eps * eps;
-    int j = 0;
-    for (int i = 0; i < p->n; i++)
-        if (p->e[i].re * p->e[i].re + p->e[i].im * p->e[i].im > e2)
-            p->e[j++] = p->e[i];
-    p->n = j;
-}
-
-static inline double plane_prob(const Plane *p) {
-    double s = 0;
-    for (int i = 0; i < p->n; i++)
-        s += p->e[i].re * p->e[i].re + p->e[i].im * p->e[i].im;
-    return s;
-}
-
-/* ── 3-Plane Register ── */
+/* ═══════════════════════════════════════════════════════════════
+ * Hash table for (b → amplitude)
+ * ═══════════════════════════════════════════════════════════════ */
 
 typedef struct {
-    Plane    planes[3];
-    int      N;           /* number of quhits */
-    uint8_t  primary;     /* which plane is authoritative (0,1,2) */
-} TCR;
+    uint64_t b;
+    double   re, im;
+    uint8_t  used;
+} PSlot;
 
-static inline TCR *tcr_alloc(int N) {
-    TCR *r = (TCR *)calloc(1, sizeof *r);
-    r->N = N;
-    r->primary = 0;
-    for (int s = 0; s < 3; s++) plane_init(&r->planes[s], 64);
+typedef struct { uint64_t b; double re, im; } PE;
+
+typedef struct {
+    PSlot *tab;
+    int    cap, cnt, N;
+    CZGate cz[MAX_CZ_GATES];
+    int    ncz;
+    uint64_t dft_mask; /* bit i=1 → quhit i has been DFT₆'d, planes uniform */
+} FQR;
+
+static inline uint64_t pmix(uint64_t b) {
+    b ^= b >> 33;
+    b *= 0xFF51AFD7ED558CCDULL;
+    b ^= b >> 33;
+    return b;
+}
+
+static inline FQR *fqr_alloc(int N) {
+    FQR *r = (FQR *)calloc(1, sizeof *r);
+    r->N = N; r->cap = 256; r->ncz = 0; r->dft_mask = 0;
+    r->tab = (PSlot *)calloc(r->cap, sizeof(PSlot));
     return r;
 }
 
-static inline void tcr_free(TCR *r) {
-    for (int s = 0; s < 3; s++) plane_free(&r->planes[s]);
-    free(r);
-}
+static inline void fqr_free(FQR *r) { free(r->tab); free(r); }
 
-/* All quhits |0⟩: k=0 → (s=0, p=0)
- * Only plane 0 has amplitude. Planes 1,2 are genuinely empty.
- * All planes authoritative — no lazy derivation at init. */
-static inline void tcr_init_zero(TCR *r) {
-    for (int s = 0; s < 3; s++) {
-        plane_clear(&r->planes[s]);
-        r->planes[s].dirty = 1;  /* all authoritative */
+static inline void fqr_rehash(FQR *r) {
+    int oc = r->cap; PSlot *ot = r->tab;
+    r->cap <<= 1; r->cnt = 0;
+    r->tab = (PSlot *)calloc(r->cap, sizeof(PSlot));
+    int m = r->cap - 1;
+    for (int i = 0; i < oc; i++) {
+        if (!ot[i].used) continue;
+        int j = (int)(pmix(ot[i].b) & m);
+        while (r->tab[j].used) j = (j+1) & m;
+        r->tab[j] = ot[i]; r->cnt++;
     }
-    plane_set(&r->planes[0], 0ULL, 1.0, 0.0);
-    r->primary = 0;
+    free(ot);
 }
 
-/* ── Lazy derivation: derive plane s from primary ──
- *
- * Before DFT₃, plane s differs from primary by twiddle ω₆^(s·p_i)
- * for each quhit i. This is a per-entry factor depending on the
- * popcount of set bits.
- *
- * For the initial state (only plane 0 populated, planes 1,2 zero):
- *   plane s has same amplitudes as plane 0 at even-parity entries,
- *   and ω₆^s × plane 0 at odd-parity entries.
- *
- * For N quhits, the twiddle factor for plane s at basis b is:
- *   Π_i ω₆^(s · b_i) = ω₆^(s · popcount(b))
- *
- * since each quhit i contributes ω₆^(s · b_i).
- */
-static inline void tcr_derive_plane(TCR *r, int target) {
-    if (r->planes[target].dirty) return;
-
-    int src = r->primary;
-    if (!r->planes[src].dirty) return;
-
-    plane_clear(&r->planes[target]);
-    int ds = target;  /* relative twiddle index */
-
-    for (int i = 0; i < r->planes[src].n; i++) {
-        uint64_t b = r->planes[src].e[i].basis;
-        double re = r->planes[src].e[i].re;
-        double im = r->planes[src].e[i].im;
-
-        /* Twiddle factor: ω₆^(ds · popcount(b)) */
-        int pop = __builtin_popcountll(b);
-        int tw = (ds * pop) % 6;
-
-        double ore = W6R[tw]*re - W6I[tw]*im;
-        double oim = W6R[tw]*im + W6I[tw]*re;
-
-        plane_add(&r->planes[target], b, ore, oim);
+static inline void fqr_add(FQR *r, uint64_t b, double re, double im) {
+    if (r->cnt * 10 >= r->cap * 7) fqr_rehash(r);
+    int m = r->cap - 1, j = (int)(pmix(b) & m);
+    while (1) {
+        if (!r->tab[j].used) {
+            r->tab[j] = (PSlot){b, re, im, 1}; r->cnt++;
+            return;
+        }
+        if (r->tab[j].b == b) {
+            r->tab[j].re += re; r->tab[j].im += im;
+            return;
+        }
+        j = (j+1) & m;
     }
-    r->planes[target].dirty = 1;
 }
 
-/* Ensure all planes are authoritative */
-static inline void tcr_materialize(TCR *r) {
-    for (int s = 0; s < 3; s++)
-        tcr_derive_plane(r, s);
+static inline PE *fqr_snap(const FQR *r, int *n) {
+    PE *a = (PE *)malloc(r->cnt * sizeof(PE));
+    int k = 0;
+    for (int i = 0; i < r->cap; i++)
+        if (r->tab[i].used)
+            a[k++] = (PE){r->tab[i].b, r->tab[i].re, r->tab[i].im};
+    *n = k; return a;
 }
 
-/* ── DFT₆ on quhit qi ── */
+static inline void fqr_clear(FQR *r) {
+    memset(r->tab, 0, r->cap * sizeof(PSlot)); r->cnt = 0;
+}
 
-static inline void tcr_dft6(TCR *r, int qi) {
+static inline void fqr_trim(FQR *r, double eps) {
+    int n; PE *a = fqr_snap(r, &n);
+    fqr_clear(r);
+    double e2 = eps * eps;
+    for (int i = 0; i < n; i++)
+        if (a[i].re*a[i].re + a[i].im*a[i].im > e2)
+            fqr_add(r, a[i].b, a[i].re, a[i].im);
+    free(a);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * Init |0...0⟩
+ * ═══════════════════════════════════════════════════════════════ */
+
+static inline void fqr_init_zero(FQR *r) {
+    fqr_clear(r);
+    r->ncz = 0;
+    r->dft_mask = 0;
+    fqr_add(r, 0, 1.0, 0.0);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * DFT₆ on quhit qi = Hadamard on parity bit qi
+ * (twiddle + DFT₃ are identity in the derived-plane basis)
+ * ═══════════════════════════════════════════════════════════════ */
+
+static inline void fqr_dft6(FQR *r, int qi) {
     uint64_t mask = 1ULL << qi;
+    int n; PE *a = fqr_snap(r, &n);
+    fqr_clear(r);
+    for (int i = 0; i < n; i++) {
+        uint64_t b0 = a[i].b & ~mask, b1 = a[i].b | mask;
+        double sg = ((a[i].b >> qi) & 1) ? -1.0 : 1.0;
+        fqr_add(r, b0, FQ_H2 * a[i].re, FQ_H2 * a[i].im);
+        fqr_add(r, b1, FQ_H2 * sg * a[i].re, FQ_H2 * sg * a[i].im);
+    }
+    free(a);
+    fqr_trim(r, 1e-15);
+    r->dft_mask |= mask;   /* mark this quhit as DFT'd: planes now uniform */
+}
 
-    /* Materialize all planes (DFT₃ needs all 3) */
-    tcr_materialize(r);
+/* ═══════════════════════════════════════════════════════════════
+ * CZ = record gate, don't modify amplitudes
+ * ═══════════════════════════════════════════════════════════════ */
 
-    /* Stage 1: Hadamard on bit qi, per plane independently */
-    for (int s = 0; s < 3; s++) {
-        int on = r->planes[s].n;
-        PlaneEntry *old = (PlaneEntry *)malloc(on * sizeof(PlaneEntry));
-        memcpy(old, r->planes[s].e, on * sizeof(PlaneEntry));
-        plane_clear(&r->planes[s]);
+static inline void fqr_cz(FQR *r, int qi, int qj) {
+    r->cz[r->ncz++] = (CZGate){qi, qj};
+}
 
-        for (int i = 0; i < on; i++) {
-            uint64_t b0 = old[i].basis & ~mask;
-            uint64_t b1 = old[i].basis | mask;
-            double re = old[i].re, im = old[i].im;
-            double sg = ((old[i].basis >> qi) & 1) ? -1.0 : 1.0;
-            plane_add(&r->planes[s], b0, H2 * re, H2 * im);
-            plane_add(&r->planes[s], b1, H2 * sg * re, H2 * sg * im);
+/* ═══════════════════════════════════════════════════════════════
+ * CZ phase for a specific plane assignment svec at parity b
+ * Product of ω₆^{k_i·k_j} over all CZ gates
+ * ═══════════════════════════════════════════════════════════════ */
+
+static inline void fqr_cz_phase(const FQR *r, uint64_t b,
+                                const int *svec, int nq,
+                                double *pr, double *pi_out) {
+    double re = 1.0, im = 0.0;
+    for (int g = 0; g < r->ncz; g++) {
+        int qi = r->cz[g].qi, qj = r->cz[g].qj;
+        int ki = 3*((b >> qi) & 1) + svec[qi];
+        int kj = 3*((b >> qj) & 1) + svec[qj];
+        int ph = (ki * kj) % 6;
+        if (!ph) continue;
+        double nr = W6R[ph]*re - W6I[ph]*im;
+        double ni = W6R[ph]*im + W6I[ph]*re;
+        re = nr; im = ni;
+    }
+    *pr = re; *pi_out = im;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * Born probs: derive plane phases at observation time
+ *
+ * For each entry b, sum over all 3^K plane assignments for
+ * the K quhits involved in CZ gates, weighted by coherent phases.
+ * ═══════════════════════════════════════════════════════════════ */
+
+static inline void fqr_born(const FQR *r, int qi, double pr[6]) {
+    memset(pr, 0, 48);
+    int dft_i = (r->dft_mask >> qi) & 1;
+
+    if (r->ncz == 0) {
+        /* No CZ: simple dft_mask check */
+        for (int i = 0; i < r->cap; i++) {
+            if (!r->tab[i].used) continue;
+            int p = (r->tab[i].b >> qi) & 1;
+            double m = r->tab[i].re*r->tab[i].re + r->tab[i].im*r->tab[i].im;
+            if (dft_i)
+                for (int s = 0; s < 3; s++) pr[3*p+s] += m / 3.0;
+            else
+                pr[3*p] += m;
         }
-        free(old);
+        return;
     }
 
-    /* Stage 2: Twiddle ω₆^s on entries where bit qi = 1 */
-    for (int s = 1; s < 3; s++)
-        for (int i = 0; i < r->planes[s].n; i++) {
-            if (!((r->planes[s].e[i].basis >> qi) & 1)) continue;
-            double re = r->planes[s].e[i].re, im = r->planes[s].e[i].im;
-            r->planes[s].e[i].re = W6R[s]*re - W6I[s]*im;
-            r->planes[s].e[i].im = W6R[s]*im + W6I[s]*re;
-        }
-
-    /* Stage 3: DFT₃ across planes for each basis state */
-    /* Collect all basis states present across 3 planes */
-    int nb = 0, nbcap = r->planes[0].n + r->planes[1].n + r->planes[2].n + 1;
-    uint64_t *bases = (uint64_t *)malloc(nbcap * sizeof(uint64_t));
-
-    for (int s = 0; s < 3; s++)
-        for (int i = 0; i < r->planes[s].n; i++) {
-            uint64_t b = r->planes[s].e[i].basis;
-            int found = 0;
-            for (int j = 0; j < nb; j++)
-                if (bases[j] == b) { found = 1; break; }
-            if (!found) {
-                if (nb >= nbcap) {
-                    nbcap *= 2;
-                    bases = (uint64_t *)realloc(bases, nbcap * sizeof(uint64_t));
-                }
-                bases[nb++] = b;
-            }
-        }
-
-    /* For each basis state, gather 3 plane amps, apply DFT₃, scatter */
-    for (int bi = 0; bi < nb; bi++) {
-        uint64_t b = bases[bi];
-        double ar[3] = {0}, ai[3] = {0};
-
-        for (int s = 0; s < 3; s++)
-            for (int i = 0; i < r->planes[s].n; i++)
-                if (r->planes[s].e[i].basis == b) {
-                    ar[s] = r->planes[s].e[i].re;
-                    ai[s] = r->planes[s].e[i].im;
-                }
-
-        /* DFT₃: out[s'] = (1/√3) Σ_s ω₃^{s'·s} in[s] */
-        double or_[3], oi[3];
-        for (int sp = 0; sp < 3; sp++) {
-            or_[sp] = 0; oi[sp] = 0;
-            for (int s = 0; s < 3; s++) {
-                int ph = (sp * s * 2) % 6;
-                or_[sp] += W6R[ph]*ar[s] - W6I[ph]*ai[s];
-                oi[sp]  += W6R[ph]*ai[s] + W6I[ph]*ar[s];
-            }
-            or_[sp] *= N3;  oi[sp] *= N3;
-        }
-
-        for (int s = 0; s < 3; s++)
-            plane_set(&r->planes[s], b, or_[s], oi[s]);
+    /* With CZ: iterate 3^K plane combos for K active quhits */
+    uint64_t active = 0;
+    for (int g = 0; g < r->ncz; g++) {
+        active |= 1ULL << r->cz[g].qi;
+        active |= 1ULL << r->cz[g].qj;
     }
-    free(bases);
+    /* Also include qi if DFT'd (needs plane averaging) */
+    if (dft_i) active |= 1ULL << qi;
 
-    /* After DFT₃, all planes are authoritative */
-    for (int s = 0; s < 3; s++) {
-        plane_trim(&r->planes[s], 1e-15);
-        r->planes[s].dirty = 1;
+    int aq[64], naq = 0;
+    for (int i = 0; i < 64 && i < r->N; i++)
+        if ((active >> i) & 1) aq[naq++] = i;
+
+    int ntot = 1;
+    for (int i = 0; i < naq; i++) ntot *= 3;
+
+    int svec[64]; memset(svec, 0, sizeof svec);
+
+    for (int combo = 0; combo < ntot; combo++) {
+        int c = combo;
+        for (int i = 0; i < naq; i++) { svec[aq[i]] = c % 3; c /= 3; }
+
+        /* Skip combos where untouched quhits have s!=0 */
+        int skip = 0;
+        for (int i = 0; i < naq; i++)
+            if (!((r->dft_mask >> aq[i]) & 1) && svec[aq[i]] != 0)
+                { skip = 1; break; }
+        if (skip) continue;
+
+        /* Normalization: 3 per DFT'd active quhit, 1 per locked */
+        double norm = 1.0;
+        for (int i = 0; i < naq; i++)
+            if ((r->dft_mask >> aq[i]) & 1) norm *= 3.0;
+
+        int si = dft_i ? svec[qi] : 0;
+
+        for (int e = 0; e < r->cap; e++) {
+            if (!r->tab[e].used) continue;
+            int p = (r->tab[e].b >> qi) & 1;
+            double phR, phI;
+            fqr_cz_phase(r, r->tab[e].b, svec, naq, &phR, &phI);
+            double aR = r->tab[e].re*phR - r->tab[e].im*phI;
+            double aI = r->tab[e].re*phI + r->tab[e].im*phR;
+            pr[3*p + si] += (aR*aR + aI*aI) / norm;
+        }
     }
 }
 
-/* ── CZ on quhits qi, qj ── */
+static inline double fqr_corr(const FQR *r, int qi, int qj) {
+    double c = 0;
+    int di = (r->dft_mask >> qi) & 1, dj = (r->dft_mask >> qj) & 1;
 
-static inline void tcr_cz(TCR *r, int qi, int qj) {
-    tcr_materialize(r);
-    uint64_t mi = 1ULL << qi, mj = 1ULL << qj;
-
-    for (int s = 0; s < 3; s++)
-        for (int i = 0; i < r->planes[s].n; i++) {
-            int pi = (r->planes[s].e[i].basis & mi) ? 1 : 0;
-            int pj = (r->planes[s].e[i].basis & mj) ? 1 : 0;
-            int ki = 3*pi + s, kj = 3*pj + s;
-            int ph = (ki * kj) % 6;
-            if (!ph) continue;
-            double re = r->planes[s].e[i].re, im = r->planes[s].e[i].im;
-            r->planes[s].e[i].re = W6R[ph]*re - W6I[ph]*im;
-            r->planes[s].e[i].im = W6R[ph]*im + W6I[ph]*re;
+    if (r->ncz == 0) {
+        for (int i = 0; i < r->cap; i++) {
+            if (!r->tab[i].used) continue;
+            int pi = (r->tab[i].b >> qi) & 1;
+            int pj = (r->tab[i].b >> qj) & 1;
+            double m = r->tab[i].re*r->tab[i].re + r->tab[i].im*r->tab[i].im;
+            int sil = di?3:1, sjl = dj?3:1;
+            double avg = 0, norm = (double)(sil*sjl);
+            for (int si=0; si<sil; si++)
+                for (int sj=0; sj<sjl; sj++)
+                    avg += (3*pi+si)*(3*pj+sj);
+            c += m * avg / norm;
         }
+        return c;
+    }
+
+    uint64_t active = 0;
+    for (int g = 0; g < r->ncz; g++) {
+        active |= 1ULL << r->cz[g].qi;
+        active |= 1ULL << r->cz[g].qj;
+    }
+    if (di) active |= 1ULL << qi;
+    if (dj) active |= 1ULL << qj;
+
+    int aq[64], naq = 0;
+    for (int i = 0; i < 64 && i < r->N; i++)
+        if ((active >> i) & 1) aq[naq++] = i;
+
+    int ntot = 1;
+    for (int i = 0; i < naq; i++) ntot *= 3;
+    int svec[64]; memset(svec, 0, sizeof svec);
+
+    for (int combo = 0; combo < ntot; combo++) {
+        int cc = combo;
+        for (int i = 0; i < naq; i++) { svec[aq[i]] = cc%3; cc/=3; }
+        int skip = 0;
+        for (int i = 0; i < naq; i++)
+            if (!((r->dft_mask >> aq[i]) & 1) && svec[aq[i]] != 0)
+                { skip = 1; break; }
+        if (skip) continue;
+
+        double norm = 1.0;
+        for (int i = 0; i < naq; i++)
+            if ((r->dft_mask >> aq[i]) & 1) norm *= 3.0;
+
+        int si = di ? svec[qi] : 0, sj = dj ? svec[qj] : 0;
+
+        for (int e = 0; e < r->cap; e++) {
+            if (!r->tab[e].used) continue;
+            int pi = (r->tab[e].b >> qi) & 1;
+            int pj = (r->tab[e].b >> qj) & 1;
+            double phR, phI;
+            fqr_cz_phase(r, r->tab[e].b, svec, naq, &phR, &phI);
+            double aR = r->tab[e].re*phR - r->tab[e].im*phI;
+            double aI = r->tab[e].re*phI + r->tab[e].im*phR;
+            int ki = 3*pi+si, kj = 3*pj+sj;
+            c += (double)(ki*kj) * (aR*aR + aI*aI) / norm;
+        }
+    }
+    return c;
 }
 
-/* ── Statistics ── */
+/* ═══════════════════════════════════════════════════════════════
+ * Statistics
+ * ═══════════════════════════════════════════════════════════════ */
 
-static inline double tcr_prob(const TCR *r) {
+static inline double fqr_prob(const FQR *r) {
     double s = 0;
-    for (int i = 0; i < 3; i++) s += plane_prob(&r->planes[i]);
+    for (int i = 0; i < r->cap; i++)
+        if (r->tab[i].used)
+            s += r->tab[i].re*r->tab[i].re + r->tab[i].im*r->tab[i].im;
     return s;
 }
 
-static inline int tcr_nnz(const TCR *r) {
-    return r->planes[0].n + r->planes[1].n + r->planes[2].n;
-}
-
-static inline void tcr_print(const TCR *r, const char *lb) {
-    printf("  %s: N=%d quhits\n", lb, r->N);
-    for (int s = 0; s < 3; s++)
-        printf("    plane[%d]: %d entries, prob=%.6f %s\n",
-               s, r->planes[s].n, plane_prob(&r->planes[s]),
-               r->planes[s].dirty ? "(auth)" : "(lazy)");
-    printf("    total: %d entries, prob=%.6f\n", tcr_nnz(r), tcr_prob(r));
-}
-
-/* ── Born probabilities ── */
-
-static inline void tcr_born(const TCR *r, int qi, double pr[6]) {
-    memset(pr, 0, 6 * sizeof(double));
-    uint64_t mask = 1ULL << qi;
-    for (int s = 0; s < 3; s++)
-        for (int i = 0; i < r->planes[s].n; i++) {
-            int p = (r->planes[s].e[i].basis & mask) ? 1 : 0;
-            double m = r->planes[s].e[i].re * r->planes[s].e[i].re +
-                       r->planes[s].e[i].im * r->planes[s].e[i].im;
-            pr[3*p + s] += m;
-        }
-}
-
-/* ── Two-quhit correlation ⟨k_i · k_j⟩ ── */
-
-static inline double tcr_corr(const TCR *r, int qi, int qj) {
-    double c = 0;
-    uint64_t mi = 1ULL << qi, mj = 1ULL << qj;
-    for (int s = 0; s < 3; s++)
-        for (int i = 0; i < r->planes[s].n; i++) {
-            int ki = 3*((r->planes[s].e[i].basis & mi)?1:0) + s;
-            int kj = 3*((r->planes[s].e[i].basis & mj)?1:0) + s;
-            double m = r->planes[s].e[i].re * r->planes[s].e[i].re +
-                       r->planes[s].e[i].im * r->planes[s].e[i].im;
-            c += (double)(ki*kj) * m;
-        }
-    return c;
+static inline void fqr_print(const FQR *r, const char *lb) {
+    printf("  %s: N=%d, %d entries (2^N storage), prob=%.6f\n",
+           lb, r->N, r->cnt, fqr_prob(r));
 }
 
 #endif /* QUHIT_3CH_REGISTER_H */
