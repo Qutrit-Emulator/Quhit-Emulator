@@ -61,38 +61,78 @@ static inline void gauss_amp_line(const int *j, int N,
     if (N == 1) { if (j[0] == 0) *re_out = 1.0; return; }
 
     /* Right-to-left integration: force k[N-2], k[N-4], ... */
-    int phase = 0;           /* accumulated ω₆ phase index */
-    int k_prev;              /* most recently forced k value */
+    int phase = 0;
+    int k_prev;
 
-    /* First step: k[N-2] = -j[N-1] mod 6 */
     k_prev = (6 - j[N-1] % 6) % 6;
     phase = (k_prev * j[N-2]) % 6;
 
-    /* Continue: each step forces k[N-2-step] from the previous forced k */
     for (int step = 2; step <= N-2; step += 2) {
         int new_idx = N - 2 - step;
         k_prev = ((6 - k_prev - j[N-1-step]) % 6 + 6) % 6;
         if (new_idx > 0) {
             phase = (phase + k_prev * j[new_idx]) % 6;
         } else {
-            /* new_idx == 0, even N: k[0] is determined, compute final phase */
             phase = (phase + k_prev * j[0]) % 6;
         }
     }
 
-    /* For odd N: constraint check — k_forced[1] must equal -j[0] mod 6 */
     if (N % 2 == 1) {
         int required = (6 - j[0] % 6) % 6;
-        if (k_prev != required) return;  /* amplitude = 0 */
+        if (k_prev != required) return;
     }
 
-    /* Magnitude: 1/6^{floor(N/2)} */
+    /* Magnitude: 1/6^{floor(N/2)} — may underflow for large N */
+    int M = N / 2;
     double mag = 1.0;
-    for (int m = 0; m < N/2; m++) mag /= 6.0;
+    if (M < 248) {  /* 6^248 ≈ 10^193, well within double range */
+        for (int m = 0; m < M; m++) mag /= 6.0;
+    } else {
+        mag = 0.0;  /* underflows — caller should use log-polar */
+    }
 
     phase = ((phase % 6) + 6) % 6;
     *re_out = mag * GAUSS_W6R[phase];
     *im_out = mag * GAUSS_W6I[phase];
+}
+
+/* Log-polar version: returns (phase_index, log2_magnitude) for ANY N.
+ * phase_index ∈ {0..5}, -1 if amplitude is zero.
+ * log2_mag = log₂(1/6^{⌊N/2⌋}) = -⌊N/2⌋ × log₂(6).
+ * Exact — no floating-point underflow possible. */
+static inline void gauss_amp_line_log(const int *j, int N,
+                                      int *phase_out, double *log2_mag_out)
+{
+    *phase_out = -1;
+    *log2_mag_out = -INFINITY;
+
+    if (N <= 0) { *phase_out = 0; *log2_mag_out = 0.0; return; }
+    if (N == 1) { if (j[0]==0) { *phase_out=0; *log2_mag_out=0.0; } return; }
+
+    int phase = 0;
+    int k_prev;
+
+    k_prev = (6 - j[N-1] % 6) % 6;
+    phase = (k_prev * j[N-2]) % 6;
+
+    for (int step = 2; step <= N-2; step += 2) {
+        int new_idx = N - 2 - step;
+        k_prev = ((6 - k_prev - j[N-1-step]) % 6 + 6) % 6;
+        if (new_idx > 0)
+            phase = (phase + k_prev * j[new_idx]) % 6;
+        else
+            phase = (phase + k_prev * j[0]) % 6;
+    }
+
+    if (N % 2 == 1) {
+        int required = (6 - j[0] % 6) % 6;
+        if (k_prev != required) return;  /* zero amplitude */
+    }
+
+    phase = ((phase % 6) + 6) % 6;
+    *phase_out = phase;
+    /* log₂(1/6^M) = -M × log₂(6) = -M × 2.584962500721156 */
+    *log2_mag_out = -(double)(N/2) * 2.5849625007211561815;
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -168,37 +208,14 @@ static inline void gauss_amp_general(
 
 static inline void gauss_born_line(int N, int qt, double pr[6])
 {
-    for (int k = 0; k < 6; k++) pr[k] = 0.0;
-
-    if (N % 2 == 0) {
-        /* Even N: uniform by symmetry */
-        for (int k = 0; k < 6; k++) pr[k] = 1.0 / 6.0;
-        return;
-    }
-
-    /* Odd N: iterate j[1..N-1] as free variables, compute j[0] */
-    int jv[64];
-    long dim_free = 1;
-    for (int i = 0; i < N-1; i++) dim_free *= 6;
-
-    for (long fi = 0; fi < dim_free; fi++) {
-        long tmp = fi;
-        for (int i = 1; i < N; i++) { jv[i] = tmp % 6; tmp /= 6; }
-
-        /* Compute k_forced[1] by right-to-left recursion */
-        int k_cur = (6 - jv[N-1] % 6) % 6;
-        for (int step = 2; step <= N-3; step += 2) {
-            k_cur = ((6 - k_cur - jv[N-1-step]) % 6 + 6) % 6;
-        }
-        jv[0] = (6 - k_cur) % 6;  /* constrained j[0] */
-
-        /* Evaluate amplitude */
-        double ar, ai;
-        gauss_amp_line(jv, N, &ar, &ai);
-        double m2 = ar*ar + ai*ai;
-        if (m2 < 1e-30) continue;
-        pr[jv[qt]] += m2;
-    }
+    /* For the DFT+CZ_chain+DFT circuit starting from |0⟩:
+     * ALL nonzero amplitudes have identical magnitude (1/6^{floor(N/2)}).
+     * By symmetry of the Gauss sum, each j_qt value appears equally often
+     * among the nonzero entries. Therefore P(k) = 1/6 for all k.
+     * This holds for BOTH even and odd N. */
+    (void)qt;
+    (void)N;
+    for (int k = 0; k < 6; k++) pr[k] = 1.0 / 6.0;
 }
 
 /* ═══════════════════════════════════════════════════════════
