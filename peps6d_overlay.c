@@ -291,7 +291,7 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
          basis_t envA=ueA[eA];
          basis_t pure=(envA/bp[bond_A])*bp[bond_A+1]+(envA%bp[bond_A]);
          for (int gv=0;gv<rank;gv++) {
-             double wt=(sn>1e-30&&sig[gv]>1e-30)?sqrt(sig[gv]/sn):0.0;
+             double wt=(sn>1e-30&&sig[gv]>1e-30)?sig[gv]*born_fast_isqrt(sig[gv])*born_fast_isqrt(sn):0.0;
              double re=Ur[row*rank+gv]*wt, im=Ui[row*rank+gv]*wt;
              if (re*re+im*im<1e-50) continue;
              basis_t bs=kA*TNS6D_C12+pure+gv*bp[bond_A];
@@ -309,7 +309,7 @@ static void tns6d_gate_2site_generic(Tns6dGrid *g, int sA, int sB,
          basis_t envB=ueB[eB];
          basis_t pure=(envB/bp[bond_B])*bp[bond_B+1]+(envB%bp[bond_B]);
          for (int gv=0;gv<rank;gv++) {
-             double wt=(sn>1e-30&&sig[gv]>1e-30)?sqrt(sig[gv]/sn):0.0;
+             double wt=(sn>1e-30&&sig[gv]>1e-30)?sig[gv]*born_fast_isqrt(sig[gv])*born_fast_isqrt(sn):0.0;
              double re=wt*Vr[gv*sdB+col], im=wt*Vi[gv*sdB+col];
              if (re*re+im*im<1e-50) continue;
              basis_t bs=kB*TNS6D_C12+pure+gv*bp[bond_B];
@@ -437,7 +437,7 @@ void tns6d_normalize_site(Tns6dGrid *g, int x, int y, int z, int w, int v, int u
     double n2=0;
     for(uint32_t e=0;e<r->num_nonzero;e++)
         n2+=r->entries[e].amp_re*r->entries[e].amp_re+r->entries[e].amp_im*r->entries[e].amp_im;
-    if(n2>1e-20){double inv=1.0/sqrt(n2);
+    if(n2>1e-20){double inv=born_fast_isqrt(n2);
         for(uint32_t e=0;e<r->num_nonzero;e++){r->entries[e].amp_re*=inv;r->entries[e].amp_im*=inv;}}
 }
 
