@@ -41,7 +41,13 @@
  * STATE VECTOR TYPE — AoS layout
  * ═══════════════════════════════════════════════════════════ */
 
-typedef struct { double re, im; } SV_Amplitude;
+typedef struct {
+    double re, im;
+    double log2_mag;  /* log₂|A|. -INFINITY = re/im are exact. Otherwise:
+                       * actual amplitude = 2^{log2_mag} × (re + i·im)
+                       * where |re+i·im| = 1 (unit phase vector).
+                       * Used by Gauss circuit mode for N > ~100. */
+} SV_Amplitude;
 
 typedef struct {
     SV_Amplitude *data;    /* contiguous array */
