@@ -135,63 +135,8 @@ static inline void gauss_amp_line_log(const int *j, int N,
     *log2_mag_out = -(double)(N/2) * 2.5849625007211561815;
 }
 
-/* ═══════════════════════════════════════════════════════════
- * GENERAL CZ GRAPH — not just a line
- *
- * For arbitrary CZ graph, evaluate the Gauss sum by brute-force
- * summation over k-space. Still O(N) per amplitude for TREE
- * graphs (integrate leaves first), but general graphs may
- * require O(6^{treewidth}) factor.
- *
- * For now: only handles LINE graphs (CZ(i,i+1) chain).
- * TODO: extend to trees and general graphs.
- * ═══════════════════════════════════════════════════════════ */
 
-static inline void gauss_amp_general(
-    const int *j, int N,
-    const uint16_t cz_a[], const uint16_t cz_b[], int n_cz,
-    double *re_out, double *im_out)
-{
-    /* Check if the CZ graph is a line: CZ(0,1), CZ(1,2), ..., CZ(N-2,N-1) */
-    int is_line = (n_cz == N - 1);
-    if (is_line) {
-        for (int g = 0; g < n_cz && is_line; g++) {
-            if (cz_a[g] != g || cz_b[g] != g + 1) is_line = 0;
-        }
-    }
 
-    if (is_line) {
-        gauss_amp_line(j, N, re_out, im_out);
-        return;
-    }
-
-    /* Fallback: brute-force Gauss sum for small N */
-    *re_out = 0.0;
-    *im_out = 0.0;
-    if (N > 10) return;  /* too large for brute force */
-
-    int dim = 1;
-    for (int i = 0; i < N; i++) dim *= 6;
-    double norm = 1.0;
-    for (int i = 0; i < N; i++) norm /= 6.0;
-
-    for (int kidx = 0; kidx < dim; kidx++) {
-        /* Decode k-vector */
-        int kv[16], tmp = kidx;
-        for (int i = 0; i < N; i++) { kv[i] = tmp % 6; tmp /= 6; }
-
-        /* Compute phase: Σ k_i·k_{i+1} (CZ) + Σ k_i·j_i (DFT) */
-        int ph = 0;
-        for (int g = 0; g < n_cz; g++)
-            ph += kv[cz_a[g]] * kv[cz_b[g]];
-        for (int i = 0; i < N; i++)
-            ph += kv[i] * j[i];
-        ph = ((ph % 6) + 6) % 6;
-
-        *re_out += norm * GAUSS_W6R[ph];
-        *im_out += norm * GAUSS_W6I[ph];
-    }
-}
 
 /* ═══════════════════════════════════════════════════════════
  * BORN MARGINAL — P(j_qt = k) for k=0..5
