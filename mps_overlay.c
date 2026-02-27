@@ -239,7 +239,7 @@ uint32_t mps_overlay_measure(QuhitEngine *eng, uint32_t *quhits, int n, int targ
             slice_norm2 += re*re + im*im;
         }
     if (slice_norm2 > 1e-30) {
-        double scale = 1.0 / sqrt(slice_norm2);
+        double scale = born_fast_isqrt(slice_norm2);
         for (int a = 0; a < chi; a++)
             for (int b = 0; b < chi; b++) {
                 double re, im;
@@ -540,7 +540,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
 
 void mps_build_dft6(double *U_re, double *U_im)
 {
-    double inv = 1.0 / sqrt(6.0);
+    double inv = born_fast_isqrt(6.0);
     for (int j = 0; j < 6; j++)
         for (int k = 0; k < 6; k++) {
             double angle = 2.0 * M_PI * j * k / (double)MPS_PHYS;
@@ -582,7 +582,7 @@ void mps_build_hadamard2(double *U_re, double *U_im)
 {
     memset(U_re, 0, 36 * sizeof(double));
     memset(U_im, 0, 36 * sizeof(double));
-    double s = 1.0 / sqrt(2.0);
+    double s = born_fast_isqrt(2.0);
     U_re[0*6+0] =  s; U_re[0*6+1] =  s;
     U_re[1*6+0] =  s; U_re[1*6+1] = -s;
     for (int k = 2; k < 6; k++) U_re[k*6+k] = 1.0;
@@ -653,7 +653,7 @@ void mps_renormalize_chain(QuhitEngine *eng, uint32_t *quhits, int n)
 {
     double norm = mps_overlay_norm(eng, quhits, n);
     if (norm > 1e-30 && fabs(norm - 1.0) > 1e-12) {
-        double scale = 1.0 / sqrt(norm);
+        double scale = born_fast_isqrt(norm);
         for (int k = 0; k < MPS_PHYS; k++)
             for (int a = 0; a < MPS_CHI; a++)
                 for (int b = 0; b < MPS_CHI; b++) {
