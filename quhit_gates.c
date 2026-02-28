@@ -145,15 +145,14 @@ void quhit_apply_cz(QuhitEngine *eng, uint32_t id_a, uint32_t id_b)
         quhit_entangle_product(eng, id_a, id_b);
     }
 
-    /* Now both share a pair — apply ω^(a·b) phases */
+    /* Now both share a pair — apply ω^(a·b) phases using precomputed table */
     QuhitPair *p = &eng->pairs[qa->pair_id];
-    double omega = 2.0 * M_PI / QUHIT_D;
 
     for (int a = 0; a < QUHIT_D; a++) {
         for (int b = 0; b < QUHIT_D; b++) {
             int idx = a * QUHIT_D + b;
-            double phase = omega * a * b;
-            double cos_p = cos(phase), sin_p = sin(phase);
+            double cos_p = CZ_PHASE[a][b].re;
+            double sin_p = CZ_PHASE[a][b].im;
             double re = p->joint.re[idx];
             double im = p->joint.im[idx];
             p->joint.re[idx] = re * cos_p - im * sin_p;
