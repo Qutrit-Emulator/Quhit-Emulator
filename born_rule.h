@@ -28,7 +28,7 @@
 
 #define BORN_MAGIC_SQ    0x3FF0000000000000ULL  /* B×2^M = bits(1.0) */
 #define BORN_MAGIC_RECIP 0x7FE0000000000000ULL  /* 2×B×2^M for fast 1/x */
-#define BORN_MAGIC_ISQRT 0x5FE6EB06D314E41AULL  /* Quantum-discovered (ITE search, 6^8 configs) */
+#define BORN_MAGIC_ISQRT 0x5FE6D826D36047EFULL  /* libm-oracle optimal (51.91 bits with 4N FMA) */
 
 /* ═══════════════════════════════════════════════════════════
  * BIT-LEVEL UTILITIES
