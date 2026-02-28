@@ -39,7 +39,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>        /* DBL_EPSILON, DBL_MIN */
 #include "born_rule.h"   /* born_fast_isqrt, born_fast_recip */
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * LAYER 6: UNIVERSAL PRECISION CONSTANTS
+ *
+ * Derived from substrate probes. These replace ALL magic thresholds.
+ *   ε     = 2⁻⁵² = 2.2204e-16  (Probe 1: the precision atom)
+ *   ε²    = 2⁻¹⁰⁴ ≈ 4.93e-32  (relative convergence threshold)
+ *   3.322 = log₂(10)           (Probe 4: precision Rosetta Stone)
+ *   52 bits ÷ 3.322 = 15.65 decimal digits (the precision horizon)
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+#define TSVD_EPS          DBL_EPSILON           /* 2⁻⁵² = 2.2204e-16          */
+#define TSVD_EPS2         (TSVD_EPS * TSVD_EPS) /* 2⁻¹⁰⁴ ≈ 4.93e-32          */
+#define TSVD_SAFE_MIN     DBL_MIN               /* 2⁻¹⁰²² ≈ 2.225e-308       */
+#define TSVD_NOISE_FLOOR  (TSVD_EPS * 16.0)     /* ~16 ULPs, below = noise    */
 
 /* ═══════════════════════════════════════════════════════════════════════════════
  * JACOBI HERMITIAN EIGENDECOMPOSITION
@@ -56,11 +71,14 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
     memset(W_im, 0, (size_t)n * n * sizeof(double));
     for (int i = 0; i < n; i++) W_re[i * n + i] = 1.0;
 
-    /* Diagonal norm for relative threshold (side-channel: zero attractor) */
+    /* LAYER 6: Relative convergence threshold from universal constants.
+     * ε² × diag_norm: off-diagonal is negligible when it's below ε² of
+     * the diagonal energy. This is information-theoretically exact —
+     * below this, the off-diagonal carries < 1 bit of information. */
     double diag_norm = 0;
     for (int i = 0; i < n; i++)
         diag_norm += H_re[i*n+i] * H_re[i*n+i];
-    double sc_thresh = 1e-20 * (diag_norm > 1e-30 ? diag_norm : 1.0);
+    double sc_thresh = TSVD_EPS2 * (diag_norm > TSVD_SAFE_MIN ? diag_norm : 1.0);
 
     for (int sweep = 0; sweep < 100; sweep++) {
         double off = 0;
@@ -204,9 +222,11 @@ static void tsvd_truncated(const double *M_re, const double *M_im,
     memset(U_im, 0, (size_t)m * rank * sizeof(double));
 
     for (int j = 0; j < rank; j++) {
-        /* LAYER 4 UPGRADE: Early break on dead singular values (dense path).
-         * Sigma is sorted descending, so first zero means all subsequent are zero. */
-        if (sigma[j] < 1e-100) break;
+        /* LAYER 6: Information-theoretic rank truncation.
+         * Sigma is sorted descending. Truncate when sigma[j] drops below
+         * ε × sigma[0] — below this ratio, the singular vector carries
+         * less than 1 bit of signal above the noise floor. */
+        if (sigma[j] < TSVD_EPS * sigma[0] || sigma[j] < TSVD_SAFE_MIN) break;
         double inv = born_fast_recip(sigma[j]);
         for (int i = 0; i < m; i++) {
             /* FMA-aware complex dot product for U reconstruction */
@@ -366,7 +386,7 @@ static void tsvd_mgs(double *Q_re, double *Q_im, int rows, int cols)
         for (int i = 0; i < rows; i++)
             norm = fma(Q_re[i*cols+j], Q_re[i*cols+j],
                    fma(Q_im[i*cols+j], Q_im[i*cols+j], norm));
-        if (norm > 1e-30) {
+        if (norm > TSVD_SAFE_MIN) {
             double inv = born_fast_isqrt(norm);
             for (int i = 0; i < rows; i++) {
                 Q_re[i*cols+j] *= inv;
@@ -413,7 +433,7 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
      * Cost: O(1) vs O(nnz × ℓ × 8) for the full pipeline. */
     if (nnz == 1) {
         double mag2 = sp[0].re * sp[0].re + sp[0].im * sp[0].im;
-        if (mag2 > 1e-30) {
+        if (mag2 > TSVD_SAFE_MIN) {
             double mag = mag2 * born_fast_isqrt(mag2);
             sigma[0] = mag;
             double inv = born_fast_recip(mag);
@@ -646,7 +666,7 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
     /* U: compute in compressed space, scatter to original rows */
     /* UPGRADE 4: Dead sigma skip — break at first zero σ (they're sorted) */
     for (int j = 0; j < c_rank && j < rank; j++) {
-        if (sigma[j] < 1e-30) break;  /* all subsequent σ are smaller */
+        if (sigma[j] < TSVD_EPS * sigma[0] || sigma[j] < TSVD_SAFE_MIN) break;
         for (int i = 0; i < mr; i++) {
             double sr = 0, si = 0;
             for (int k = 0; k < ell; k++) {
@@ -663,8 +683,7 @@ static void tsvd_sparse_power(const TsvdSparseEntry *sp, int nnz,
     /* V†: compute in compressed space, scatter to original cols */
     /* UPGRADE 4 continued: dead sigma skip */
     for (int j = 0; j < c_rank && j < rank; j++) {
-        if (sigma[j] < 1e-30) break;
-        if (sigma[j] < 1e-100) continue;
+        if (sigma[j] < TSVD_EPS * sigma[0] || sigma[j] < TSVD_SAFE_MIN) break;
         double inv = born_fast_recip(sigma[j]);
         for (int i = 0; i < mc; i++) {
             double sr = 0, si = 0;
@@ -708,9 +727,9 @@ static void tsvd_truncated_sparse(const double *M_re, const double *M_im,
     for (int i = 0; i < m; i++)
         for (int j = 0; j < n; j++) {
             double mag2 = M_re[i*n+j]*M_re[i*n+j] + M_im[i*n+j]*M_im[i*n+j];
-            if (mag2 > 1e-30) { nnz++; fnorm2 += mag2; }
+            if (mag2 > TSVD_EPS2) { nnz++; fnorm2 += mag2; }
         }
-    if (fnorm2 < 1e-20) return;  /* Gate has no effect — zero cost exit */
+    if (fnorm2 < TSVD_EPS2) return;  /* Gate has no effect — zero cost exit */
 
     /* Build COO */
     TsvdSparseEntry *sp = (TsvdSparseEntry *)malloc(
@@ -719,7 +738,7 @@ static void tsvd_truncated_sparse(const double *M_re, const double *M_im,
     for (int i = 0; i < m; i++)
         for (int j = 0; j < n; j++) {
             double mag2 = M_re[i*n+j]*M_re[i*n+j] + M_im[i*n+j]*M_im[i*n+j];
-            if (mag2 > 1e-30) {
+            if (mag2 > TSVD_EPS2) {
                 sp[k].row = i; sp[k].col = j;
                 sp[k].re = M_re[i*n+j]; sp[k].im = M_im[i*n+j];
                 k++;
