@@ -45,7 +45,7 @@
 #define TNS6D_TSIZ (TNS6D_D * TNS6D_C12)
 
 typedef struct { int reg_idx; } Tns6dTensor;
-typedef struct { double *w; /* Heap-allocated */ } Tns6dBondWeight;
+typedef struct { double *w; double *V_re; double *V_im; int V_n; } Tns6dBondWeight;
 
 typedef struct {
     int Lx, Ly, Lz, Lw, Lv, Lu;
