@@ -28,7 +28,7 @@
 
 #define BORN_MAGIC_SQ    0x3FF0000000000000ULL  /* B×2^M = bits(1.0) */
 #define BORN_MAGIC_RECIP 0x7FE0000000000000ULL  /* 2×B×2^M for fast 1/x */
-#define BORN_MAGIC_ISQRT 0x5FE6EB3BD314E41AULL  /* Quake double */
+#define BORN_MAGIC_ISQRT 0x5FE6EB06D314E41AULL  /* Quantum-discovered (ITE search, 6^8 configs) */
 
 /* ═══════════════════════════════════════════════════════════
  * BIT-LEVEL UTILITIES
@@ -90,6 +90,7 @@ static inline double born_fast_isqrt(double x) {
     y = y * (1.5 - 0.5 * x * y * y);  /* Newton 1: ~4.5 → 9 bits   */
     y = y * (1.5 - 0.5 * x * y * y);  /* Newton 2:   9 → 17.7 bits */
     y = y * (1.5 - 0.5 * x * y * y);  /* Newton 3: 17.7 → 34.9 bits */
+    y = y * (1.5 - 0.5 * x * y * y);  /* Newton 4: 34.9 → 51.6 bits */
     return y;
 }
 
