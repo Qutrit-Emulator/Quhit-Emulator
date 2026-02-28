@@ -159,12 +159,12 @@ void tns3d_set_product_state(Tns3dGrid *g, int x, int y, int z,
 
 /* ═══════════════ 1-SITE GATE ═══════════════ */
 
-struct tmp_entry { basis_t basis; double re, im; };
+struct tns3d_tmp_entry { basis_t basis; double re, im; };
 
-static int cmp_basis(const void *a, const void *b)
+static int tns3d_cmp_basis(const void *a, const void *b)
 {
-    const struct tmp_entry *ea = (const struct tmp_entry *)a;
-    const struct tmp_entry *eb = (const struct tmp_entry *)b;
+    const struct tns3d_tmp_entry *ea = (const struct tns3d_tmp_entry *)a;
+    const struct tns3d_tmp_entry *eb = (const struct tns3d_tmp_entry *)b;
     if (ea->basis < eb->basis) return -1;
     if (ea->basis > eb->basis) return 1;
     return 0;
@@ -198,7 +198,7 @@ void tns3d_gate_1site(Tns3dGrid *g, int x, int y, int z,
 
     uint32_t max_out = old_n * D + 1;
     if (max_out < 4096) max_out = 4096;
-    struct tmp_entry *tmp = calloc(max_out, sizeof(*tmp));
+    struct tns3d_tmp_entry *tmp = calloc(max_out, sizeof(*tmp));
     uint32_t nout = 0;
 
     for (int kp = 0; kp < D; kp++) {
@@ -225,7 +225,7 @@ void tns3d_gate_1site(Tns3dGrid *g, int x, int y, int z,
         }
     }
 
-    qsort(tmp, nout, sizeof(struct tmp_entry), cmp_basis);
+    qsort(tmp, nout, sizeof(struct tns3d_tmp_entry), tns3d_cmp_basis);
 
     r->num_nonzero = 0;
     for (uint32_t t = 0; t < nout; t++) {
