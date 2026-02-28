@@ -73,16 +73,23 @@ static inline double born_prob_fast(double re, double im) {
 /* ═══════════════════════════════════════════════════════════
  * FAST INVERSE SQRT — Quake III (double precision)
  *
- * Magic pointer probe result: 1 Newton iteration gives 9.2 bits.
- * Jacobi rotations are self-correcting — 9 bits is sufficient.
- * Saves 2 MUL + 1 SUB per call vs 2 iterations.
+ * Sidechannel probe (probe_isqrt.c) results:
+ *   • 1 Newton: 9.2 bits  — old, caused 5.67e-4 Bell error
+ *   • 2 Newton: 17.7 bits — free (ILP pipeline)
+ *   • 3 Newton: 34.9 bits — free (ILP pipeline, 2.3ns same as 1N)
+ *   • Max relative error: 3.17e-11
+ *
+ * All 3 iterations run in 2.3 ns/call due to instruction-level
+ * parallelism — the CPU pipelines the multiply chains.
  * ═══════════════════════════════════════════════════════════ */
 
 static inline double born_fast_isqrt(double x) {
     uint64_t i = _born_d2b(x);
     i = BORN_MAGIC_ISQRT - (i >> 1);
     double y = _born_b2d(i);
-    y = y * (1.5 - 0.5 * x * y * y);  /* Newton 1 (9.2 bits) */
+    y = y * (1.5 - 0.5 * x * y * y);  /* Newton 1: ~4.5 → 9 bits   */
+    y = y * (1.5 - 0.5 * x * y * y);  /* Newton 2:   9 → 17.7 bits */
+    y = y * (1.5 - 0.5 * x * y * y);  /* Newton 3: 17.7 → 34.9 bits */
     return y;
 }
 
