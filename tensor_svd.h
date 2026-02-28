@@ -94,6 +94,94 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
         diag_norm += H_re[i*n+i] * H_re[i*n+i];
     double sc_thresh = TSVD_EPS2 * (diag_norm > TSVD_SAFE_MIN ? diag_norm : 1.0);
 
+    /* ═══ LAYER 9: JACOBI FAST-PATHS (from substrate_probe_jacobi.c) ═══
+     *
+     * Sidechannel probe showed:
+     *   • 86.5% of M†M are already diagonal → 0 sweeps needed
+     *   • 99.5% of M†M are circulant → diagonalizable via DFT
+     *   • Only <1% need full Jacobi iteration
+     * ════════════════════════════════════════════════════════════════════ */
+
+    /* ─── Fast-path 1: Already diagonal (87% of calls) ─── */
+    double off_norm = 0;
+    for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; j++)
+            off_norm += H_re[i*n+j]*H_re[i*n+j] + H_im[i*n+j]*H_im[i*n+j];
+
+    if (off_norm < sc_thresh) {
+        /* M†M is diagonal — eigenvalues are on the diagonal, V = I */
+        for (int i = 0; i < n; i++) diag[i] = H_re[i*n+i];
+        /* Sort descending with eigenvector permutation */
+        for (int i = 0; i < n - 1; i++) {
+            int mx = i;
+            for (int j = i + 1; j < n; j++)
+                if (diag[j] > diag[mx]) mx = j;
+            if (mx != i) {
+                double tmp = diag[i]; diag[i] = diag[mx]; diag[mx] = tmp;
+                for (int k = 0; k < n; k++) {
+                    double tr = W_re[k*n+i]; W_re[k*n+i] = W_re[k*n+mx]; W_re[k*n+mx] = tr;
+                }
+            }
+        }
+        return;  /* Zero Jacobi iterations */
+    }
+
+    /* ─── Fast-path 2: Circulant matrix (99.5% of remaining calls) ───
+     *
+     * A circulant Hermitian matrix has H[i][j] = h[(i-j) mod n].
+     * Its eigenvalues are the DFT of the first row: λ_k = Σ_j h[j] × ω^(jk)
+     * Its eigenvectors are the columns of the DFT matrix.
+     * For D=6, we already have DFT6[6][6] precomputed. */
+    if (n <= 6) {
+        int is_circ = 1;
+        for (int i = 1; i < n && is_circ; i++)
+            for (int j = 0; j < n && is_circ; j++) {
+                int shift = ((i - j) % n + n) % n;
+                /* Compare H[i][j] with H[0][shift] */
+                if (fabs(H_re[i*n+j] - H_re[0*n+shift]) > 1e-10 * (fabs(H_re[0*n+shift]) + 1e-30) ||
+                    fabs(H_im[i*n+j] - H_im[0*n+shift]) > 1e-10 * (fabs(H_im[0*n+shift]) + 1e-30))
+                    is_circ = 0;
+            }
+
+        if (is_circ) {
+            /* Eigenvalues λ_k = Σ_j h[j] × ω^(jk) where h = first row */
+            for (int k = 0; k < n; k++) {
+                double lr = 0, li = 0;
+                for (int j = 0; j < n; j++) {
+                    /* ω^(jk) for D=6: use precomputed OMEGA6 */
+                    int idx = (j * k) % n;
+                    double wr = OMEGA6[idx].re, wi = OMEGA6[idx].im;
+                    lr += H_re[0*n+j] * wr - H_im[0*n+j] * wi;
+                    li += H_re[0*n+j] * wi + H_im[0*n+j] * wr;
+                }
+                /* Eigenvalue of Hermitian matrix must be real */
+                diag[k] = lr;
+            }
+            /* Eigenvectors = DFT columns (conjugated for Hermitian convention) */
+            for (int k = 0; k < n; k++)
+                for (int i = 0; i < n; i++) {
+                    W_re[i*n+k] = DFT6[i][k].re;
+                    W_im[i*n+k] = DFT6[i][k].im;
+                }
+            /* Sort descending */
+            for (int i = 0; i < n - 1; i++) {
+                int mx = i;
+                for (int j = i + 1; j < n; j++)
+                    if (diag[j] > diag[mx]) mx = j;
+                if (mx != i) {
+                    double tmp = diag[i]; diag[i] = diag[mx]; diag[mx] = tmp;
+                    for (int k = 0; k < n; k++) {
+                        double tr = W_re[k*n+i]; W_re[k*n+i] = W_re[k*n+mx]; W_re[k*n+mx] = tr;
+                        double ti = W_im[k*n+i]; W_im[k*n+i] = W_im[k*n+mx]; W_im[k*n+mx] = ti;
+                    }
+                }
+            }
+            return;  /* Circulant diagonalized via DFT — zero Jacobi iterations */
+        }
+    }
+
+    /* ─── General case: Full Jacobi iteration (<1% of calls) ─── */
+
     for (int sweep = 0; sweep < 30; sweep++) {  /* L7: 30 max (Probe 8: converges in 6-29) */
         /* LAYER 7: Kahan compensated summation for off-diagonal norm.
          * Probe 2 showed addition loses ~1 bit per op. For n=36,
