@@ -75,19 +75,8 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
              double mag = mag2 * born_fast_isqrt(mag2);
 
              double hpp = H_re[p*n+p], hqq = H_re[q*n+q];
-             /* LAYER 4 UPGRADE: Anti-cancellation Jacobi tau.
-              * Probe 8 showed catastrophic cancellation destroys 3.3 bits
-              * per digit of agreement. When hpp ≈ hqq, (hqq-hpp) loses
-              * precision. Use hypot-stable formulation instead. */
-             double gap = hqq - hpp;
-             double tau;
-             if (fabs(gap) < mag * 1e-8) {
-                 /* Near-degenerate: tau ≈ 0, use Taylor expansion t ≈ 1 */
-                 tau = 0.0;
-             } else {
-                 tau = gap / (2.0 * mag);
-             }
-             double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau*tau));
+             double tau = (hqq - hpp) / (2.0 * mag);
+             double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + fabs(tau) * born_fast_isqrt(1.0 + 1.0/(tau*tau)));
              double c = born_fast_isqrt(1.0 + t*t);
              double s = t * c;
 
