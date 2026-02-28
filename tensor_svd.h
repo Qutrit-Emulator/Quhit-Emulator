@@ -131,6 +131,84 @@ static void tsvd_jacobi_hermitian(double *H_re, double *H_im, int n,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * RAYLEIGH QUOTIENT EIGENVALUES (CMY flatness shortcut)
+ *
+ * Given pre-computed eigenvectors V_in (from CMY rotation of a previous
+ * axis's eigenvectors), extract eigenvalues of H via Rayleigh quotient:
+ *
+ *   λᵢ = (V[:,i]† · H · V[:,i]) / (V[:,i]† · V[:,i])
+ *
+ * This is O(n²·k) for k eigenvalues — no iteration needed.
+ * The CMY flatness guarantees V_in = R·V₀ are EXACT eigenvectors
+ * of H₁ = R·H₀·R†, so the Rayleigh quotient gives exact eigenvalues.
+ * More accurate than Jacobi because it reads the UNTOUCHED original H,
+ * bypassing accumulated rotation error from born_fast_isqrt.
+ *
+ * Output: eigenvalues in `diag` (descending), W = copy of V_in (sorted).
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+static void tsvd_rayleigh_eigenvalues(const double *H_re, const double *H_im, int n,
+                                      double *diag, double *W_re, double *W_im,
+                                      const double *V_re, const double *V_im)
+{
+    size_t nsq = (size_t)n * n;
+
+    /* Copy V into W */
+    memcpy(W_re, V_re, nsq * sizeof(double));
+    memcpy(W_im, V_im, nsq * sizeof(double));
+
+    /* Compute normalized Rayleigh quotient for each eigenvector:
+     * λᵢ = (V[:,i]† · H · V[:,i]) / (V[:,i]† · V[:,i])
+     *
+     * Step 1: t = H · V[:,i]   (O(n²) per column)
+     * Step 2: λ = V[:,i]† · t  (O(n) per column)
+     * Step 3: normalize by v†v (needed: born_fast eigenvectors ≈ 0.9997 norm)
+     */
+    double *t_re = (double *)malloc(n * sizeof(double));
+    double *t_im = (double *)malloc(n * sizeof(double));
+
+    for (int i = 0; i < n; i++) {
+        /* t = H × V[:,i] */
+        for (int r = 0; r < n; r++) {
+            double sr = 0, si = 0;
+            for (int c = 0; c < n; c++) {
+                double hr = H_re[r*n+c], hi = H_im[r*n+c];
+                double vr = V_re[c*n+i], vi = V_im[c*n+i];
+                sr += hr*vr - hi*vi;
+                si += hr*vi + hi*vr;
+            }
+            t_re[r] = sr;
+            t_im[r] = si;
+        }
+        /* λ = (V[:,i]† · t) / (V[:,i]† · V[:,i]) */
+        double lr = 0, vnorm = 0;
+        for (int k = 0; k < n; k++) {
+            double vr = V_re[k*n+i], vi = V_im[k*n+i];
+            lr += vr * t_re[k] + vi * t_im[k]; /* Re(conj(v)·t) */
+            vnorm += vr * vr + vi * vi;         /* |v|² */
+        }
+        diag[i] = (vnorm > 1e-30) ? lr / vnorm : lr;
+    }
+
+    free(t_re); free(t_im);
+
+    /* Sort descending by eigenvalue (matching Jacobi output convention) */
+    for (int i = 0; i < n - 1; i++) {
+        int mx = i;
+        for (int j = i + 1; j < n; j++)
+            if (diag[j] > diag[mx]) mx = j;
+        if (mx != i) {
+            double tmp = diag[i]; diag[i] = diag[mx]; diag[mx] = tmp;
+            for (int k = 0; k < n; k++) {
+                double tr, ti;
+                tr = W_re[k*n+i]; W_re[k*n+i] = W_re[k*n+mx]; W_re[k*n+mx] = tr;
+                ti = W_im[k*n+i]; W_im[k*n+i] = W_im[k*n+mx]; W_im[k*n+mx] = ti;
+            }
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * TRUNCATED SVD
  *
  * M (m×n complex) → U (m×chi) × σ (chi) × V† (chi×n)
@@ -580,4 +658,3 @@ static void tsvd_truncated_sparse(const double *M_re, const double *M_im,
 }
 
 #endif /* TENSOR_SVD_H */
-
